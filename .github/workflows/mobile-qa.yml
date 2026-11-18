@@ -27,6 +27,11 @@ on:
         description: Simulator name, empty = newest plain iPhone
         default: ''
         type: string
+      ios_runner:
+        description: macOS runner label for the iOS job (fallback when GitHub is short of one pool)
+        default: macos-15
+        type: choice
+        options: [macos-15, macos-15-intel, macos-26]
 
 permissions:
   contents: read
@@ -38,7 +43,7 @@ env:
 jobs:
   ios:
     if: contains(inputs.platforms, 'ios')
-    runs-on: macos-15
+    runs-on: ${{ inputs.ios_runner || 'macos-15' }}
     timeout-minutes: 45
     env:
       IOS_DEVICE: ${{ inputs.ios_device }}
