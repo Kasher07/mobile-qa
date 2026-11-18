@@ -129,8 +129,19 @@ try {
   log('run ' + rid + ': https://github.com/' + REPO + '/actions/runs/' + runId);
   let last = '';
   const deadline = Date.now() + 150 * 60000;
+  let apiErrors = 0;
   for (;;) {
-    const v = JSON.parse(gh(['run', 'view', String(runId), '-R', REPO, '--json', 'status,conclusion,jobs']));
+    let v;
+    try {
+      v = JSON.parse(gh(['run', 'view', String(runId), '-R', REPO, '--json', 'status,conclusion,jobs']));
+      apiErrors = 0;
+    } catch (e) {
+      // GitHub answers 5xx now and then: keep waiting rather than throwing the run away.
+      if (++apiErrors > 20) throw e;
+      log('GitHub API error while polling (' + String(e.stderr || e.message).split('\n')[0].slice(0, 120) + '), retrying');
+      await sleep(30000);
+      continue;
+    }
     const line = v.jobs.map((j) => j.name + ':' + (j.conclusion || j.status) + (j.steps?.find((s) => s.status === 'in_progress') ? ' (' + j.steps.find((s) => s.status === 'in_progress').name + ')' : '')).join(' | ');
     if (line !== last) { log(line); last = line; }
     if (v.status === 'completed') {
