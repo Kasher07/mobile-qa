@@ -127,13 +127,23 @@ async function dismissTips() {
 
 let sid = null;
 let driver = null;
-async function wd(method, p, body) {
-  const r = await fetch('http://127.0.0.1:4444' + p, {
-    method,
-    headers: { 'content-type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(120000),
-  });
+async function wd(method, p, body, attempt = 0) {
+  let r;
+  try {
+    r = await fetch('http://127.0.0.1:4444' + p, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(120000),
+    });
+  } catch (e) {
+    // safaridriver drops a connection now and then ("fetch failed"): retry the same command twice.
+    if (attempt < 2 && !/aborted|timeout/i.test(String(e.name) + String(e.message))) {
+      await sleep(2000);
+      return wd(method, p, body, attempt + 1);
+    }
+    throw new Error('webdriver ' + method + ' ' + p.replace(/\/session\/[^/]+/, '') + ': ' + ((e.cause && e.cause.code) || e.message));
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(method + ' ' + p + ' ' + r.status + ' ' + JSON.stringify(j).slice(0, 300));
   return j.value;
