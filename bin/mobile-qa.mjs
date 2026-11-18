@@ -316,7 +316,7 @@ export function verdict(p) {
     if (/^(Safari Can.t Open the Page|Cannot Open Page|Failed to open page)$/i.test(pr.title || '')) bad.push('browser error page');
     if (pr.overflowX) bad.push('horizontal overflow ' + pr.scrollWidth + '>' + pr.innerWidth + ' [' + (pr.wide || []).slice(0, 3).join('; ') + ']');
     if (!pr.viewportMeta) bad.push('no viewport meta');
-    else if ((pr.scale && pr.scale < 0.98) || (pr.innerWidthRaw && pr.screenWidth && pr.innerWidthRaw > pr.screenWidth + 1)) bad.push('page zoomed out (content wider than the screen)');
+    else if ((pr.scale && pr.scale < 0.98) || (pr.innerWidthRaw && pr.screenWidth && pr.innerWidthRaw > pr.screenWidth + 1)) bad.push('page wider than the screen (browser zoomed out or widened the viewport)');
     if (typeof pr.textLen === 'number' && pr.textLen < 20 && !pr.media) bad.push('blank page (no text or images)');
   }
   if ((p.pageErrors || []).length) bad.push(p.pageErrors.length + ' JS errors: ' + p.pageErrors[0]);

@@ -22,8 +22,8 @@ test('redirect to another path is a note', () => {
 test('browser error page', () => isBad(pg({ probe: probe({ href: 'about:blank' }) }), /browser error page/));
 test('overflow', () => isBad(pg({ probe: probe({ overflowX: true, scrollWidth: 656 }) }), /overflow/));
 test('zoomed out page', () => {
-  isBad(pg({ probe: probe({ scale: 0.6 }) }), /zoomed out/);
-  isBad(pg({ probe: probe({ innerWidthRaw: 700 }) }), /zoomed out/);
+  isBad(pg({ probe: probe({ scale: 0.6 }) }), /wider than the screen/);
+  isBad(pg({ probe: probe({ innerWidthRaw: 700 }) }), /wider than the screen/);
 });
 test('missing viewport', () => isBad(pg({ probe: probe({ viewportMeta: false }) }), /viewport/));
 test('blank page', () => {
