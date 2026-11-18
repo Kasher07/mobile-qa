@@ -251,6 +251,10 @@ for (const [i, url] of urls.entries()) {
       await sleep(2000);
       await exec('window.scrollTo(0, 0);');
       cur.probe = await exec('return (' + probe.toString() + ')();');
+      for (let t = 0; t < 2 && cur.probe.challenge; t++) {
+        await sleep(12000);
+        cur.probe = await exec('return (' + probe.toString() + ')();');
+      }
       cur.status = cur.probe.navStatus;
       if (!cur.status) {
         // Safari may not expose responseStatus: ask the server directly (same URL, from the runner).

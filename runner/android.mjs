@@ -102,6 +102,12 @@ async function checkPage(cur, url, name) {
   await page.waitForTimeout(1200);
   await page.evaluate(() => window.scrollTo(0, 0));
   cur.probe = await page.evaluate(probe);
+  // A JS challenge (Cloudflare/Vercel) usually clears itself for a real browser after a few seconds: give it two chances.
+  for (let t = 0; t < 2 && cur.probe.challenge; t++) {
+    await page.waitForTimeout(12000);
+    await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
+    cur.probe = await page.evaluate(probe);
+  }
   const vh = cur.probe.innerHeight || 700;
   const plan = segmentPlan(cur.probe.scrollHeight, vh, MAX_SEG);
   cur.segmentsNeeded = plan.needed;
