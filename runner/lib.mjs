@@ -22,7 +22,19 @@ export function slug(url, i) {
 }
 
 export function newPage(url, name) {
-  return { url, name, status: null, error: null, probe: null, consoleErrors: [], pageErrors: [], failedRequests: [], shots: [] };
+  return { url, name, status: null, error: null, probe: null, consoleErrors: [], pageErrors: [], failedRequests: [], shots: [], segmentsNeeded: null };
+}
+
+// Screens needed to reach the page bottom when each step scrolls 90% of a screen; capped at max.
+export function segmentPlan(scrollHeight, vh, max) {
+  const needed = 1 + Math.max(0, Math.ceil((scrollHeight - vh) / (0.9 * vh)));
+  return { needed, count: Math.min(max, needed) };
+}
+
+// Saved after every page so a hang or a job timeout keeps what was done.
+export function saveResults(dir, results) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'results.json'), JSON.stringify(results, null, 2));
 }
 
 // Runs inside the page (Playwright evaluate or WebDriver execute): layout facts a screenshot alone can hide.

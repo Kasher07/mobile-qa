@@ -3,7 +3,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage } from './lib.mjs';
+import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage, segmentPlan, saveResults } from './lib.mjs';
 
 const OUT = path.resolve('out/ios');
 fs.mkdirSync(OUT, { recursive: true });
@@ -60,7 +60,7 @@ function shot(file) {
 // accessibility tree and taps the tip's Close button. Only buttons near a tip text are tapped, never page content.
 let axe = null;
 try {
-  run('axe', ['--version']);
+  run('sh', ['-c', 'command -v axe']);
   axe = 'axe';
 } catch {
   console.log('AXe not installed: Safari tips may stay on screen');
@@ -99,7 +99,7 @@ async function dismissTips() {
     const tip = nodes.find((n) => TIP_TEXT.test(n.label));
     if (!tip) return;
     const btn = nodes
-      .filter((n) => CLOSE_LABEL.test(n.label.trim()) && /button/i.test(n.type || 'button') && Math.abs(n.y - tip.y) < 400)
+      .filter((n) => CLOSE_LABEL.test(n.label.trim()) && /button/i.test(n.type) && Math.abs(n.y - tip.y) < 400)
       .sort((a, b) => Math.abs(a.y - tip.y) - Math.abs(b.y - tip.y))[0];
     if (!btn) {
       console.log('tip found but no close button: ' + tip.label.slice(0, 80));
@@ -165,9 +165,10 @@ async function startDriver() {
 
 // Close Safari's first-run tips before automation starts: a tap during a WebDriver session makes Safari show
 // "Safari is Running an Automated Test" over the page. The dismissal persists, so the automated Safari opens clean.
+// Taps happen only here, on a fixed neutral page, never on a page under test.
 if (axe && urls.length) {
   try {
-    run('xcrun', ['simctl', 'openurl', dev.udid, urls[0]]);
+    run('xcrun', ['simctl', 'openurl', dev.udid, 'https://example.com/']);
     await sleep(8000);
     await dismissTips();
     await sleep(1000);
@@ -192,7 +193,9 @@ for (const [i, url] of urls.entries()) {
       cur.probe = await exec('return (' + probe.toString() + ')();');
       cur.status = cur.probe.navStatus;
       const vh = cur.probe.innerHeight || 700;
-      const segs = Math.min(MAX_SEG, Math.max(1, Math.ceil(cur.probe.scrollHeight / vh)));
+      const plan = segmentPlan(cur.probe.scrollHeight, vh, MAX_SEG);
+      cur.segmentsNeeded = plan.needed;
+      const segs = plan.count;
       for (let k = 0; k < segs; k++) {
         if (k > 0) await exec('window.scrollTo(0, arguments[0]);', [Math.round(k * vh * 0.9)]);
         await sleep(k === 0 ? 300 : 700);
@@ -201,7 +204,6 @@ for (const [i, url] of urls.entries()) {
     } else {
       run('xcrun', ['simctl', 'openurl', dev.udid, url]);
       await sleep(9000);
-      await dismissTips();
       cur.shots.push(shot(name + '-01.jpg'));
     }
   } catch (e) {
@@ -210,6 +212,7 @@ for (const [i, url] of urls.entries()) {
       cur.shots.push(shot(name + '-error.jpg'));
     } catch {}
   }
+  saveResults(OUT, results);
 }
 if (sid) await wd('DELETE', '/session/' + sid).catch(() => {});
 if (driver) driver.kill();

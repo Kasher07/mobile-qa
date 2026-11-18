@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { _android as android } from 'playwright-core';
-import { readUrls, slug, probe, writeResults, maxSegments, newPage } from './lib.mjs';
+import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults } from './lib.mjs';
 
 const OUT = path.resolve('out/android');
 fs.mkdirSync(OUT, { recursive: true });
@@ -49,7 +49,9 @@ for (const [i, url] of urls.entries()) {
     await page.evaluate(() => window.scrollTo(0, 0));
     cur.probe = await page.evaluate(probe);
     const vh = cur.probe.innerHeight || 700;
-    const segs = Math.min(MAX_SEG, Math.max(1, Math.ceil(cur.probe.scrollHeight / vh)));
+    const plan = segmentPlan(cur.probe.scrollHeight, vh, MAX_SEG);
+    cur.segmentsNeeded = plan.needed;
+    const segs = plan.count;
     for (let k = 0; k < segs; k++) {
       if (k > 0) await page.evaluate((y) => window.scrollTo(0, y), Math.round(k * vh * 0.9));
       await page.waitForTimeout(k === 0 ? 300 : 600);
@@ -65,6 +67,7 @@ for (const [i, url] of urls.entries()) {
       cur.shots.push(f);
     } catch {}
   }
+  saveResults(OUT, results);
 }
 cur = null;
 await context.close().catch(() => {});
