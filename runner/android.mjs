@@ -39,7 +39,7 @@ async function ensureChromeOnTop(cur) {
 }
 
 const context = await device.launchBrowser();
-const page = context.pages()[0] || (await context.newPage());
+let page = context.pages()[0] || (await context.newPage());
 // A freshly booted emulator can lack DNS for a while; a page under test must not fail for that.
 for (let t = 0; t < 12; t++) {
   try {
@@ -63,21 +63,33 @@ async function gotoOnce(url) {
 let cur = null;
 // favicon.ico 404s are noise on almost every site.
 const noise = (u) => /\/favicon\.ico(\?|$)/.test(u || '');
-page.on('console', (m) => {
-  if (cur && m.type() === 'error' && !noise((m.location() || {}).url)) cur.consoleErrors.push(m.text().slice(0, 300));
-});
-page.on('pageerror', (e) => {
-  if (cur) cur.pageErrors.push(String((e && e.message) || e).slice(0, 300));
-});
-page.on('requestfailed', (r) => {
-  if (cur && !noise(r.url())) cur.failedRequests.push(((r.failure() && r.failure().errorText) || 'failed') + ' ' + r.url().slice(0, 200));
-});
-page.on('response', (r) => {
-  if (cur && r.status() >= 400 && !noise(r.url())) cur.failedRequests.push(r.status() + ' ' + r.url().slice(0, 200));
-});
+// Each page gets its own tab: a page left scrolled with work in flight blocked the next navigation in the same tab
+// (Moioi baseline, 2026-11-18). Dialogs (beforeunload, alert) are accepted so they never hold a navigation.
+function attach(p) {
+  p.on('dialog', (d) => d.accept().catch(() => {}));
+  p.on('console', (m) => {
+    if (cur && m.type() === 'error' && !noise((m.location() || {}).url)) cur.consoleErrors.push(m.text().slice(0, 300));
+  });
+  p.on('pageerror', (e) => {
+    if (cur) cur.pageErrors.push(String((e && e.message) || e).slice(0, 300));
+  });
+  p.on('requestfailed', (r) => {
+    if (cur && !noise(r.url())) cur.failedRequests.push(((r.failure() && r.failure().errorText) || 'failed') + ' ' + r.url().slice(0, 200));
+  });
+  p.on('response', (r) => {
+    if (cur && r.status() >= 400 && !noise(r.url())) cur.failedRequests.push(r.status() + ' ' + r.url().slice(0, 200));
+  });
+}
+attach(page);
 
 for (const [i, url] of urls.entries()) {
   const name = slug(url, i);
+  if (i > 0) {
+    const prev = page;
+    page = await context.newPage();
+    attach(page);
+    await prev.close({ runBeforeUnload: false }).catch(() => {});
+  }
   cur = newPage(url, name);
   results.pages.push(cur);
   try {
