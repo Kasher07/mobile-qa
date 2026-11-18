@@ -2,7 +2,7 @@
 // mobile-qa: real-phone screenshots of PUBLIC pages on GitHub Actions in the public repo Kasher07/mobile-qa
 // (iOS Simulator Safari + Android emulator Chrome), then download the results and delete the run.
 // Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android] [--out DIR] [--segments N]
-//        [--ios-device "iPhone SE (3rd generation)"] [--file urls.txt] [--keep]
+//        [--ios-device "iPhone SE (3rd generation)"] [--file urls.txt] [--keep] [--sweep-only]
 // Exit: 0 no issues, 1 issues found, 2 run failed / bad input / tool error.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -25,7 +25,7 @@ class InputError extends Error {}
 
 // ---- args
 export function parseArgs(argv) {
-  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', keep: false, urls: [] };
+  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', keep: false, sweepOnly: false, urls: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--platforms') opts.platforms = argv[++i];
@@ -33,6 +33,7 @@ export function parseArgs(argv) {
     else if (a === '--segments') opts.segments = Number(argv[++i]);
     else if (a === '--ios-device') opts.iosDevice = argv[++i] || '';
     else if (a === '--keep') opts.keep = true;
+    else if (a === '--sweep-only') opts.sweepOnly = true;
     else if (a === '--file') opts.urls.push(...fs.readFileSync(argv[++i], 'utf8').split(/\s+/).filter(Boolean));
     else if (a === '-h' || a === '--help') {
       console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 7).join('\n'));
@@ -243,6 +244,30 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
   });
 }
 
+// A caller killed hard (TerminateProcess on Windows runs no handler) leaves its run public. Every call first
+// sweeps runs of this workflow that no live caller can still own: finished more than STALE_DONE_MIN ago, or
+// started more than STALE_RUNNING_MIN ago (past any caller's deadline). Only "mq-" runs; --keep runs are "mqk-".
+const STALE_DONE_MIN = Number(process.env.MOBILE_QA_STALE_DONE_MIN || 30);
+const STALE_RUNNING_MIN = Number(process.env.MOBILE_QA_STALE_RUNNING_MIN || 120);
+async function sweep() {
+  const l = await api('GET', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/runs?per_page=50');
+  const now = Date.now();
+  let n = 0;
+  for (const x of (l && l.workflow_runs) || []) {
+    if (!/^mq-/.test(x.display_title || '')) continue;
+    const ageMin = (now - Date.parse(x.updated_at || x.created_at)) / 60000;
+    const startedMin = (now - Date.parse(x.run_started_at || x.created_at)) / 60000;
+    if (x.status === 'completed' && ageMin > STALE_DONE_MIN) {
+      await api('DELETE', '/repos/' + REPO + '/actions/runs/' + x.id).catch(() => {});
+      n++;
+    } else if (x.status !== 'completed' && startedMin > STALE_RUNNING_MIN) {
+      await api('POST', '/repos/' + REPO + '/actions/runs/' + x.id + '/cancel').catch(() => {});
+      log('cancelled abandoned run ' + x.display_title + ' (deleted on a later call)');
+    }
+  }
+  if (n) log('swept ' + n + ' abandoned run(s)');
+}
+
 function findResults(dir) {
   const found = [];
   if (!fs.existsSync(dir)) return found;
@@ -257,12 +282,13 @@ function findResults(dir) {
 async function main() {
   opts = parseArgs(process.argv.slice(2));
   const urls = [];
+  if (opts.sweepOnly) opts.urls = [];
   for (const raw of [...new Set(opts.urls)]) {
     const c = checkUrl(raw);
     if (c.why) throw new InputError('refused ' + raw + ': ' + c.why);
     if (!urls.includes(c.href)) urls.push(c.href);
   }
-  if (!urls.length) throw new InputError('no URLs. Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android]');
+  if (!urls.length && !opts.sweepOnly) throw new InputError('no URLs. Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android]');
   if (urls.length > PER_RUN * MAX_RUNS) throw new InputError('max ' + PER_RUN * MAX_RUNS + ' URLs per call (got ' + urls.length + '); split the list');
 
   try {
@@ -272,7 +298,9 @@ async function main() {
       '). If it is not logged in: gh auth login --web --scopes workflow, then gh auth switch --user KitTran1307');
   }
 
-  const baseId = 'mq-' + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '') + '-' + Math.random().toString(36).slice(2, 6);
+  await sweep();
+  if (opts.sweepOnly) return 0;
+  const baseId = (opts.keep ? 'mqk-' : 'mq-') + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '') + '-' + Math.random().toString(36).slice(2, 6);
   outDir = path.join(path.resolve(opts.out || path.join(os.tmpdir(), 'mobile-qa')), baseId); // always a fresh folder
   fs.mkdirSync(outDir, { recursive: true });
   const chunks = [];
@@ -360,6 +388,12 @@ async function main() {
   }
   const failed = runs.filter((r) => r.conclusion !== 'success' || !r.downloaded);
   if (failed.length) lines.push('Runs without full results: ' + failed.map((r) => r.rid + ' (' + r.conclusion + (r.downloaded ? '' : ', not downloaded') + ')').join(', '));
+  for (const r of failed) {
+    const fl = path.join(r.dir, 'failed.log');
+    if (!fs.existsSync(fl)) continue;
+    const errs = fs.readFileSync(fl, 'utf8').split('\n').filter((l) => /\bError\b|##\[error\]/.test(l)).slice(-3);
+    for (const e of errs) lines.push('  ' + r.rid + ': ' + e.replace(/^.*?Z /, '').slice(0, 300));
+  }
   fs.writeFileSync(path.join(outDir, 'summary.md'), lines.join('\n'));
   console.log(lines.join('\n'));
   log('summary: ' + path.join(outDir, 'summary.md'));

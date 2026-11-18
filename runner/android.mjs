@@ -23,6 +23,26 @@ await sh('pm grant com.android.chrome android.permission.POST_NOTIFICATIONS').ca
 
 const context = await device.launchBrowser();
 const page = context.pages()[0] || (await context.newPage());
+// A freshly booted emulator can lack DNS for a while; a page under test must not fail for that.
+for (let t = 0; t < 12; t++) {
+  try {
+    await page.goto('https://example.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    break;
+  } catch (e) {
+    console.log('network not ready (' + String(e.message).split('\n')[0].slice(0, 80) + '), waiting');
+    await page.waitForTimeout(5000);
+  }
+}
+async function gotoOnce(url) {
+  try {
+    return await page.goto(url, { waitUntil: 'load', timeout: 45000 });
+  } catch (e) {
+    if (!/net::ERR_/.test(String(e.message))) throw e;
+    console.log('retrying after ' + String(e.message).split('\n')[0].slice(0, 80));
+    await page.waitForTimeout(5000);
+    return page.goto(url, { waitUntil: 'load', timeout: 45000 });
+  }
+}
 let cur = null;
 page.on('console', (m) => {
   if (cur && m.type() === 'error') cur.consoleErrors.push(m.text().slice(0, 300));
@@ -42,7 +62,7 @@ for (const [i, url] of urls.entries()) {
   cur = newPage(url, name);
   results.pages.push(cur);
   try {
-    const resp = await page.goto(url, { waitUntil: 'load', timeout: 45000 });
+    const resp = await gotoOnce(url);
     cur.status = resp ? resp.status() : null;
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(1200);
