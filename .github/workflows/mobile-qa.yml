@@ -32,6 +32,11 @@ on:
         default: macos-15
         type: choice
         options: [macos-15, macos-15-intel, macos-26]
+      ios_mode:
+        description: webdriver (full checks) or openurl (screenshot only; to test the fallback)
+        default: webdriver
+        type: choice
+        options: [webdriver, openurl]
 
 permissions:
   contents: read
@@ -48,6 +53,7 @@ jobs:
     env:
       IOS_DEVICE: ${{ inputs.ios_device }}
       JOB_BUDGET_MIN: '36'
+      IOS_MODE: ${{ inputs.ios_mode || 'webdriver' }}
       AXE_URL: https://github.com/cameroncooke/AXe/releases/download/v2.0.4/AXe-macOS-v2.0.4-universal.tar.gz
       AXE_SHA256: 3178ec66d9ff46455fec737debad719c41cab16edb1435b2c721e07760a208c3
     steps:

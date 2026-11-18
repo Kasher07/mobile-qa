@@ -31,7 +31,7 @@ export function readUrlFile(f) {
   return fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !l.trim().startsWith('#')).flatMap((l) => l.match(/https?:\/\/[^\s<>`"')]+/g) || []);
 }
 export function parseArgs(argv) {
-  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', keep: false, sweepOnly: false, urls: [] };
+  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, urls: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--platforms') opts.platforms = argv[++i];
@@ -40,6 +40,7 @@ export function parseArgs(argv) {
     else if (a === '--ios-device') opts.iosDevice = argv[++i] || '';
     else if (a === '--keep') opts.keep = true;
     else if (a === '--sweep-only') opts.sweepOnly = true;
+    else if (a === '--ios-mode') opts.iosMode = argv[++i];
     else if (a === '--file') opts.urls.push(...readUrlFile(argv[++i]));
     else if (a === '-h' || a === '--help') {
       console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 7).join('\n'));
@@ -50,6 +51,7 @@ export function parseArgs(argv) {
   if (!/^(ios|android|ios,android|android,ios)$/.test(opts.platforms || '')) throw new InputError('--platforms must be ios, android or ios,android');
   if (!Number.isInteger(opts.segments) || opts.segments < 1 || opts.segments > 12) throw new InputError('--segments must be 1..12');
   if (/[\r\n]/.test(opts.iosDevice)) throw new InputError('bad --ios-device');
+  if (!/^(webdriver|openurl)$/.test(opts.iosMode)) throw new InputError('--ios-mode must be webdriver or openurl');
   return opts;
 }
 
@@ -193,7 +195,7 @@ async function dispatch(chunk, i, baseId, total, extra = {}) {
     // Never retried: a POST that timed out may still have queued a run (duplicates would stay public).
     const res = await api('POST', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/dispatches', {
       ref: 'main',
-      inputs: { urls: chunk.join('\n'), platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool] },
+      inputs: { urls: chunk.join('\n'), platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool], ios_mode: opts.iosMode },
       return_run_details: true,
     }, { retry: false });
     id = res && (res.workflow_run_id || res.id);
@@ -312,6 +314,18 @@ async function sweep() {
   if (n) log('swept ' + n + ' abandoned run(s)');
 }
 
+// What to do with a finished run whose jobs did not all succeed. Only jobs that never got a runner (no runner name, no
+// steps) are retried: a real failure is reported, never retried until green. A starved iOS job moves to the next macOS
+// pool when there is one; otherwise the starved jobs are re-run in place.
+export function starvedAction(jobs, pool, poolCount) {
+  const bad = (jobs || []).filter((x) => x.conclusion !== 'success' && x.conclusion !== 'skipped');
+  const starved = bad.filter((x) => !x.runner_name && !(x.steps || []).length);
+  const redo = starved.map((x) => x.name).sort().join(',');
+  if (!bad.length || starved.length !== bad.length) return { action: 'none', redo };
+  if (starved.some((x) => x.name === 'ios') && pool < poolCount - 1) return { action: 'move', redo };
+  return { action: 'rerun', redo };
+}
+
 // What counts as an issue (bad) or a remark (notes) for one page. Exported for tests: a broken page must never be "ok".
 export function verdict(p) {
   const pr = p.probe || {};
@@ -415,28 +429,32 @@ async function main() {
       r.status = v.status;
       r.conclusion = v.conclusion;
       if (r.status !== 'completed') continue;
-      if (r.conclusion !== 'success' && r.reruns < MAX_RERUNS) {
-        // Re-run only when every failed job never got a runner (no runner name, no steps): a real failure is
-        // reported, never retried until green.
-        const j = await api('GET', '/repos/' + REPO + '/actions/runs/' + r.id + '/jobs?filter=latest');
-        const bad = ((j && j.jobs) || []).filter((x) => x.conclusion !== 'success' && x.conclusion !== 'skipped');
-        const starved = bad.filter((x) => !x.runner_name && !(x.steps || []).length);
-        const starvedIos = starved.some((x) => x.name === 'ios');
-        if (bad.length && starved.length === bad.length && starvedIos && r.pool < IOS_POOLS.length - 1) {
+      let conclusion = r.conclusion;
+      let jobs = null;
+      if (process.env.MOBILE_QA_TEST_STARVE_IOS === '1' && r.pool === 0 && r.platforms.includes('ios')) {
+        // Fault injection for the pool fallback test: pretend GitHub never started the iOS job on the first pool.
+        jobs = ((await api('GET', '/repos/' + REPO + '/actions/runs/' + r.id + '/jobs?filter=latest')).jobs || []).map((x) =>
+          x.name === 'ios' ? Object.assign({}, x, { conclusion: 'cancelled', runner_name: '', steps: [] }) : x);
+        conclusion = 'failure';
+        log(r.rid + ': TEST: treating the iOS job as never started');
+      }
+      if (conclusion !== 'success' && r.reruns < MAX_RERUNS) {
+        if (!jobs) jobs = (await api('GET', '/repos/' + REPO + '/actions/runs/' + r.id + '/jobs?filter=latest')).jobs || [];
+        const act = starvedAction(jobs, r.pool, IOS_POOLS.length);
+        if (act.action === 'move') {
           // Another macOS pool usually has capacity: keep what this run produced, start the starved platforms on the next pool.
           r.downloaded = download(r);
           await removeRun(r);
           r.replaced = true;
           r.finished = true;
-          const redo = starved.map((x) => x.name).sort().join(',');
-          log(r.rid + ': GitHub gave no runner to ' + redo + ' on ' + IOS_POOLS[r.pool] + ', moving it to ' + IOS_POOLS[r.pool + 1]);
-          await dispatch(r.chunk, r.i, baseId, r.total, { suffix: '-p' + (r.pool + 1), platforms: redo, pool: r.pool + 1, dir: r.dir });
+          log(r.rid + ': GitHub gave no runner to ' + act.redo + ' on ' + IOS_POOLS[r.pool] + ', moving it to ' + IOS_POOLS[r.pool + 1]);
+          await dispatch(r.chunk, r.i, baseId, r.total, { suffix: '-p' + (r.pool + 1), platforms: act.redo, pool: r.pool + 1, dir: r.dir });
           continue;
         }
-        if (bad.length && starved.length === bad.length) {
+        if (act.action === 'rerun') {
           r.reruns++;
           r.minAttempt = (v.run_attempt || 1) + 1;
-          log(r.rid + ': GitHub gave no runner to ' + starved.map((x) => x.name).join(', ') + ', re-running (' + r.reruns + '/' + MAX_RERUNS + ')');
+          log(r.rid + ': GitHub gave no runner to ' + act.redo + ', re-running (' + r.reruns + '/' + MAX_RERUNS + ')');
           await api('POST', '/repos/' + REPO + '/actions/runs/' + r.id + '/rerun-failed-jobs');
           r.status = 'queued';
           r.conclusion = null;

@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Infrastructure noise fixture</title>
+<script>
+console.error("[Report Only] Refused to load the script 'https://example.com/x.js' because it violates the following Content Security Policy directive: \"script-src 'none'\".");
+console.error("Refused to connect to 'data:,' because it violates the document's Content Security Policy.");
+fetch('https://challenges.cloudflare.com/cdn-cgi/challenge-platform/mobile-qa-fixture').catch(function () {});
+</script>
+</head>
+<body style="font-family:system-ui;padding:16px">
+<h1>Infrastructure noise</h1>
+<p>Page Shield and Turnstile style console lines and a challenges.cloudflare.com request: they must be counted as infrastructure, not as page errors.</p>
+</body>
+</html>

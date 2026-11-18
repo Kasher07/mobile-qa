@@ -231,6 +231,10 @@ for (const [n, cand] of candidates.slice(0, 2).entries()) {
     continue;
   }
   await warmUp();
+  if (process.env.IOS_MODE === 'openurl') {
+    note('openurl mode requested: screenshots only, no page checks');
+    break;
+  }
   hasWd = await startDriver();
   if (hasWd) break;
   note('no WebDriver session on ' + dev.name + ' ' + dev.runtime + ' ' + dev.udid + (n < 2 ? ', trying the next simulator' : ''));
