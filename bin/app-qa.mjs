@@ -92,7 +92,16 @@ try {
     const v = JSON.parse(gh(['run', 'view', String(runId), '-R', REPO, '--json', 'status,conclusion,jobs']));
     const line = v.jobs.map((j) => j.name + ':' + (j.conclusion || j.status) + (j.steps?.find((s) => s.status === 'in_progress') ? ' (' + j.steps.find((s) => s.status === 'in_progress').name + ')' : '')).join(' | ');
     if (line !== last) { log(line); last = line; }
-    if (v.status === 'completed') { code = v.conclusion === 'success' ? 0 : 1; break; }
+    if (v.status === 'completed') {
+      code = v.conclusion === 'success' ? 0 : 1;
+      for (const j of v.jobs.filter((x) => x.conclusion !== 'success')) {
+        try {
+          const ann = JSON.parse(gh(['api', 'repos/' + REPO + '/check-runs/' + j.databaseId + '/annotations']));
+          for (const a of ann) log(j.name + ' annotation: ' + String(a.message).slice(0, 400));
+        } catch { /* none */ }
+      }
+      break;
+    }
     if (Date.now() > deadline) throw new Error('timed out');
     await sleep(30000);
   }

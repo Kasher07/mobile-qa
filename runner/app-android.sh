@@ -8,6 +8,7 @@ APK=$(ls app/android/app/build/outputs/apk/release/*.apk | head -1)
 AAPT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
 { echo "apk_bytes=$(stat -c %s "$APK") (x86_64 only)"
   "$AAPT" dump permissions "$APK" | sed 's/^/manifest: /'
+  unzip -l "$APK" | awk '/lib\/.*\.so$/ {print "so: " $4 " " $1}'
   "$AAPT" dump xmltree --file AndroidManifest.xml "$APK" | grep -E "allowBackup|fullBackupContent|dataExtractionRules" | sed 's/^ */manifest: /'
 } > "$OUT/checks.txt"
 adb install -r "$APK"
