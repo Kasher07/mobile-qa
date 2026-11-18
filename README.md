@@ -12,6 +12,9 @@ targets, viewport meta, HTTP status) and, on Android, JS errors, console errors 
 node bin/mobile-qa.mjs https://example.com https://example.com/pricing [--platforms ios,android] [--out DIR]
 ```
 
+Self-check: `npm test`; fixtures at https://kasher07.github.io/mobile-qa/; fault paths with `MOBILE_QA_TEST_STARVE_IOS=1`,
+`MOBILE_QA_TEST_FAULT=android-setup` and `--ios-mode openurl`.
+
 The client dispatches `.github/workflows/mobile-qa.yml`, waits, downloads the artifacts and deletes the run, so URLs
 and screenshots do not stay public. Only public URLs are accepted (no localhost, private IPs, credentials or
 secret-looking query parameters).
