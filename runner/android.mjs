@@ -95,13 +95,17 @@ function attach(p) {
 }
 attach(page);
 
+const stamp = (t0, s) => console.log('      ' + Math.round((Date.now() - t0) / 1000) + 's ' + s);
 async function checkPage(cur, url, name) {
+  const t0 = Date.now();
   const resp = await gotoOnce(url);
+  stamp(t0, 'loaded');
   cur.status = resp ? resp.status() : null;
   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(1200);
   await page.evaluate(() => window.scrollTo(0, 0));
   cur.probe = await page.evaluate(probe);
+  stamp(t0, 'probed');
   // A JS challenge (Cloudflare/Vercel) usually clears itself for a real browser after a few seconds: give it two chances.
   for (let t = 0; t < 2 && cur.probe.challenge; t++) {
     await page.waitForTimeout(12000);
@@ -116,8 +120,9 @@ async function checkPage(cur, url, name) {
     await page.waitForTimeout(k === 0 ? 300 : 600);
     await ensureChromeOnTop(cur);
     const f = name + '-' + String(k + 1).padStart(2, '0') + '.png';
-    fs.writeFileSync(path.join(OUT, f), await device.screenshot());
+    fs.writeFileSync(path.join(OUT, f), await withTimeout(device.screenshot(), 30000, 'screenshot'));
     cur.shots.push(f);
+    stamp(t0, 'screen ' + (k + 1));
   }
 }
 
@@ -141,7 +146,25 @@ for (const [i, url] of urls.entries()) {
   console.log('[' + (i + 1) + '/' + urls.length + '] ' + url);
   const t0 = Date.now();
   try {
-    await withTimeout(checkPage(cur, url, name), PAGE_LIMIT_MS, 'page');
+    try {
+      await withTimeout(checkPage(cur, url, name), PAGE_LIMIT_MS, 'page');
+    } catch (e) {
+      // The emulator stalls now and then in its first minutes (launcher ANRs): one more try in a fresh tab. A page that
+      // really hangs fails again and is reported; a retry is always written in the notes.
+      if (!/did not finish|net::ERR_/.test(String(e.message)) || Date.now() - STARTED > JOB_BUDGET_MS - PAGE_LIMIT_MS) throw e;
+      console.log('    retrying after: ' + String(e.message).split('\n')[0].slice(0, 100));
+      cur.retried = String(e.message).split('\n')[0].slice(0, 120);
+      for (const f of cur.shots) fs.rmSync(path.join(OUT, f), { force: true });
+      cur.shots = [];
+      cur.consoleErrors = [];
+      cur.pageErrors = [];
+      cur.failedRequests = [];
+      const prev = page;
+      page = await withTimeout(context.newPage(), 30000, 'new tab');
+      attach(page);
+      prev.close({ runBeforeUnload: false }).catch(() => {});
+      await withTimeout(checkPage(cur, url, name), PAGE_LIMIT_MS, 'page (retry)');
+    }
   } catch (e) {
     cur.error = String((e && e.message) || e).split('\n')[0].slice(0, 300);
     try {
