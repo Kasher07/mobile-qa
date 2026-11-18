@@ -82,7 +82,14 @@ export function probe() {
     smallTapTargets: [],
     viewportMeta: !!document.querySelector('meta[name=viewport]'),
     navStatus: typeof nav.responseStatus === 'number' ? nav.responseStatus : null,
+    challenge: null,
   };
+  // Bot-protection pages (Cloudflare, Vercel, Akamai...) are what an automated browser on a datacenter IP sees, not users.
+  const text = document.body ? document.body.innerText.slice(0, 2000) : '';
+  if (/^Just a moment\.\.\.$|Attention Required|Security Checkpoint|^Access denied/i.test(document.title) ||
+      /Verify you are human|Performing security verification|checking your browser|Vercel Security Checkpoint/i.test(text)) {
+    out.challenge = /vercel/i.test(document.title + text) ? 'Vercel' : /cloudflare/i.test(text) || /Just a moment/.test(document.title) ? 'Cloudflare' : 'bot protection';
+  }
   const label = (el) => {
     const cls = typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
     return el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + cls;

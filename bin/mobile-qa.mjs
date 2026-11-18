@@ -312,7 +312,14 @@ export function verdict(p) {
   const notes = [];
   if (p.error) bad.push('ERROR ' + p.error);
   if (!p.probe && !p.error) bad.push('not checked (no page probe' + (p.mode ? ', mode ' + p.mode : '') + ')');
-  if (p.status && p.status >= 400) bad.push('HTTP ' + p.status);
+  const pr0 = p.probe || {};
+  if (pr0.challenge) bad.push('blocked by ' + pr0.challenge + ' bot protection: page not checked (users do not see this; it hits automated browsers on GitHub IPs)');
+  else if (p.status && p.status >= 400) {
+    // A status from the runner's own request (iOS fallback) is a hint only: bot rules answer 403/429/503 to it while
+    // Safari got the real page.
+    if (p.statusSource && [401, 403, 429, 503].includes(p.status) && (pr0.textLen || 0) > 200) notes.push('server answered ' + p.status + ' to a non-browser request (Safari got the page)');
+    else bad.push('HTTP ' + p.status);
+  }
   if (p.probe) {
     let from = null;
     let to = null;

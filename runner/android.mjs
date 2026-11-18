@@ -76,7 +76,13 @@ function attach(p) {
     if (cur) cur.pageErrors.push(String((e && e.message) || e).slice(0, 300));
   });
   p.on('requestfailed', (r) => {
-    if (cur && !noise(r.url())) cur.failedRequests.push(((r.failure() && r.failure().errorText) || 'failed') + ' ' + r.url().slice(0, 200));
+    const aborted = r.failure() && /ERR_ABORTED/.test(r.failure().errorText);
+    let crossOrigin = false;
+    try {
+      crossOrigin = new URL(r.url()).origin !== new URL(p.url()).origin;
+    } catch {}
+    // Analytics beacons cut off by the next navigation are noise, not a broken page.
+    if (cur && !noise(r.url()) && !(aborted && crossOrigin)) cur.failedRequests.push(((r.failure() && r.failure().errorText) || 'failed') + ' ' + r.url().slice(0, 200));
   });
   p.on('response', (r) => {
     if (cur && r.status() >= 400 && !noise(r.url())) cur.failedRequests.push(r.status() + ' ' + r.url().slice(0, 200));

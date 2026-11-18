@@ -35,4 +35,15 @@ test('JS errors and missing screenshots', () => {
   isBad(pg({ shots: [] }), /no screenshot/);
 });
 test('system window over the page', () => isBad(pg({ overlay: 'Application Not Responding: launcher' }), /system window/));
+test('bot challenge is reported as blocked, not as a page bug', () => {
+  const v = verdict(pg({ status: 403, probe: probe({ challenge: 'Cloudflare', textLen: 274 }) }));
+  assert.ok(v.bad.some((b) => /blocked by Cloudflare/.test(b)));
+  assert.ok(!v.bad.some((b) => /^HTTP/.test(b)));
+});
+test('403 from the runner fetch on a real page is a note', () => {
+  const v = verdict(pg({ status: 403, statusSource: 'server request from the runner' }));
+  assert.deepEqual(v.bad, []);
+  assert.ok(v.notes.some((n) => /non-browser/.test(n)));
+});
+test('403 from the browser itself stays an issue', () => isBad(pg({ status: 403 }), /HTTP 403/));
 test('truncated screens are noted', () => assert.ok(verdict(pg({ segmentsNeeded: 8 })).notes.some((n) => /1\/8/.test(n))));
