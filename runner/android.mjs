@@ -64,13 +64,18 @@ async function gotoOnce(url) {
 }
 let cur = null;
 // favicon.ico 404s are noise on almost every site.
-const noise = (u) => /\/favicon\.ico(\?|$)/.test(u || '');
+const noise = (u) => /\/favicon\.ico(\?|$)/.test(u || '') || /^https:\/\/([a-z0-9-]+\.)*challenges\.cloudflare\.com\//.test(u || '');
+// Console lines that are infrastructure, not the page: Cloudflare Page Shield's Report-Only CSP monitor and the probes
+// Cloudflare Turnstile makes on purpose. Counted apart so a real error never hides among them.
+const infraNoise = (t) => /^\[Report Only\]/.test(t) || /Refused to connect to 'data:,'/.test(t);
 // Each page gets its own tab: a page left scrolled with work in flight blocked the next navigation in the same tab
 // (Moioi baseline, 2026-11-18). Dialogs (beforeunload, alert) are accepted so they never hold a navigation.
 function attach(p) {
   p.on('dialog', (d) => d.accept().catch(() => {}));
   p.on('console', (m) => {
-    if (cur && m.type() === 'error' && !noise((m.location() || {}).url)) cur.consoleErrors.push(m.text().slice(0, 300));
+    if (!cur || m.type() !== 'error' || noise((m.location() || {}).url)) return;
+    if (infraNoise(m.text())) cur.infraNoise = (cur.infraNoise || 0) + 1;
+    else cur.consoleErrors.push(m.text().slice(0, 300));
   });
   p.on('pageerror', (e) => {
     if (cur) cur.pageErrors.push(String((e && e.message) || e).slice(0, 300));

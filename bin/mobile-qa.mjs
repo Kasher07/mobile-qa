@@ -340,6 +340,7 @@ export function verdict(p) {
   if (!(p.shots || []).length) bad.push('no screenshot');
   if (p.overlay) bad.push('a system window covered the page: ' + p.overlay);
   if ((p.consoleErrors || []).length) notes.push(p.consoleErrors.length + ' console errors');
+  if (p.infraNoise) notes.push(p.infraNoise + ' Cloudflare Page Shield/Turnstile console lines (not the page)');
   if ((p.failedRequests || []).length) notes.push(p.failedRequests.length + ' failed requests');
   if ((pr.smallTapTargets || []).length) notes.push(pr.smallTapTargets.length + ' tap targets <24px');
   if (p.segmentsNeeded && p.segmentsNeeded > (p.shots || []).length) notes.push('screens ' + (p.shots || []).length + '/' + p.segmentsNeeded + ' (raise --segments to see the rest)');
