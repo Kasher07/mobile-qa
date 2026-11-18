@@ -3,6 +3,20 @@ import path from 'node:path';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// One page may never hang the whole job: each page has its own limit, and the job stops starting pages once its
+// budget is used, so results.json and the screenshots are always uploaded before GitHub's job timeout.
+export const PAGE_LIMIT_MS = 150000;
+export const JOB_BUDGET_MS = 22 * 60000;
+export function withTimeout(promise, ms, what) {
+  let t;
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => {
+      t = setTimeout(() => rej(new Error(what + ' did not finish in ' + Math.round(ms / 1000) + ' s')), ms);
+    }),
+  ]).finally(() => clearTimeout(t));
+}
+
 export function readUrls() {
   return (process.env.URLS || '')
     .split(/[\s,]+/)

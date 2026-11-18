@@ -3,7 +3,9 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage, segmentPlan, saveResults } from './lib.mjs';
+import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
+
+const STARTED = Date.now();
 
 const OUT = path.resolve('out/ios');
 fs.mkdirSync(OUT, { recursive: true });
@@ -189,6 +191,12 @@ for (const [i, url] of urls.entries()) {
   const name = slug(url, i);
   const cur = newPage(url, name);
   results.pages.push(cur);
+  if (Date.now() - STARTED > JOB_BUDGET_MS) {
+    cur.error = 'not checked: the job time budget was used by earlier pages';
+    saveResults(OUT, results);
+    continue;
+  }
+  console.log('[' + (i + 1) + '/' + urls.length + '] ' + url);
   try {
     if (hasWd) {
       await wd('POST', '/session/' + sid + '/url', { url });

@@ -220,8 +220,14 @@ function download(r) {
 function saveFailedLog(r) {
   try {
     const out = execFileSync('gh', ['run', 'view', String(r.id), '-R', REPO, '--log-failed'], { env: ghEnv(), encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+    let text = out;
+    if (!text.trim()) {
+      // A job cancelled by its timeout has no "failed step": keep the tail of the whole log instead.
+      const all = execFileSync('gh', ['run', 'view', String(r.id), '-R', REPO, '--log'], { env: ghEnv(), encoding: 'utf8', maxBuffer: 256 << 20, stdio: ['ignore', 'pipe', 'pipe'] });
+      text = all.split('\n').slice(-600).join('\n');
+    }
     fs.mkdirSync(r.dir, { recursive: true });
-    fs.writeFileSync(path.join(r.dir, 'failed.log'), out);
+    fs.writeFileSync(path.join(r.dir, 'failed.log'), text);
     log(r.rid + ': failed-step log saved to ' + path.join(r.dir, 'failed.log'));
   } catch (e) {
     log(r.rid + ': could not save the failed log: ' + String(e.stderr || e.message).slice(0, 200));

@@ -3,7 +3,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { _android as android } from 'playwright-core';
-import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults } from './lib.mjs';
+import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
+
+const STARTED = Date.now();
 
 const OUT = path.resolve('out/android');
 fs.mkdirSync(OUT, { recursive: true });
@@ -82,46 +84,61 @@ function attach(p) {
 }
 attach(page);
 
+async function checkPage(cur, url, name) {
+  const resp = await gotoOnce(url);
+  cur.status = resp ? resp.status() : null;
+  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  cur.probe = await page.evaluate(probe);
+  const vh = cur.probe.innerHeight || 700;
+  const plan = segmentPlan(cur.probe.scrollHeight, vh, MAX_SEG);
+  cur.segmentsNeeded = plan.needed;
+  for (let k = 0; k < plan.count; k++) {
+    if (k > 0) await page.evaluate((y) => window.scrollTo(0, y), Math.round(k * vh * 0.9));
+    await page.waitForTimeout(k === 0 ? 300 : 600);
+    await ensureChromeOnTop(cur);
+    const f = name + '-' + String(k + 1).padStart(2, '0') + '.png';
+    fs.writeFileSync(path.join(OUT, f), await device.screenshot());
+    cur.shots.push(f);
+  }
+}
+
 for (const [i, url] of urls.entries()) {
   const name = slug(url, i);
-  if (i > 0) {
-    const prev = page;
-    page = await context.newPage();
-    attach(page);
-    await prev.close({ runBeforeUnload: false }).catch(() => {});
-  }
   cur = newPage(url, name);
   results.pages.push(cur);
-  try {
-    const resp = await gotoOnce(url);
-    cur.status = resp ? resp.status() : null;
-    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(1200);
-    await page.evaluate(() => window.scrollTo(0, 0));
-    cur.probe = await page.evaluate(probe);
-    const vh = cur.probe.innerHeight || 700;
-    const plan = segmentPlan(cur.probe.scrollHeight, vh, MAX_SEG);
-    cur.segmentsNeeded = plan.needed;
-    const segs = plan.count;
-    for (let k = 0; k < segs; k++) {
-      if (k > 0) await page.evaluate((y) => window.scrollTo(0, y), Math.round(k * vh * 0.9));
-      await page.waitForTimeout(k === 0 ? 300 : 600);
-      await ensureChromeOnTop(cur);
-      const f = name + '-' + String(k + 1).padStart(2, '0') + '.png';
-      fs.writeFileSync(path.join(OUT, f), await device.screenshot());
-      cur.shots.push(f);
+  if (Date.now() - STARTED > JOB_BUDGET_MS) {
+    cur.error = 'not checked: the job time budget was used by earlier pages';
+    saveResults(OUT, results);
+    continue;
+  }
+  if (i > 0) {
+    const prev = page;
+    page = await withTimeout(context.newPage(), 30000, 'new tab').catch(() => page);
+    if (page !== prev) {
+      attach(page);
+      prev.close({ runBeforeUnload: false }).catch(() => {});
     }
+  }
+  console.log('[' + (i + 1) + '/' + urls.length + '] ' + url);
+  const t0 = Date.now();
+  try {
+    await withTimeout(checkPage(cur, url, name), PAGE_LIMIT_MS, 'page');
   } catch (e) {
     cur.error = String((e && e.message) || e).split('\n')[0].slice(0, 300);
     try {
       const f = name + '-error.png';
-      fs.writeFileSync(path.join(OUT, f), await device.screenshot());
+      fs.writeFileSync(path.join(OUT, f), await withTimeout(device.screenshot(), 20000, 'screenshot'));
       cur.shots.push(f);
     } catch {}
   }
+  console.log('    ' + (cur.error ? 'error: ' + cur.error : 'ok') + ' in ' + Math.round((Date.now() - t0) / 1000) + ' s, ' + cur.shots.length + ' screens');
   saveResults(OUT, results);
 }
 cur = null;
-await context.close().catch(() => {});
-await device.close().catch(() => {});
+// Results first: closing Chrome or adb has hung before, and nothing may stop the upload step.
 writeResults(OUT, results);
+await withTimeout(context.close(), 20000, 'close').catch(() => {});
+await withTimeout(device.close(), 20000, 'adb close').catch(() => {});
+process.exit(0);
