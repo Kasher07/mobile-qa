@@ -161,8 +161,16 @@ async function startDriver() {
     note('safaridriver --enable failed: ' + String(e.stderr || e).slice(0, 200));
   }
   const caps = { browserName: 'safari', platformName: 'iOS', 'safari:useSimulator': true, 'safari:deviceUDID': dev.udid };
-  for (let round = 1; round <= 2; round++) {
+  // safaridriver gives up after ~40 s when Safari is slow to start ("timed out while connecting to a Safari
+  // instance"): launch Safari once first so its cold start is paid before the session, and allow 4 rounds.
+  for (let round = 1; round <= 4; round++) {
     if (driver) driver.kill();
+    try {
+      run('xcrun', ['simctl', 'launch', dev.udid, 'com.apple.mobilesafari'], { timeout: 120000 });
+      await sleep(round === 1 ? 10000 : 20000);
+    } catch (e) {
+      note('Safari pre-launch failed: ' + String(e.stderr || e.message).slice(0, 120));
+    }
     try {
       run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
     } catch {}
@@ -183,7 +191,7 @@ async function startDriver() {
     } catch (e) {
       note('session round ' + round + ' failed after ' + Math.round((Date.now() - t0) / 1000) + ' s: ' + e.message.slice(0, 200));
     }
-    await sleep(5000);
+    await sleep(10000);
   }
   if (driver) driver.kill();
   driver = null;

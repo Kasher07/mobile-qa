@@ -27,7 +27,8 @@ class InputError extends Error {}
 // ---- args
 // One URL per line; blank lines and lines starting with # are ignored.
 export function readUrlFile(f) {
-  return fs.readFileSync(f, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).flatMap((l) => l.split(/\s+/));
+  // Plain list or markdown: every http(s) URL outside a # line is taken; prose and bullets around it are ignored.
+  return fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !l.trim().startsWith('#')).flatMap((l) => l.match(/https?:\/\/[^\s<>`"')]+/g) || []);
 }
 export function parseArgs(argv) {
   const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', keep: false, sweepOnly: false, urls: [] };
@@ -179,14 +180,20 @@ async function findRunByTitle(rid) {
   return m ? m.id : null;
 }
 
-async function dispatch(chunk, i, baseId, total) {
-  const rid = total > 1 ? baseId + '-' + (i + 1) : baseId;
+// macOS runner pools tried in order when GitHub never starts the iOS job (capacity constraints on one pool).
+// Tested 2026-11-18: macos-15-intel works (slow, ~17 min for one page); macos-26 never got a Safari WebDriver session.
+const IOS_POOLS = (process.env.MOBILE_QA_IOS_POOLS || 'macos-15,macos-15-intel').split(',');
+
+async function dispatch(chunk, i, baseId, total, extra = {}) {
+  const rid = (total > 1 ? baseId + '-' + (i + 1) : baseId) + (extra.suffix || '');
+  const platforms = extra.platforms || opts.platforms;
+  const pool = extra.pool || 0;
   let id = null;
   try {
     // Never retried: a POST that timed out may still have queued a run (duplicates would stay public).
     const res = await api('POST', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/dispatches', {
       ref: 'main',
-      inputs: { urls: chunk.join('\n'), platforms: opts.platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice },
+      inputs: { urls: chunk.join('\n'), platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool] },
       return_run_details: true,
     }, { retry: false });
     id = res && (res.workflow_run_id || res.id);
@@ -199,10 +206,10 @@ async function dispatch(chunk, i, baseId, total) {
     id = await findRunByTitle(rid);
   }
   if (!id) throw new Error('could not find the run of ' + rid);
-  const dir = total > 1 ? path.join(outDir, 'part' + (i + 1)) : outDir;
-  const r = { rid, id, chunk, status: 'queued', conclusion: null, dir, deleted: false, downloaded: false, reruns: 0 };
+  const dir = extra.dir || (total > 1 ? path.join(outDir, 'part' + (i + 1)) : outDir);
+  const r = { rid, id, chunk, i, total, platforms, pool, status: 'queued', conclusion: null, dir, deleted: false, downloaded: false, reruns: 0 };
   runs.push(r);
-  log('run ' + rid + ' -> ' + runUrl(id) + ' (' + chunk.length + ' URLs, ' + opts.platforms + ')');
+  log('run ' + rid + ' -> ' + runUrl(id) + ' (' + chunk.length + ' URLs, ' + platforms + (platforms.includes('ios') ? ', iOS on ' + IOS_POOLS[pool] : '') + ')');
   return r;
 }
 
@@ -213,7 +220,7 @@ function download(r) {
   } catch (e) {
     log(r.rid + ': download failed: ' + String(e.stderr || e.message).slice(0, 200));
   }
-  const want = opts.platforms.split(',');
+  const want = (r.platforms || opts.platforms).split(',');
   return want.every((p) => fs.existsSync(path.join(r.dir, p, 'results.json')));
 }
 
@@ -414,6 +421,18 @@ async function main() {
         const j = await api('GET', '/repos/' + REPO + '/actions/runs/' + r.id + '/jobs?filter=latest');
         const bad = ((j && j.jobs) || []).filter((x) => x.conclusion !== 'success' && x.conclusion !== 'skipped');
         const starved = bad.filter((x) => !x.runner_name && !(x.steps || []).length);
+        const starvedIos = starved.some((x) => x.name === 'ios');
+        if (bad.length && starved.length === bad.length && starvedIos && r.pool < IOS_POOLS.length - 1) {
+          // Another macOS pool usually has capacity: keep what this run produced, start the starved platforms on the next pool.
+          r.downloaded = download(r);
+          await removeRun(r);
+          r.replaced = true;
+          r.finished = true;
+          const redo = starved.map((x) => x.name).sort().join(',');
+          log(r.rid + ': GitHub gave no runner to ' + redo + ' on ' + IOS_POOLS[r.pool] + ', moving it to ' + IOS_POOLS[r.pool + 1]);
+          await dispatch(r.chunk, r.i, baseId, r.total, { suffix: '-p' + (r.pool + 1), platforms: redo, pool: r.pool + 1, dir: r.dir });
+          continue;
+        }
         if (bad.length && starved.length === bad.length) {
           r.reruns++;
           r.minAttempt = (v.run_attempt || 1) + 1;
@@ -466,7 +485,7 @@ async function main() {
     }
     lines.push('');
   }
-  const failed = runs.filter((r) => r.conclusion !== 'success' || !r.downloaded);
+  const failed = runs.filter((r) => !r.replaced && (r.conclusion !== 'success' || !r.downloaded));
   if (failed.length) lines.push('Runs without full results: ' + failed.map((r) => r.rid + ' (' + r.conclusion + (r.downloaded ? '' : ', not downloaded') + ')').join(', '));
   for (const r of failed) {
     const fl = path.join(r.dir, 'failed.log');
