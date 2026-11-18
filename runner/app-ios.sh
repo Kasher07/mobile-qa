@@ -22,7 +22,7 @@ status=0
 run_flows() { # $1 = output folder, $2.. = flows
   local dir="$1"; shift
   ( cd "$dir" && maestro --device "$UDID" test --format junit --output "$dir/junit.xml" --test-output-dir "$dir/maestro" "$@" ) > "$dir/maestro.log" 2>&1 || status=1
-  tail -40 "$dir/maestro.log"
+  grep -E "^\[(Passed|Failed)\]" "$dir/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
 }
 run_flows "$OUT/light" "$FLOWS/01-doc-danh-dau-ghi-chu.yaml" "$FLOWS/02-ban-dich.yaml" "$FLOWS/03-man-hinh.yaml"
 DATA=$(xcrun simctl get_app_container "$UDID" "$APP_ID" data 2>/dev/null)
@@ -38,5 +38,4 @@ xcrun simctl ui "$UDID" appearance dark
 xcrun simctl ui "$UDID" content_size accessibility-extra-extra-extra-large
 xcrun simctl terminate "$UDID" "$APP_ID" || true
 run_flows "$OUT/dark-large" "$FLOWS/03-man-hinh.yaml"
-cat "$OUT/checks.txt"
 exit $status

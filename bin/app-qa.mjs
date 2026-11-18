@@ -6,7 +6,7 @@
 // with a fresh AES-256-GCM key (repo secret APP_QA_KEY) and uploaded as a temporary release asset: nothing readable
 // of the app stays in the public repo. Exit: 0 all flows passed, 1 a flow failed, 2 run/tool error.
 import { execFileSync } from 'node:child_process';
-import { createCipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -43,6 +43,25 @@ if (!fs.existsSync(path.join(appDir, '.maestro'))) throw new Error('no .maestro 
 const token = execFileSync('gh', ['auth', 'token', '--user', ACCOUNT], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const env = { ...process.env, GH_TOKEN: token };
 const gh = (args, o = {}) => execFileSync('gh', args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20, ...o });
+// The key goes through stdin, never the command line (other processes and audit logs can read argv).
+const setKey = (hex) => execFileSync('gh', ['secret', 'set', 'APP_QA_KEY', '-R', REPO], { env, input: hex, stdio: ['pipe', 'pipe', 'pipe'] });
+
+// ---- one run at a time (they share APP_QA_KEY); leftovers of a killed caller are removed first
+const ageMin = (t) => (Date.now() - Date.parse(t)) / 60000;
+function sweepAndLock() {
+  const runs = JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '50', '--json', 'databaseId,displayTitle,status,createdAt,updatedAt']));
+  for (const r of runs) {
+    if (r.status !== 'completed' && ageMin(r.createdAt) > 180) { try { gh(['run', 'cancel', String(r.databaseId), '-R', REPO]); log('cancelled abandoned run ' + r.displayTitle); } catch { /* already ending */ } }
+    if (r.status === 'completed' && ageMin(r.updatedAt) > 30) { try { gh(['run', 'delete', String(r.databaseId), '-R', REPO]); log('deleted leftover run ' + r.displayTitle); } catch { /* gone */ } }
+  }
+  const active = runs.filter((r) => r.status !== 'completed' && ageMin(r.createdAt) <= 180);
+  if (active.length) throw new Error('another app-qa run is active (' + active.map((r) => r.displayTitle).join(', ') + '); try again when it ends');
+  const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt']));
+  for (const r of rels.filter((x) => x.tagName.startsWith('app-qa-'))) {
+    if (ageMin(r.createdAt) > 180) { try { gh(['release', 'delete', r.tagName, '-R', REPO, '--cleanup-tag', '-y']); log('deleted leftover release ' + r.tagName); } catch { /* gone */ } }
+    else throw new Error('release ' + r.tagName + ' of another app-qa call exists; try again later');
+  }
+}
 const rid = 'aq-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14) + '-' + randomBytes(2).toString('hex');
 const tag = 'app-qa-' + rid;
 const outDir = path.resolve(opts.out || path.join(os.tmpdir(), rid));
@@ -52,6 +71,10 @@ const work = fs.mkdtempSync(path.join(os.tmpdir(), 'app-qa-'));
 // ---- pack + encrypt
 const files = execFileSync('git', ['-C', appDir, 'ls-files', '-co', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 64 << 20 })
   .split('\n').filter((f) => f && fs.existsSync(path.join(appDir, f)));
+// Never ship credentials to a runner, even encrypted: build code there could read them.
+const SECRETISH = /(^|\/)(\.env(\..*)?|.*\.(keystore|jks|p8|p12|pem|key|mobileprovision)|credentials\.json|google-services\.json|GoogleService-Info\.plist|.*service-account.*\.json)$/i;
+const risky = files.filter((f) => SECRETISH.test(f));
+if (risky.length) throw new Error('refusing to send credential-like files: ' + risky.join(', ') + ' (ignore or move them)');
 fs.writeFileSync(path.join(work, 'list.txt'), files.join('\n') + '\n');
 const tarBin = process.platform === 'win32' ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
 execFileSync(tarBin, ['-czf', path.join(work, 'app.tgz'), '-T', path.join(work, 'list.txt')], { cwd: appDir });
@@ -64,25 +87,41 @@ fs.rmSync(path.join(work, 'app.tgz'));
 log(files.length + ' files packed, ' + Math.round(enc.length / 1e6 * 10) / 10 + ' MB encrypted');
 
 let runId = null;
-let released = false;
-async function cleanup() {
-  if (runId && !opts.keep) { try { gh(['run', 'delete', String(runId), '-R', REPO]); log('run deleted'); } catch (e) { log('delete the run by hand: https://github.com/' + REPO + '/actions/runs/' + runId); } }
-  if (released) { try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); log('release deleted'); } catch { log('delete release ' + tag + ' by hand'); } }
-  try { gh(['secret', 'set', 'APP_QA_KEY', '-R', REPO, '--body', randomBytes(32).toString('hex')]); } catch { /* best effort: the old key is useless once the release is gone */ }
-  fs.rmSync(work, { recursive: true, force: true });
+let dispatched = false;
+const findRun = () => JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '20', '--json', 'databaseId,displayTitle'])).find((x) => x.displayTitle === rid)?.databaseId ?? null;
+let cleaning = null;
+function cleanup() {
+  cleaning ??= (async () => {
+    if (!runId && dispatched) { try { runId = findRun(); } catch { /* below */ } }
+    if (runId && !opts.keep) {
+      try {
+        const st = JSON.parse(gh(['run', 'view', String(runId), '-R', REPO, '--json', 'status'])).status;
+        if (st !== 'completed') {
+          gh(['run', 'cancel', String(runId), '-R', REPO]);
+          for (let t = 0; t < 24 && JSON.parse(gh(['run', 'view', String(runId), '-R', REPO, '--json', 'status'])).status !== 'completed'; t++) await sleep(5000);
+        }
+        gh(['run', 'delete', String(runId), '-R', REPO]);
+        log('run deleted');
+      } catch { log('could not delete the run; the next app-qa call removes it: https://github.com/' + REPO + '/actions/runs/' + runId); }
+    } else if (dispatched && !runId) log('run of ' + rid + ' not found; the next app-qa call removes it');
+    try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); log('release deleted'); } catch { /* never created, or already gone */ }
+    try { setKey(randomBytes(32).toString('hex')); } catch (e) { log('WARNING: could not replace APP_QA_KEY: ' + String(e.stderr || e.message).slice(0, 150)); }
+    fs.rmSync(work, { recursive: true, force: true });
+  })();
+  return cleaning;
 }
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) process.on(sig, () => { log('interrupted, cleaning up'); cleanup().finally(() => process.exit(2)); });
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, () => { log('interrupted, cleaning up'); cleanup().finally(() => process.exit(2)); });
 
 let code = 2;
 try {
-  gh(['secret', 'set', 'APP_QA_KEY', '-R', REPO, '--body', key.toString('hex')]);
+  sweepAndLock();
+  setKey(key.toString('hex'));
   gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
-  released = true;
+  dispatched = true;
   gh(['workflow', 'run', WORKFLOW, '-R', REPO, '-f', 'request_id=' + rid, '-f', 'asset_tag=' + tag, '-f', 'platforms=' + opts.platforms, '-f', 'app_id=' + appId, '-f', 'ios_runner=' + opts.iosRunner]);
   for (let t = 0; !runId && t < 24; t++) {
     await sleep(5000);
-    const l = JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '20', '--json', 'databaseId,displayTitle']));
-    runId = l.find((x) => x.displayTitle === rid)?.databaseId ?? null;
+    runId = findRun();
   }
   if (!runId) throw new Error('run not found');
   log('run ' + rid + ': https://github.com/' + REPO + '/actions/runs/' + runId);
@@ -106,6 +145,17 @@ try {
     await sleep(30000);
   }
   try { gh(['run', 'download', String(runId), '-R', REPO, '-D', outDir]); } catch (e) { log('download failed: ' + String(e.stderr || e.message).slice(0, 200)); code = 2; }
+  // Artifacts are sealed with this run's key: open them here.
+  for (const p of opts.platforms.split(',')) {
+    const sealed = path.join(outDir, p, p + '.enc');
+    if (!fs.existsSync(sealed)) continue;
+    const blob = fs.readFileSync(sealed);
+    const d = createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12), { authTagLength: 16 });
+    d.setAuthTag(blob.subarray(12, 28));
+    fs.writeFileSync(path.join(work, p + '.tgz'), Buffer.concat([d.update(blob.subarray(28)), d.final()]));
+    fs.rmSync(sealed);
+    execFileSync(tarBin, ['-xzf', path.join(work, p + '.tgz'), '-C', path.join(outDir, p)]);
+  }
   if (code !== 0) {
     try { fs.writeFileSync(path.join(outDir, 'failed.log'), gh(['run', 'view', String(runId), '-R', REPO, '--log-failed'])); log('failed-step log: ' + path.join(outDir, 'failed.log')); } catch { /* none */ }
   }

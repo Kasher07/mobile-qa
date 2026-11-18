@@ -34,9 +34,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: app-qa
-  cancel-in-progress: false
 
 env:
   ASSET_TAG: ${{ inputs.asset_tag }}
@@ -69,33 +66,37 @@ jobs:
         run: node runner/app-fetch.mjs
       - name: Install dependencies
         working-directory: app
-        run: npm ci --no-audit --no-fund
+        run: npm ci --no-audit --no-fund --loglevel=error
+      # Build output goes to files that are sealed with the results: the public log shows only step outcomes.
       - name: Native project (expo prebuild + pods)
         working-directory: app
         run: |
-          npx expo prebuild --platform ios --no-install
-          cd ios && pod install
+          npx expo prebuild --platform ios --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 || { echo "prebuild failed"; exit 1; }
+          cd ios && pod install > "$RUNNER_TEMP/pods.log" 2>&1 || { echo "pod install failed"; exit 1; }
       - name: Build release for the simulator
         working-directory: app/ios
         run: |
-          set -o pipefail
           WS=$(ls -d *.xcworkspace | head -1); SCHEME="${WS%.xcworkspace}"
-          echo "workspace $WS scheme $SCHEME"
           xcodebuild -workspace "$WS" -scheme "$SCHEME" -configuration Release -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath "$RUNNER_TEMP/dd" \
-            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build 2>&1 \
-            | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" | tail -80
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/xcodebuild.log" 2>&1
+          rc=$?; grep -E "BUILD (SUCCEEDED|FAILED)" "$RUNNER_TEMP/xcodebuild.log" | tail -1; exit $rc
       - name: Install Maestro (pinned, sha256 checked)
         run: bash runner/app-maestro-install.sh
       - name: Run flows on the iOS Simulator
         run: bash runner/app-ios.sh
-      - if: failure()
-        run: mkdir -p out/ios && cp "$RUNNER_TEMP/xcodebuild.log" out/ios/ 2>/dev/null || true
+      - name: Seal results
+        if: always()
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          mkdir -p out/ios && cp "$RUNNER_TEMP"/*.log out/ios/ 2>/dev/null || true
+          node runner/app-seal.mjs out/ios
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ios
-          path: out/ios
+          path: sealed/ios.enc
           retention-days: 1
           overwrite: true
           if-no-files-found: warn
@@ -126,13 +127,15 @@ jobs:
         run: node runner/app-fetch.mjs
       - name: Install dependencies
         working-directory: app
-        run: npm ci --no-audit --no-fund
+        run: npm ci --no-audit --no-fund --loglevel=error
       - name: Native project (expo prebuild)
         working-directory: app
-        run: npx expo prebuild --platform android --no-install
+        run: npx expo prebuild --platform android --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 || { echo "prebuild failed"; exit 1; }
       - name: Build release APK (x86_64 for the emulator)
         working-directory: app/android
-        run: ./gradlew assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon --console=plain -q
+        run: |
+          ./gradlew assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon --console=plain > "$RUNNER_TEMP/gradle.log" 2>&1
+          rc=$?; grep -E "BUILD (SUCCESSFUL|FAILED)" "$RUNNER_TEMP/gradle.log" | tail -1; exit $rc
       - name: Install Maestro (pinned, sha256 checked)
         run: bash runner/app-maestro-install.sh
       - name: Enable KVM
@@ -151,11 +154,18 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: bash runner/app-android.sh
+      - name: Seal results
+        if: always()
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          mkdir -p out/android && cp "$RUNNER_TEMP"/*.log out/android/ 2>/dev/null || true
+          node runner/app-seal.mjs out/android
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android
-          path: out/android
+          path: sealed/android.enc
           retention-days: 1
           overwrite: true
           if-no-files-found: warn

@@ -17,7 +17,7 @@ status=0
 run_flows() {
   local dir="$1"; shift
   ( cd "$dir" && maestro test --format junit --output "$dir/junit.xml" --test-output-dir "$dir/maestro" "$@" ) > "$dir/maestro.log" 2>&1 || status=1
-  tail -40 "$dir/maestro.log"
+  grep -E "^\[(Passed|Failed)\]" "$dir/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
 }
 adb shell cmd uimode night no
 run_flows "$OUT/light" "$FLOWS/01-doc-danh-dau-ghi-chu.yaml" "$FLOWS/02-ban-dich.yaml" "$FLOWS/03-man-hinh.yaml"
@@ -27,5 +27,4 @@ adb shell am force-stop "$APP_ID"
 sleep 3
 run_flows "$OUT/dark-large" "$FLOWS/03-man-hinh.yaml"
 adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID" | tail -200 > "$OUT/logcat-errors.txt" || true
-cat "$OUT/checks.txt"
 exit $status
