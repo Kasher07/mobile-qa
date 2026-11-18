@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -56,7 +57,22 @@ const secretName = (k) => {
   return SECRET_PARTS.has(low.replace(/[^a-z0-9]/g, '')) || low.split(/[^a-z0-9]+/).some((p) => SECRET_PARTS.has(p));
 };
 // JWTs and long random strings without separators (slugs have hyphens, so they pass).
-const secretValue = (v) => /^eyJ[A-Za-z0-9_-]{10,}/.test(v) || /^(?=[A-Za-z0-9_]*\d)(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{24,}$/.test(v);
+const secretValue = (v) =>
+  /^eyJ[A-Za-z0-9_-]{10,}/.test(v) || // JWT
+  /^(?=[A-Za-z0-9_]*\d)(?=[A-Za-z0-9_]*[A-Za-z])[A-Za-z0-9_]{24,}$/.test(v) || // long random string
+  /^[A-Za-z0-9+/_-]{16,}={1,2}$/.test(v) || // base64 with padding
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) || // UUID
+  v.split(/[-_.~]/).some((part) => part.length >= 16 && /\d/.test(part) && /[A-Za-z]/.test(part)); // token inside a slug
+const PERSONAL = /^(e?mail|email_?address|phone|tel|telephone|sdt|mobile|cell|address|dia_?chi|cccd|cmnd|passport|dob)$/i;
+const personalValue = (v) => /[^\s@]+@[^\s@]+\.[a-z]{2,}/i.test(v);
+const TUNNEL = /(^|\.)(trycloudflare\.com|ngrok\.io|ngrok\.app|ngrok-free\.app|ngrok-free\.dev|loca\.lt|localtunnel\.me|serveo\.net|localhost\.run|lhr\.life|pinggy\.link|devtunnels\.ms)$/;
+const decode = (s) => {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+};
 const privateIPv4 = (h) =>
   /^(127|10|0)\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h) || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h);
 
@@ -73,13 +89,21 @@ export function checkUrl(raw) {
   if (h === 'localhost' || /\.(localhost|local|internal|lan|home|corp)$/.test(h)) return { why: 'local host (runner cannot reach it)' };
   if (/^\d+\.\d+\.\d+\.\d+$/.test(h) && privateIPv4(h)) return { why: 'private IP (runner cannot reach it)' };
   if (!h.includes('.')) return { why: 'single-label host (not public)' };
-  if (u.username || u.password) return { why: 'credentials in URL (public repo)' };
-  for (const [k, v] of u.searchParams) {
-    if (secretName(k)) return { why: 'query parameter "' + k + '" looks secret (public repo)' };
-    if (secretValue(v)) return { why: 'query value of "' + k + '" looks like a token (public repo)' };
+  if (TUNNEL.test(h)) return { why: 'tunnel to a private machine (not a public page)' };
+  try {
+    decodeURIComponent(u.pathname + u.search + u.hash);
+  } catch {
+    return { why: 'malformed percent-encoding' };
   }
-  for (const seg of u.pathname.split('/')) if (secretValue(decodeURIComponent(seg))) return { why: 'path segment looks like a token (public repo)' };
-  if (u.hash && (secretName(u.hash.slice(1).split('=')[0]) || /eyJ[A-Za-z0-9_-]{10,}/.test(u.hash))) return { why: 'fragment looks secret (public repo)' };
+  if (u.username || u.password) return { why: 'credentials in URL (public repo)' };
+  const params = [...u.searchParams].map((kv) => ['query', ...kv]);
+  if (u.hash.length > 1) for (const kv of new URLSearchParams(u.hash.slice(1))) params.push(['fragment', ...kv]);
+  for (const [where, k, v] of params) {
+    if (secretName(k)) return { why: where + ' parameter "' + k + '" looks secret (public repo)' };
+    if (PERSONAL.test(k) || personalValue(v) || personalValue(k)) return { why: where + ' parameter "' + k + '" carries personal data (public repo)' };
+    if (secretValue(v) || (!v && secretValue(k))) return { why: where + ' value of "' + k + '" looks like a token (public repo)' };
+  }
+  for (const seg of u.pathname.split('/')) if (secretValue(decode(seg)) || personalValue(decode(seg))) return { why: 'path segment looks like a token or personal data (public repo)' };
   if (/[,\s]/.test(u.href)) return { why: 'comma or space in URL (the runner splits on them)' };
   return { href: u.href };
 }
@@ -228,6 +252,8 @@ function cleanup(reason) {
         }
         saveFailedLog(r);
         await removeRun(r);
+      } else if (r.finished) {
+        continue;
       } else if (r.downloaded || r.conclusion !== 'success') {
         await removeRun(r);
       } else {
@@ -247,8 +273,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
 // A caller killed hard (TerminateProcess on Windows runs no handler) leaves its run public. Every call first
 // sweeps runs of this workflow that no live caller can still own: finished more than STALE_DONE_MIN ago, or
 // started more than STALE_RUNNING_MIN ago (past any caller's deadline). Only "mq-" runs; --keep runs are "mqk-".
-const STALE_DONE_MIN = Number(process.env.MOBILE_QA_STALE_DONE_MIN || 30);
-const STALE_RUNNING_MIN = Number(process.env.MOBILE_QA_STALE_RUNNING_MIN || 120);
+// Both thresholds are above DEADLINE_MS, so a live caller never loses a run it still waits for.
+const STALE_DONE_MIN = Number(process.env.MOBILE_QA_STALE_DONE_MIN || 120);
+const STALE_RUNNING_MIN = Number(process.env.MOBILE_QA_STALE_RUNNING_MIN || 150);
 async function sweep() {
   const l = await api('GET', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/runs?per_page=50');
   const now = Date.now();
@@ -266,6 +293,39 @@ async function sweep() {
     }
   }
   if (n) log('swept ' + n + ' abandoned run(s)');
+}
+
+// What counts as an issue (bad) or a remark (notes) for one page. Exported for tests: a broken page must never be "ok".
+export function verdict(p) {
+  const pr = p.probe || {};
+  const bad = [];
+  const notes = [];
+  if (p.error) bad.push('ERROR ' + p.error);
+  if (!p.probe && !p.error) bad.push('not checked (no page probe' + (p.mode ? ', mode ' + p.mode : '') + ')');
+  if (p.status && p.status >= 400) bad.push('HTTP ' + p.status);
+  if (p.probe) {
+    let from = null;
+    let to = null;
+    try {
+      from = new URL(p.url);
+      to = pr.href ? new URL(pr.href) : null;
+    } catch {}
+    if (to && !/^https?:$/.test(to.protocol)) bad.push('browser error page (' + to.protocol + ')');
+    else if (to && from && to.hostname.replace(/^www\./, '') !== from.hostname.replace(/^www\./, '')) bad.push('redirected to another host: ' + to.hostname);
+    else if (to && from && to.pathname.replace(/\/$/, '') !== from.pathname.replace(/\/$/, '')) notes.push('redirected to ' + to.pathname);
+    if (/^(Safari Can.t Open the Page|Cannot Open Page|Failed to open page)$/i.test(pr.title || '')) bad.push('browser error page');
+    if (pr.overflowX) bad.push('horizontal overflow ' + pr.scrollWidth + '>' + pr.innerWidth + ' [' + (pr.wide || []).slice(0, 3).join('; ') + ']');
+    if (!pr.viewportMeta) bad.push('no viewport meta');
+    else if ((pr.scale && pr.scale < 0.98) || (pr.innerWidthRaw && pr.screenWidth && pr.innerWidthRaw > pr.screenWidth + 1)) bad.push('page zoomed out (content wider than the screen)');
+    if (typeof pr.textLen === 'number' && pr.textLen < 20 && !pr.media) bad.push('blank page (no text or images)');
+  }
+  if ((p.pageErrors || []).length) bad.push(p.pageErrors.length + ' JS errors: ' + p.pageErrors[0]);
+  if (!(p.shots || []).length) bad.push('no screenshot');
+  if ((p.consoleErrors || []).length) notes.push(p.consoleErrors.length + ' console errors');
+  if ((p.failedRequests || []).length) notes.push(p.failedRequests.length + ' failed requests');
+  if ((pr.smallTapTargets || []).length) notes.push(pr.smallTapTargets.length + ' tap targets <24px');
+  if (p.segmentsNeeded && p.segmentsNeeded > (p.shots || []).length) notes.push('screens ' + (p.shots || []).length + '/' + p.segmentsNeeded + ' (raise --segments to see the rest)');
+  return { bad, notes };
 }
 
 function findResults(dir) {
@@ -298,7 +358,12 @@ async function main() {
       '). If it is not logged in: gh auth login --web --scopes workflow, then gh auth switch --user KitTran1307');
   }
 
-  await sweep();
+  try {
+    await sweep();
+  } catch (e) {
+    log('sweep skipped: ' + e.message.slice(0, 120));
+    if (opts.sweepOnly) return 2;
+  }
   if (opts.sweepOnly) return 0;
   const baseId = (opts.keep ? 'mqk-' : 'mq-') + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '') + '-' + Math.random().toString(36).slice(2, 6);
   outDir = path.join(path.resolve(opts.out || path.join(os.tmpdir(), 'mobile-qa')), baseId); // always a fresh folder
@@ -307,49 +372,54 @@ async function main() {
   for (let i = 0; i < urls.length; i += PER_RUN) chunks.push(urls.slice(i, i + PER_RUN));
   for (const [i, chunk] of chunks.entries()) await dispatch(chunk, i, baseId, chunks.length); // serial: GitHub asks for no concurrent writes
 
-  // wait: one request per unfinished run per poll (~3/min per run, far under 5000/h)
+  // wait: one request per unfinished run per poll (~3/min per run, far under 5000/h). Each run is downloaded and
+  // deleted as soon as it finishes, so its results never depend on the other runs of this call.
   const t0 = Date.now();
   await sleep(30000);
-  while (runs.some((r) => r.status !== 'completed')) {
+  while (runs.some((r) => !r.finished)) {
     if (Date.now() - t0 > DEADLINE_MS) {
       log('timed out after ' + Math.round(DEADLINE_MS / 60000) + ' min');
       await cleanup('timeout');
       return 2;
     }
-    for (const r of runs.filter((x) => x.status !== 'completed')) {
+    for (const r of runs.filter((x) => !x.finished)) {
       const v = await api('GET', '/repos/' + REPO + '/actions/runs/' + r.id);
+      if ((v.run_attempt || 1) < (r.minAttempt || 1)) continue; // a re-run not visible yet
       if (v.status !== r.status) log(r.rid + ': ' + v.status + (v.conclusion ? ' (' + v.conclusion + ')' : '') + ' after ' + Math.round((Date.now() - t0) / 1000) + 's');
       r.status = v.status;
       r.conclusion = v.conclusion;
-      if (r.status === 'completed' && r.conclusion !== 'success' && r.reruns < MAX_RERUNS) {
-        // A job that never got a runner has no runner name and no steps: re-run only the failed jobs (the
-        // finished platform keeps its artifact), instead of reporting a failure GitHub caused.
+      if (r.status !== 'completed') continue;
+      if (r.conclusion !== 'success' && r.reruns < MAX_RERUNS) {
+        // Re-run only when every failed job never got a runner (no runner name, no steps): a real failure is
+        // reported, never retried until green.
         const j = await api('GET', '/repos/' + REPO + '/actions/runs/' + r.id + '/jobs?filter=latest');
-        const starved = ((j && j.jobs) || []).filter((x) => x.conclusion !== 'success' && x.conclusion !== 'skipped' && !x.runner_name && !(x.steps || []).length);
-        if (starved.length) {
+        const bad = ((j && j.jobs) || []).filter((x) => x.conclusion !== 'success' && x.conclusion !== 'skipped');
+        const starved = bad.filter((x) => !x.runner_name && !(x.steps || []).length);
+        if (bad.length && starved.length === bad.length) {
           r.reruns++;
+          r.minAttempt = (v.run_attempt || 1) + 1;
           log(r.rid + ': GitHub gave no runner to ' + starved.map((x) => x.name).join(', ') + ', re-running (' + r.reruns + '/' + MAX_RERUNS + ')');
           await api('POST', '/repos/' + REPO + '/actions/runs/' + r.id + '/rerun-failed-jobs');
           r.status = 'queued';
           r.conclusion = null;
+          continue;
         }
       }
-    }
-    if (runs.some((r) => r.status !== 'completed')) await sleep(POLL_MS + Math.floor(Math.random() * 3000));
-  }
-
-  for (const r of runs) {
-    r.downloaded = download(r);
-    if (!r.downloaded && r.conclusion === 'success') {
-      await sleep(10000);
       r.downloaded = download(r);
+      if (!r.downloaded && r.conclusion === 'success') {
+        await sleep(10000);
+        r.downloaded = download(r);
+      }
+      if (r.conclusion !== 'success') {
+        log(r.rid + ': run ' + r.conclusion);
+        saveFailedLog(r);
+      }
+      if (r.downloaded || r.conclusion !== 'success') await removeRun(r);
+      else log(r.rid + ': kept (results not downloaded): ' + runUrl(r.id) + ' - the next call sweeps it after ' + STALE_DONE_MIN + ' min');
+      r.finished = true;
     }
-    if (r.conclusion !== 'success') {
-      log(r.rid + ': run ' + r.conclusion);
-      saveFailedLog(r);
-    }
+    if (runs.some((r) => !r.finished)) await sleep(POLL_MS + Math.floor(Math.random() * 3000));
   }
-  await cleanup('done');
 
   // summary
   let issues = 0;
@@ -368,20 +438,7 @@ async function main() {
     lines.push('## ' + res.platform + ': ' + res.device + ', ' + res.browser + ' (' + res.mode + ')', '');
     if (res.platform === 'ios') lines.push('iOS: JS errors are not captured (WebDriver has no console); the Android section covers them.', '');
     for (const p of res.pages || []) {
-      const pr = p.probe || {};
-      const bad = [];
-      if (p.error) bad.push('ERROR ' + p.error);
-      if (p.status && p.status >= 400) bad.push('HTTP ' + p.status);
-      if (pr.overflowX) bad.push('horizontal overflow ' + pr.scrollWidth + '>' + pr.innerWidth + ' [' + (pr.wide || []).slice(0, 3).join('; ') + ']');
-      if ((p.pageErrors || []).length) bad.push(p.pageErrors.length + ' JS errors: ' + p.pageErrors[0]);
-      if (p.probe && !pr.viewportMeta) bad.push('no viewport meta');
-      if (p.probe && pr.viewportMeta && pr.scale && pr.scale < 0.98) bad.push('page zoomed out to ' + pr.scale + ' (content wider than the screen)');
-      if (!(p.shots || []).length) bad.push('no screenshot');
-      const notes = [];
-      if ((p.consoleErrors || []).length) notes.push(p.consoleErrors.length + ' console errors');
-      if ((p.failedRequests || []).length) notes.push(p.failedRequests.length + ' failed requests');
-      if ((pr.smallTapTargets || []).length) notes.push(pr.smallTapTargets.length + ' tap targets <24px');
-      if (p.segmentsNeeded && p.segmentsNeeded > (p.shots || []).length) notes.push('screens ' + p.shots.length + '/' + p.segmentsNeeded + ' (raise --segments to see the rest)');
+      const { bad, notes } = verdict(p);
       issues += bad.length;
       lines.push('- ' + p.url + ' :: ' + (bad.length ? 'ISSUES: ' + bad.join(' | ') : 'ok') + (notes.length ? ' (' + notes.join(', ') + ')' : ''));
       for (const s of p.shots || []) lines.push('  - ' + path.join(dir, s));
@@ -402,7 +459,14 @@ async function main() {
   return !files.length || failed.length ? 2 : issues ? 1 : 0;
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+const sameFile = (a, b) => {
+  try {
+    return fs.realpathSync(a).toLowerCase() === fs.realpathSync(b).toLowerCase();
+  } catch {
+    return false;
+  }
+};
+const isMain = !!process.argv[1] && sameFile(process.argv[1], fileURLToPath(import.meta.url));
 if (isMain) {
   main()
     .then((code) => process.exit(code))

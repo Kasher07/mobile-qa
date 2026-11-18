@@ -3,7 +3,7 @@ run-name: ${{ inputs.request_id }}
 
 # Real-phone screenshots for KIT: iOS Simulator Safari (macOS runner) and Android emulator Chrome (Linux runner).
 # Public repo = standard runners are free and unlimited. Triggered only by bin/mobile-qa.mjs (workflow_dispatch);
-# inputs reach scripts through env, never through shell interpolation.
+# inputs reach scripts through env, never through shell interpolation. Actions are pinned to commit SHAs.
 on:
   workflow_dispatch:
     inputs:
@@ -42,28 +42,36 @@ jobs:
     timeout-minutes: 30
     env:
       IOS_DEVICE: ${{ inputs.ios_device }}
+      AXE_URL: https://github.com/cameroncooke/AXe/releases/download/v2.0.4/AXe-macOS-v2.0.4-universal.tar.gz
+      AXE_SHA256: 3178ec66d9ff46455fec737debad719c41cab16edb1435b2c721e07760a208c3
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
-      - name: Install AXe (taps Safari's first-run tips away)
+      - name: Install AXe (pinned release, sha256 checked; closes Safari's first-run tip)
         continue-on-error: true
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_NO_INSTALL_CLEANUP: '1'
-          HOMEBREW_NO_ENV_HINTS: '1'
-        run: brew install cameroncooke/axe/axe || true
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/axe"
+          curl -fsSL "$AXE_URL" -o "$RUNNER_TEMP/axe.tgz"
+          echo "$AXE_SHA256  $RUNNER_TEMP/axe.tgz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/axe.tgz" -C "$RUNNER_TEMP/axe"
+          BIN=$(find "$RUNNER_TEMP/axe" -type f -name axe -perm -u+x | head -1)
+          [ -n "$BIN" ] || { echo "axe binary not found in the archive"; exit 1; }
+          dirname "$BIN" >> "$GITHUB_PATH"
+          "$BIN" --help > /dev/null 2>&1 || "$BIN" list-simulators > /dev/null
       - name: Safari on iOS Simulator
         run: node runner/ios.mjs
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ios
           path: out/ios
           retention-days: 1
+          overwrite: true
           if-no-files-found: warn
 
   android:
@@ -71,10 +79,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
           cache: npm
@@ -84,16 +92,17 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - uses: actions/cache@v4
+      # The AVD snapshot is saved right after it is created (clean), never after browsing real sites.
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: avd-cache
         with:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-35-google_apis-x86_64-pixel_7-v1
+          key: avd-35-google_apis-x86_64-pixel_7-v2
       - name: Create AVD snapshot (cache miss only)
         if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
           target: google_apis
@@ -103,8 +112,15 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
           script: echo "AVD snapshot created"
+      - if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-35-google_apis-x86_64-pixel_7-v2
       - name: Chrome on Android emulator
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
           target: google_apis
@@ -115,9 +131,10 @@ jobs:
           disable-animations: true
           script: node runner/android.mjs
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android
           path: out/android
           retention-days: 1
+          overwrite: true
           if-no-files-found: warn

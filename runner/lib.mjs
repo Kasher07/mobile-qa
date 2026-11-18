@@ -54,6 +54,10 @@ export function probe() {
   const out = {
     title: document.title,
     innerWidth: vw,
+    innerWidthRaw: window.innerWidth,
+    href: location.href,
+    textLen: document.body ? document.body.innerText.trim().length : 0,
+    media: document.querySelectorAll('img,video,canvas,svg,picture,iframe').length,
     screenWidth: screenW,
     scale: vv ? Math.round(vv.scale * 100) / 100 : 1,
     innerHeight: window.innerHeight,
@@ -91,6 +95,7 @@ export function probe() {
 }
 
 export function writeResults(dir, results) {
+  for (const p of results.pages) p.mode = results.mode;
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'results.json'), JSON.stringify(results, null, 2));
   console.log(results.platform + ' | ' + results.device + ' | ' + results.browser + ' | mode=' + (results.mode || '-'));

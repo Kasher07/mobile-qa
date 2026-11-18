@@ -26,7 +26,9 @@ test('checkUrl refuses secrets (public repo)', () => {
   for (const u of ['https://u:p@a.com/', 'https://a.com/?token=1', 'https://a.com/?access_token=1', 'https://a.com/?api-key=1',
     'https://a.com/?X-Amz-Credential=1', 'https://a.com/?pwd=1', 'https://a.com/?session_id=1', 'https://a.com/?id=eyJhbGciOiJIUzI1NiJ9.abc',
     'https://a.com/?r=a8f9c2d7e6b5a4f3c2d1e0f9', 'https://a.com/reset/a8f9c2d7e6b5a4f3c2d1e0f9', 'https://a.com/#access_token=x',
-    'https://a.com/a,b']) no(u);
+    'https://a.com/a,b', 'https://a.com/?t=QUJDREVGR0hJSktMTU5PUA==', 'https://a.com/reset/123e4567-e89b-12d3-a456-426614174000',
+    'https://a.com/?id=ab12cd34ef56gh78-ij90', 'https://a.com/?email=client@x.com', 'https://a.com/?phone=0909123456', 'https://a.com/#k=ab12cd34ef56gh78ij90kl12mn',
+    'https://abc-def.trycloudflare.com/', 'https://x.ngrok-free.app/', 'https://a.com/%E0%A4%A']) no(u);
 });
 
 test('checkUrl normalises what it sends', () => {

@@ -152,6 +152,7 @@ async function startDriver() {
     try {
       const v = await wd('POST', '/session', { capabilities: { alwaysMatch: caps } });
       sid = v.sessionId;
+      await wd('POST', '/session/' + sid + '/timeouts', { pageLoad: 60000, script: 30000 }).catch(() => {});
       const got = v.capabilities && v.capabilities['safari:deviceUDID'];
       if (got && got !== dev.udid) {
         console.log('safaridriver picked another simulator ' + got);
@@ -195,7 +196,7 @@ for (const [i, url] of urls.entries()) {
       await exec('window.scrollTo(0, 0);');
       cur.probe = await exec('return (' + probe.toString() + ')();');
       cur.status = cur.probe.navStatus;
-      if (cur.status == null) {
+      if (!cur.status) {
         // Safari may not expose responseStatus: ask the server directly (same URL, from the runner).
         try {
           // Browser UA: some sites (Cloudflare bot rules, anti-scraping) answer 403 to a bare client.
