@@ -32,6 +32,11 @@ on:
         default: macos-15
         type: choice
         options: [macos-15, macos-15-intel, macos-26]
+      test_fault:
+        description: Fault injection for the tool's own tests (none, android-setup)
+        default: none
+        type: choice
+        options: [none, android-setup]
       ios_mode:
         description: webdriver (full checks) or openurl (screenshot only; to test the fallback)
         default: webdriver
@@ -134,6 +139,8 @@ jobs:
       - name: Chrome on Android emulator
         id: emu1
         continue-on-error: true
+        env:
+          TEST_FAULT: ${{ inputs.test_fault || 'none' }}
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
@@ -143,7 +150,7 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: node runner/android.mjs
+          script: if [ "$TEST_FAULT" = "android-setup" ]; then echo "TEST: failing the first emulator step on purpose"; exit 1; fi; node runner/android.mjs
       # The emulator package download from Google fails now and then ("Error on ZipFile unknown archive"): one retry.
       - name: Chrome on Android emulator (retry after a setup failure)
         if: steps.emu1.outcome == 'failure'

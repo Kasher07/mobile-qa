@@ -195,7 +195,7 @@ async function dispatch(chunk, i, baseId, total, extra = {}) {
     // Never retried: a POST that timed out may still have queued a run (duplicates would stay public).
     const res = await api('POST', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/dispatches', {
       ref: 'main',
-      inputs: { urls: chunk.join('\n'), platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool], ios_mode: opts.iosMode },
+      inputs: { urls: chunk.join('\n'), platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool], ios_mode: opts.iosMode, test_fault: process.env.MOBILE_QA_TEST_FAULT || 'none' },
       return_run_details: true,
     }, { retry: false });
     id = res && (res.workflow_run_id || res.id);
