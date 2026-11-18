@@ -39,9 +39,10 @@ jobs:
   ios:
     if: contains(inputs.platforms, 'ios')
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       IOS_DEVICE: ${{ inputs.ios_device }}
+      JOB_BUDGET_MIN: '36'
       AXE_URL: https://github.com/cameroncooke/AXe/releases/download/v2.0.4/AXe-macOS-v2.0.4-universal.tar.gz
       AXE_SHA256: 3178ec66d9ff46455fec737debad719c41cab16edb1435b2c721e07760a208c3
     steps:

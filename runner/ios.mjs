@@ -127,20 +127,20 @@ async function dismissTips() {
 
 let sid = null;
 let driver = null;
-async function wd(method, p, body, attempt = 0) {
+async function wd(method, p, body, attempt = 0, timeoutMs = 120000) {
   let r;
   try {
     r = await fetch('http://127.0.0.1:4444' + p, {
       method,
       headers: { 'content-type': 'application/json' },
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(120000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
     // safaridriver drops a connection now and then ("fetch failed"): retry the same command twice.
     if (attempt < 2 && !/aborted|timeout/i.test(String(e.name) + String(e.message))) {
       await sleep(2000);
-      return wd(method, p, body, attempt + 1);
+      return wd(method, p, body, attempt + 1, timeoutMs);
     }
     throw new Error('webdriver ' + method + ' ' + p.replace(/\/session\/[^/]+/, '') + ': ' + ((e.cause && e.cause.code) || e.message));
   }
@@ -150,16 +150,22 @@ async function wd(method, p, body, attempt = 0) {
 }
 const exec = (script, args = []) => wd('POST', '/session/' + sid + '/execute/sync', { script, args });
 
+// Creating a Safari session on a busy macOS runner can take more than 4 minutes (seen 2026-11-18). A shorter client
+// timeout abandons a session safaridriver is still pairing, and the retry then fails with "already paired": so wait up
+// to 7 minutes, and between rounds kill safaridriver and Safari so nothing half-paired is left.
+const SESSION_TIMEOUT_MS = 7 * 60000;
 async function startDriver() {
   try {
     run('sudo', ['safaridriver', '--enable']);
   } catch (e) {
     note('safaridriver --enable failed: ' + String(e.stderr || e).slice(0, 200));
   }
-  const base = { browserName: 'safari', platformName: 'iOS', 'safari:useSimulator': true };
-  // Session creation fails now and then on a fresh runner: restart safaridriver and try again (3 rounds).
-  for (let round = 1; round <= 3; round++) {
+  const caps = { browserName: 'safari', platformName: 'iOS', 'safari:useSimulator': true, 'safari:deviceUDID': dev.udid };
+  for (let round = 1; round <= 2; round++) {
     if (driver) driver.kill();
+    try {
+      run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
+    } catch {}
     driver = spawn('safaridriver', ['-p', '4444'], { stdio: 'inherit' });
     for (let i = 0; i < 40; i++) {
       try {
@@ -167,24 +173,20 @@ async function startDriver() {
       } catch {}
       await sleep(500);
     }
-    for (const caps of [Object.assign({ 'safari:deviceUDID': dev.udid }, base), base]) {
-      try {
-        const v = await wd('POST', '/session', { capabilities: { alwaysMatch: caps } });
-        sid = v.sessionId;
-        await wd('POST', '/session/' + sid + '/timeouts', { pageLoad: 60000, script: 30000 }).catch(() => {});
-        const got = v.capabilities && v.capabilities['safari:deviceUDID'];
-        if (got && got !== dev.udid) {
-          note('safaridriver picked another simulator ' + got);
-          dev.udid = got;
-        }
-        console.log('webdriver session ok (round ' + round + ')');
-        return true;
-      } catch (e) {
-        note('session round ' + round + ' failed: ' + e.message.slice(0, 200));
-      }
+    const t0 = Date.now();
+    try {
+      const v = await wd('POST', '/session', { capabilities: { alwaysMatch: caps } }, 2, SESSION_TIMEOUT_MS);
+      sid = v.sessionId;
+      await wd('POST', '/session/' + sid + '/timeouts', { pageLoad: 60000, script: 30000 }).catch(() => {});
+      console.log('webdriver session ok (round ' + round + ', ' + Math.round((Date.now() - t0) / 1000) + ' s)');
+      return true;
+    } catch (e) {
+      note('session round ' + round + ' failed after ' + Math.round((Date.now() - t0) / 1000) + ' s: ' + e.message.slice(0, 200));
     }
-    await sleep(10000);
+    await sleep(5000);
   }
+  if (driver) driver.kill();
+  driver = null;
   return false;
 }
 
@@ -208,7 +210,8 @@ async function warmUp() {
 // Some runner images carry a simulator whose Safari never accepts automation (and even openurl fails): try the next
 // best device before giving up (2026-11-18: the same UDID failed in two baselines while others worked).
 let hasWd = false;
-for (const [n, cand] of candidates.slice(0, 3).entries()) {
+for (const [n, cand] of candidates.slice(0, 2).entries()) {
+  if (n > 0 && Date.now() - STARTED > 15 * 60000) break; // no time left for a second simulator
   dev = cand;
   results.device = dev.name + ' / ' + dev.runtime;
   results.browser = 'Safari (' + dev.runtime + ')';
@@ -225,7 +228,7 @@ for (const [n, cand] of candidates.slice(0, 3).entries()) {
   note('no WebDriver session on ' + dev.name + ' ' + dev.runtime + ' ' + dev.udid + (n < 2 ? ', trying the next simulator' : ''));
   if (driver) driver.kill();
   driver = null;
-  if (n < Math.min(2, candidates.length - 1)) {
+  if (n < Math.min(1, candidates.length - 1)) {
     try {
       run('xcrun', ['simctl', 'shutdown', dev.udid]);
     } catch {}
