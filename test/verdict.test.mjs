@@ -34,4 +34,5 @@ test('JS errors and missing screenshots', () => {
   isBad(pg({ pageErrors: ['boom'] }), /JS errors/);
   isBad(pg({ shots: [] }), /no screenshot/);
 });
+test('system window over the page', () => isBad(pg({ overlay: 'Application Not Responding: launcher' }), /system window/));
 test('truncated screens are noted', () => assert.ok(verdict(pg({ segmentsNeeded: 8 })).notes.some((n) => /1\/8/.test(n))));

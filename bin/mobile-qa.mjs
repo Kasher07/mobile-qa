@@ -321,6 +321,7 @@ export function verdict(p) {
   }
   if ((p.pageErrors || []).length) bad.push(p.pageErrors.length + ' JS errors: ' + p.pageErrors[0]);
   if (!(p.shots || []).length) bad.push('no screenshot');
+  if (p.overlay) bad.push('a system window covered the page: ' + p.overlay);
   if ((p.consoleErrors || []).length) notes.push(p.consoleErrors.length + ' console errors');
   if ((p.failedRequests || []).length) notes.push(p.failedRequests.length + ' failed requests');
   if ((pr.smallTapTargets || []).length) notes.push(pr.smallTapTargets.length + ' tap targets <24px');

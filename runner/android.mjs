@@ -20,6 +20,23 @@ console.log('device ' + results.device + ' | ' + results.browser);
 await sh('am set-debug-app --persistent com.android.chrome').catch(() => {});
 // Without the permission Chrome opens a full-screen "Chrome notifications" promo over the first page.
 await sh('pm grant com.android.chrome android.permission.POST_NOTIFICATIONS').catch(() => {});
+// A slow emulator raises "Pixel Launcher isn't responding" dialogs over Chrome: hide them, and check focus before
+// every screenshot so a covered screen is reported instead of passing as a page screenshot.
+await sh('settings put global hide_error_dialogs 1').catch(() => {});
+async function focusedWindow() {
+  const out = await sh('dumpsys window | grep -m1 mCurrentFocus').catch(() => '');
+  return out.replace(/.*mCurrentFocus=/, '').trim();
+}
+async function ensureChromeOnTop(cur) {
+  for (let t = 0; t < 3; t++) {
+    const w = await focusedWindow();
+    if (!w || /com\.android\.chrome/.test(w)) return;
+    console.log('window over Chrome: ' + w.slice(0, 120));
+    await sh('am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS').catch(() => {});
+    await page.waitForTimeout(800);
+    if (t === 2) cur.overlay = w.slice(0, 160);
+  }
+}
 
 const context = await device.launchBrowser();
 const page = context.pages()[0] || (await context.newPage());
@@ -77,6 +94,7 @@ for (const [i, url] of urls.entries()) {
     for (let k = 0; k < segs; k++) {
       if (k > 0) await page.evaluate((y) => window.scrollTo(0, y), Math.round(k * vh * 0.9));
       await page.waitForTimeout(k === 0 ? 300 : 600);
+      await ensureChromeOnTop(cur);
       const f = name + '-' + String(k + 1).padStart(2, '0') + '.png';
       fs.writeFileSync(path.join(OUT, f), await device.screenshot());
       cur.shots.push(f);
