@@ -46,4 +46,9 @@ test('403 from the runner fetch on a real page is a note', () => {
   assert.ok(v.notes.some((n) => /non-browser/.test(n)));
 });
 test('403 from the browser itself stays an issue', () => isBad(pg({ status: 403 }), /HTTP 403/));
+test('a page that passed on a retry is ok with a note', () => {
+  const v = verdict(pg({ retried: 'page did not finish in 150 s' }));
+  assert.deepEqual(v.bad, []);
+  assert.ok(v.notes.some((n) => /second try/.test(n)));
+});
 test('truncated screens are noted', () => assert.ok(verdict(pg({ segmentsNeeded: 8 })).notes.some((n) => /1\/8/.test(n))));
