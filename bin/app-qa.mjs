@@ -76,6 +76,8 @@ const SECRETISH = /(^|\/)(\.env(\..*)?|.*\.(keystore|jks|p8|p12|pem|key|mobilepr
 const risky = files.filter((f) => SECRETISH.test(f));
 if (risky.length) throw new Error('refusing to send credential-like files: ' + risky.join(', ') + ' (ignore or move them)');
 fs.writeFileSync(path.join(work, 'list.txt'), files.join('\n') + '\n');
+const gitTar = process.platform === 'win32' ? [path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'usr', 'bin', 'tar.exe')].find((f) => fs.existsSync(f)) : null;
+const unpackTar = gitTar || 'tar';
 const tarBin = process.platform === 'win32' ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
 execFileSync(tarBin, ['-czf', path.join(work, 'app.tgz'), '-T', path.join(work, 'list.txt')], { cwd: appDir });
 const key = randomBytes(32);
@@ -152,9 +154,17 @@ try {
     const blob = fs.readFileSync(sealed);
     const d = createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12), { authTagLength: 16 });
     d.setAuthTag(blob.subarray(12, 28));
-    fs.writeFileSync(path.join(work, p + '.tgz'), Buffer.concat([d.update(blob.subarray(28)), d.final()]));
+    const tgz = path.join(outDir, p, p + '.tgz');
+    fs.writeFileSync(tgz, Buffer.concat([d.update(blob.subarray(28)), d.final()]));
     fs.rmSync(sealed);
-    execFileSync(tarBin, ['-xzf', path.join(work, p + '.tgz'), '-C', path.join(outDir, p)]);
+    // Maestro names folders after the flows (Vietnamese): Windows' bsdtar cannot write those names, Git's GNU tar can.
+    // Relative paths and cwd keep GNU tar from reading "D:" as a remote host.
+    try {
+      execFileSync(unpackTar, ['-xzf', p + '.tgz'], { cwd: path.join(outDir, p), stdio: ['ignore', 'pipe', 'pipe'] });
+      fs.rmSync(tgz);
+    } catch (e) {
+      log(p + ': could not unpack (' + String(e.stderr || e.message).split('\n')[0].slice(0, 160) + '); the archive is kept: ' + tgz);
+    }
   }
   if (code !== 0) {
     try { fs.writeFileSync(path.join(outDir, 'failed.log'), gh(['run', 'view', String(runId), '-R', REPO, '--log-failed'])); log('failed-step log: ' + path.join(outDir, 'failed.log')); } catch { /* none */ }
