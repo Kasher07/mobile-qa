@@ -56,6 +56,66 @@ function shot(file) {
   return file;
 }
 
+// Safari's first-run tips (iOS 26: "View Bookmarks, Share Menu, and Open Tabs") cover the page; AXe reads the
+// accessibility tree and taps the tip's Close button. Only buttons near a tip text are tapped, never page content.
+let axe = null;
+try {
+  run('axe', ['--version']);
+  axe = 'axe';
+} catch {
+  console.log('AXe not installed: Safari tips may stay on screen');
+}
+const TIP_TEXT = /View Bookmarks|You can (now|change this)|Safari settings|Try it out|New in Safari/i;
+const CLOSE_LABEL = /^(Close|Dismiss|Not Now|OK|Continue|Done)$/i;
+let treeSaved = false;
+function uiNodes() {
+  const raw = JSON.parse(run('axe', ['describe-ui', '--udid', dev.udid]));
+  if (!treeSaved) {
+    fs.writeFileSync(path.join(OUT, 'ui-tree.json'), JSON.stringify(raw, null, 1));
+    treeSaved = true;
+  }
+  const nodes = [];
+  const walk = (o) => {
+    if (Array.isArray(o)) return o.forEach(walk);
+    if (!o || typeof o !== 'object') return;
+    const label = o.AXLabel || o.label || o.AXValue || '';
+    const f = o.frame || o.AXFrame;
+    if (label && f && typeof f === 'object') nodes.push({ label: String(label), type: String(o.type || o.role || ''), x: f.x, y: f.y, w: f.width, h: f.height });
+    for (const v of Object.values(o)) if (v && typeof v === 'object') walk(v);
+  };
+  walk(raw);
+  return nodes;
+}
+async function dismissTips() {
+  if (!axe) return;
+  for (let round = 0; round < 3; round++) {
+    let nodes;
+    try {
+      nodes = uiNodes();
+    } catch (e) {
+      console.log('describe-ui failed: ' + String(e.stderr || e).slice(0, 200));
+      return;
+    }
+    const tip = nodes.find((n) => TIP_TEXT.test(n.label));
+    if (!tip) return;
+    const btn = nodes
+      .filter((n) => CLOSE_LABEL.test(n.label.trim()) && /button/i.test(n.type || 'button') && Math.abs(n.y - tip.y) < 400)
+      .sort((a, b) => Math.abs(a.y - tip.y) - Math.abs(b.y - tip.y))[0];
+    if (!btn) {
+      console.log('tip found but no close button: ' + tip.label.slice(0, 80));
+      return;
+    }
+    console.log('closing Safari tip "' + tip.label.slice(0, 60) + '" via ' + btn.label);
+    try {
+      run('axe', ['tap', '-x', String(Math.round(btn.x + btn.w / 2)), '-y', String(Math.round(btn.y + btn.h / 2)), '--udid', dev.udid]);
+    } catch (e) {
+      console.log('tap failed: ' + String(e.stderr || e).slice(0, 200));
+      return;
+    }
+    await sleep(800);
+  }
+}
+
 let sid = null;
 let driver = null;
 async function wd(method, p, body) {
@@ -113,6 +173,7 @@ for (const [i, url] of urls.entries()) {
     if (hasWd) {
       await wd('POST', '/session/' + sid + '/url', { url });
       await sleep(2000);
+      await dismissTips();
       await exec('window.scrollTo(0, 0);');
       cur.probe = await exec('return (' + probe.toString() + ')();');
       cur.status = cur.probe.navStatus;
@@ -126,6 +187,7 @@ for (const [i, url] of urls.entries()) {
     } else {
       run('xcrun', ['simctl', 'openurl', dev.udid, url]);
       await sleep(9000);
+      await dismissTips();
       cur.shots.push(shot(name + '-01.jpg'));
     }
   } catch (e) {

@@ -18,6 +18,8 @@ results.device = (await sh('getprop ro.product.model')) + ' / Android ' + (await
 results.browser = 'Chrome ' + (await sh('dumpsys package com.android.chrome | grep versionName | head -1')).replace(/.*versionName=/, '');
 console.log('device ' + results.device + ' | ' + results.browser);
 await sh('am set-debug-app --persistent com.android.chrome').catch(() => {});
+// Without the permission Chrome opens a full-screen "Chrome notifications" promo over the first page.
+await sh('pm grant com.android.chrome android.permission.POST_NOTIFICATIONS').catch(() => {});
 
 const context = await device.launchBrowser();
 const page = context.pages()[0] || (await context.newPage());

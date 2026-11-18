@@ -49,6 +49,13 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - name: Install AXe (taps Safari's first-run tips away)
+        continue-on-error: true
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+          HOMEBREW_NO_ENV_HINTS: '1'
+        run: brew install cameroncooke/axe/axe || true
       - name: Safari on iOS Simulator
         run: node runner/ios.mjs
       - if: always()
@@ -107,15 +114,6 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: node runner/android.mjs
-      - name: Shrink screenshots
-        if: always()
-        run: |
-          [ -d out/android ] || exit 0
-          IM=$(command -v magick || command -v convert || true)
-          [ -n "$IM" ] || { echo "no ImageMagick, keeping PNG"; exit 0; }
-          cd out/android
-          for f in *.png; do [ -e "$f" ] || continue; "$IM" "$f" -resize 'x1600>' -quality 72 "${f%.png}.jpg" && rm "$f"; done
-          [ -f results.json ] && sed -i 's/\.png"/.jpg"/g' results.json || true
       - if: always()
         uses: actions/upload-artifact@v4
         with:
