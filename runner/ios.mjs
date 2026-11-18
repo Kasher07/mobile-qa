@@ -13,7 +13,11 @@ const urls = readUrls();
 const MAX_SEG = maxSegments();
 const run = (cmd, args, opts) =>
   execFileSync(cmd, args, Object.assign({ encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }, opts));
-const results = { platform: 'ios', device: null, browser: null, mode: null, pages: [] };
+const results = { platform: 'ios', device: null, browser: null, mode: null, notes: [], pages: [] };
+const note = (s) => {
+  console.log(s);
+  results.notes.push(s);
+};
 
 function pickDevice() {
   const j = JSON.parse(run('xcrun', ['simctl', 'list', 'devices', 'available', '-j']));
@@ -140,31 +144,36 @@ async function startDriver() {
   try {
     run('sudo', ['safaridriver', '--enable']);
   } catch (e) {
-    console.log('safaridriver --enable failed: ' + String(e.stderr || e).slice(0, 200));
-  }
-  driver = spawn('safaridriver', ['-p', '4444'], { stdio: 'inherit' });
-  for (let i = 0; i < 40; i++) {
-    try {
-      if ((await fetch('http://127.0.0.1:4444/status')).ok) break;
-    } catch {}
-    await sleep(500);
+    note('safaridriver --enable failed: ' + String(e.stderr || e).slice(0, 200));
   }
   const base = { browserName: 'safari', platformName: 'iOS', 'safari:useSimulator': true };
-  for (const caps of [Object.assign({ 'safari:deviceUDID': dev.udid }, base), base]) {
-    try {
-      const v = await wd('POST', '/session', { capabilities: { alwaysMatch: caps } });
-      sid = v.sessionId;
-      await wd('POST', '/session/' + sid + '/timeouts', { pageLoad: 60000, script: 30000 }).catch(() => {});
-      const got = v.capabilities && v.capabilities['safari:deviceUDID'];
-      if (got && got !== dev.udid) {
-        console.log('safaridriver picked another simulator ' + got);
-        dev.udid = got;
-      }
-      console.log('webdriver session ok');
-      return true;
-    } catch (e) {
-      console.log('session failed: ' + e.message);
+  // Session creation fails now and then on a fresh runner: restart safaridriver and try again (3 rounds).
+  for (let round = 1; round <= 3; round++) {
+    if (driver) driver.kill();
+    driver = spawn('safaridriver', ['-p', '4444'], { stdio: 'inherit' });
+    for (let i = 0; i < 40; i++) {
+      try {
+        if ((await fetch('http://127.0.0.1:4444/status')).ok) break;
+      } catch {}
+      await sleep(500);
     }
+    for (const caps of [Object.assign({ 'safari:deviceUDID': dev.udid }, base), base]) {
+      try {
+        const v = await wd('POST', '/session', { capabilities: { alwaysMatch: caps } });
+        sid = v.sessionId;
+        await wd('POST', '/session/' + sid + '/timeouts', { pageLoad: 60000, script: 30000 }).catch(() => {});
+        const got = v.capabilities && v.capabilities['safari:deviceUDID'];
+        if (got && got !== dev.udid) {
+          note('safaridriver picked another simulator ' + got);
+          dev.udid = got;
+        }
+        console.log('webdriver session ok (round ' + round + ')');
+        return true;
+      } catch (e) {
+        note('session round ' + round + ' failed: ' + e.message.slice(0, 200));
+      }
+    }
+    await sleep(10000);
   }
   return false;
 }
@@ -224,7 +233,13 @@ for (const [i, url] of urls.entries()) {
         cur.shots.push(shot(name + '-' + String(k + 1).padStart(2, '0') + '.jpg'));
       }
     } else {
-      run('xcrun', ['simctl', 'openurl', dev.udid, url]);
+      try {
+        run('xcrun', ['simctl', 'openurl', dev.udid, url]);
+      } catch (e) {
+        note('openurl failed once: ' + String(e.stderr || e.message).slice(0, 200));
+        await sleep(5000);
+        run('xcrun', ['simctl', 'openurl', dev.udid, url]);
+      }
       await sleep(9000);
       cur.shots.push(shot(name + '-01.jpg'));
     }

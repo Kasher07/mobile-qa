@@ -448,6 +448,8 @@ async function main() {
     const dir = path.dirname(f);
     lines.push('## ' + res.platform + ': ' + res.device + ', ' + res.browser + ' (' + res.mode + ')', '');
     if (res.platform === 'ios') lines.push('iOS: JS errors are not captured (WebDriver has no console); the Android section covers them.', '');
+    for (const n of res.notes || []) lines.push('note: ' + n);
+    if ((res.notes || []).length) lines.push('');
     for (const p of res.pages || []) {
       const { bad, notes } = verdict(p);
       issues += bad.length;
