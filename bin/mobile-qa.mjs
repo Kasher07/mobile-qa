@@ -25,6 +25,10 @@ const log = (s) => console.log('[mobile-qa] ' + s);
 class InputError extends Error {}
 
 // ---- args
+// One URL per line; blank lines and lines starting with # are ignored.
+export function readUrlFile(f) {
+  return fs.readFileSync(f, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).flatMap((l) => l.split(/\s+/));
+}
 export function parseArgs(argv) {
   const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', keep: false, sweepOnly: false, urls: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -35,7 +39,7 @@ export function parseArgs(argv) {
     else if (a === '--ios-device') opts.iosDevice = argv[++i] || '';
     else if (a === '--keep') opts.keep = true;
     else if (a === '--sweep-only') opts.sweepOnly = true;
-    else if (a === '--file') opts.urls.push(...fs.readFileSync(argv[++i], 'utf8').split(/\s+/).filter(Boolean));
+    else if (a === '--file') opts.urls.push(...readUrlFile(argv[++i]));
     else if (a === '-h' || a === '--help') {
       console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 7).join('\n'));
       process.exit(0);
