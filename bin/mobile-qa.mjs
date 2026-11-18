@@ -449,7 +449,8 @@ async function main() {
           r.replaced = true;
           r.finished = true;
           log(r.rid + ': GitHub gave no runner to ' + act.redo + ' on ' + IOS_POOLS[r.pool] + ', moving it to ' + IOS_POOLS[r.pool + 1]);
-          await dispatch(r.chunk, r.i, baseId, r.total, { suffix: '-p' + (r.pool + 1), platforms: act.redo, pool: r.pool + 1, dir: r.dir });
+          if (process.env.MOBILE_QA_TEST_STARVE_IOS === '1') for (const p of act.redo.split(',')) fs.rmSync(path.join(r.dir, p), { recursive: true, force: true }); // the injected job really ran: drop its output like a starved job has none
+          await dispatch(r.chunk, r.i, baseId, r.total, { suffix: '-p' + (r.pool + 1), platforms: act.redo, pool: r.pool + 1, dir: path.join(r.dir, 'on-' + IOS_POOLS[r.pool + 1]) });
           continue;
         }
         if (act.action === 'rerun') {
@@ -481,7 +482,8 @@ async function main() {
   // summary
   let issues = 0;
   const lines = ['# mobile-qa ' + baseId, ''];
-  const files = runs.flatMap((r) => findResults(r.dir));
+  // A replacement run writes below its first run's folder: take each results file once.
+  const files = [...new Set(runs.flatMap((r) => findResults(r.dir)))];
   for (const f of files) {
     let res;
     try {
