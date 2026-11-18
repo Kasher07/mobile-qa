@@ -1,0 +1,158 @@
+name: app-qa
+run-name: ${{ inputs.request_id }}
+
+# Native app QA for KIT: builds an Expo app (release, no Metro) for the iOS Simulator (macOS runner) and the Android
+# emulator (Linux runner, KVM), then runs the app's own Maestro flows in light mode and again in dark mode with the
+# largest system font. The app source arrives as an AES-256-GCM encrypted release asset; the key is the repo secret
+# APP_QA_KEY. bin/app-qa.mjs uploads both, dispatches, downloads the results and then deletes the run, the release and
+# the key. Inputs reach scripts only through env. Actions are pinned to commit SHAs.
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Caller id (becomes the run name)
+        required: true
+        type: string
+      asset_tag:
+        description: Release tag that holds app.tgz.enc
+        required: true
+        type: string
+      platforms:
+        description: ios, android or ios,android
+        default: ios,android
+        type: string
+      app_id:
+        description: iOS bundle id / Android package
+        required: true
+        type: string
+      ios_runner:
+        description: macOS runner label
+        default: macos-26
+        type: choice
+        options: [macos-26, macos-15]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-qa
+  cancel-in-progress: false
+
+env:
+  ASSET_TAG: ${{ inputs.asset_tag }}
+  APP_ID: ${{ inputs.app_id }}
+  MAESTRO_VERSION: cli-2.12.1
+  MAESTRO_SHA256: 54dbb0716425626604973cbb374c585ca30272375d9ce15177a1152765ddd9d7
+  MAESTRO_CLI_NO_ANALYTICS: '1'
+  EXPO_NO_TELEMETRY: '1'
+  CI: '1'
+
+jobs:
+  ios:
+    if: contains(inputs.platforms, 'ios')
+    runs-on: ${{ inputs.ios_runner || 'macos-26' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 26
+      - name: Fetch and decrypt the app
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: node runner/app-fetch.mjs
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+      - name: Native project (expo prebuild + pods)
+        working-directory: app
+        run: |
+          npx expo prebuild --platform ios --no-install
+          cd ios && pod install
+      - name: Build release for the simulator
+        working-directory: app/ios
+        run: |
+          set -o pipefail
+          WS=$(ls -d *.xcworkspace | head -1); SCHEME="${WS%.xcworkspace}"
+          echo "workspace $WS scheme $SCHEME"
+          xcodebuild -workspace "$WS" -scheme "$SCHEME" -configuration Release -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath "$RUNNER_TEMP/dd" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build 2>&1 \
+            | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" | tail -80
+      - name: Install Maestro (pinned, sha256 checked)
+        run: bash runner/app-maestro-install.sh
+      - name: Run flows on the iOS Simulator
+        run: bash runner/app-ios.sh
+      - if: failure()
+        run: mkdir -p out/ios && cp "$RUNNER_TEMP/xcodebuild.log" out/ios/ 2>/dev/null || true
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios
+          path: out/ios
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: warn
+
+  android:
+    if: contains(inputs.platforms, 'android')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Free disk space (Gradle + emulator need ~25 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 26
+      - name: Fetch and decrypt the app
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: node runner/app-fetch.mjs
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+      - name: Native project (expo prebuild)
+        working-directory: app
+        run: npx expo prebuild --platform android --no-install
+      - name: Build release APK (x86_64 for the emulator)
+        working-directory: app/android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon --console=plain -q
+      - name: Install Maestro (pinned, sha256 checked)
+        run: bash runner/app-maestro-install.sh
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run flows on the Android emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: bash runner/app-android.sh
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android
+          path: out/android
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: warn
