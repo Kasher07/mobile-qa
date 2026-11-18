@@ -29,7 +29,10 @@ function pickDevice() {
       if (!best || score > best.score) best = { name: d.name, udid: d.udid, runtime: 'iOS ' + m[1] + '.' + m[2], score };
     }
   }
-  if (!best) throw new Error('no iOS simulator matches ' + (want || 'iPhone NN'));
+  if (!best) {
+    const names = [...new Set(Object.values(j.devices).flat().filter((d) => /^iPhone/.test(d.name)).map((d) => d.name))];
+    throw new Error('no iOS simulator matches "' + (want || 'iPhone NN') + '"; available: ' + names.join(', '));
+  }
   return best;
 }
 
@@ -192,6 +195,14 @@ for (const [i, url] of urls.entries()) {
       await exec('window.scrollTo(0, 0);');
       cur.probe = await exec('return (' + probe.toString() + ')();');
       cur.status = cur.probe.navStatus;
+      if (cur.status == null) {
+        // Safari may not expose responseStatus: ask the server directly (same URL, from the runner).
+        try {
+          cur.status = (await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(20000) })).status;
+        } catch (e) {
+          cur.error = 'unreachable: ' + String((e.cause && e.cause.code) || e.message).slice(0, 120);
+        }
+      }
       const vh = cur.probe.innerHeight || 700;
       const plan = segmentPlan(cur.probe.scrollHeight, vh, MAX_SEG);
       cur.segmentsNeeded = plan.needed;

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JS error fixture</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;margin:0;padding:16px;line-height:1.5}h1{font-size:28px}.band{padding:24px;margin:16px 0;border-radius:12px;background:#eef}</style>
+<script>console.error("fixture console error");window.addEventListener("load",function(){throw new Error("fixture uncaught error")});</script>
+</head>
+<body>
+<h1>JS error</h1><p>This page logs a console error and throws on load.</p><img src="missing-image-404.png" alt="missing" width="50" height="50">
+</body>
+</html>

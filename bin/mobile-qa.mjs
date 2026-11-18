@@ -24,7 +24,7 @@ const log = (s) => console.log('[mobile-qa] ' + s);
 class InputError extends Error {}
 
 // ---- args
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', keep: false, urls: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];

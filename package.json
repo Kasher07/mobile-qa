@@ -11,5 +11,8 @@
   },
   "dependencies": {
     "playwright-core": "1.65.1"
+  },
+  "scripts": {
+    "test": "node --test test/"
   }
 }
