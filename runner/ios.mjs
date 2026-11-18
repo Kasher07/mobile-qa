@@ -198,7 +198,9 @@ for (const [i, url] of urls.entries()) {
       if (cur.status == null) {
         // Safari may not expose responseStatus: ask the server directly (same URL, from the runner).
         try {
-          cur.status = (await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(20000) })).status;
+          // Browser UA: some sites (Cloudflare bot rules, anti-scraping) answer 403 to a bare client.
+          const ua = await exec('return navigator.userAgent;').catch(() => 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1');
+          cur.status = (await fetch(url, { redirect: 'follow', headers: { 'user-agent': ua, accept: 'text/html' }, signal: AbortSignal.timeout(20000) })).status;
         } catch (e) {
           cur.error = 'unreachable: ' + String((e.cause && e.cause.code) || e.message).slice(0, 120);
         }

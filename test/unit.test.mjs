@@ -57,7 +57,8 @@ test('segmentPlan reaches the page bottom', () => {
 
 test('slug is filesystem safe and ordered', () => {
   assert.equal(slug('https://a.com/san-pham/ao?x=1', 0), '01-a-com-san-pham-ao');
-  assert.match(slug('https://a.com/ti%E1%BA%BFng-vi%E1%BB%87t.html', 11), /^12-[a-z0-9-]+$/i);
+  assert.equal(slug('https://a.com/ti%E1%BA%BFng-vi%E1%BB%87t.html', 11), '12-a-com-tieng-viet-html');
+  assert.equal(slug('https://a.com/%C4%91%C6%B0%E1%BB%9Dng', 0), '01-a-com-duong');
   assert.equal(slug('https://a.com/', 1), '02-a-com');
 });
 

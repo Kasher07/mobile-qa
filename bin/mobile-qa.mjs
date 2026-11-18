@@ -366,6 +366,7 @@ async function main() {
     }
     const dir = path.dirname(f);
     lines.push('## ' + res.platform + ': ' + res.device + ', ' + res.browser + ' (' + res.mode + ')', '');
+    if (res.platform === 'ios') lines.push('iOS: JS errors are not captured (WebDriver has no console); the Android section covers them.', '');
     for (const p of res.pages || []) {
       const pr = p.probe || {};
       const bad = [];
@@ -374,6 +375,7 @@ async function main() {
       if (pr.overflowX) bad.push('horizontal overflow ' + pr.scrollWidth + '>' + pr.innerWidth + ' [' + (pr.wide || []).slice(0, 3).join('; ') + ']');
       if ((p.pageErrors || []).length) bad.push(p.pageErrors.length + ' JS errors: ' + p.pageErrors[0]);
       if (p.probe && !pr.viewportMeta) bad.push('no viewport meta');
+      if (p.probe && pr.viewportMeta && pr.scale && pr.scale < 0.98) bad.push('page zoomed out to ' + pr.scale + ' (content wider than the screen)');
       if (!(p.shots || []).length) bad.push('no screenshot');
       const notes = [];
       if ((p.consoleErrors || []).length) notes.push(p.consoleErrors.length + ' console errors');

@@ -44,17 +44,19 @@ async function gotoOnce(url) {
   }
 }
 let cur = null;
+// favicon.ico 404s are noise on almost every site.
+const noise = (u) => /\/favicon\.ico(\?|$)/.test(u || '');
 page.on('console', (m) => {
-  if (cur && m.type() === 'error') cur.consoleErrors.push(m.text().slice(0, 300));
+  if (cur && m.type() === 'error' && !noise((m.location() || {}).url)) cur.consoleErrors.push(m.text().slice(0, 300));
 });
 page.on('pageerror', (e) => {
   if (cur) cur.pageErrors.push(String((e && e.message) || e).slice(0, 300));
 });
 page.on('requestfailed', (r) => {
-  if (cur) cur.failedRequests.push(((r.failure() && r.failure().errorText) || 'failed') + ' ' + r.url().slice(0, 200));
+  if (cur && !noise(r.url())) cur.failedRequests.push(((r.failure() && r.failure().errorText) || 'failed') + ' ' + r.url().slice(0, 200));
 });
 page.on('response', (r) => {
-  if (cur && r.status() >= 400) cur.failedRequests.push(r.status() + ' ' + r.url().slice(0, 200));
+  if (cur && r.status() >= 400 && !noise(r.url())) cur.failedRequests.push(r.status() + ' ' + r.url().slice(0, 200));
 });
 
 for (const [i, url] of urls.entries()) {

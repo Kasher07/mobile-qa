@@ -17,7 +17,12 @@ export function maxSegments() {
 
 export function slug(url, i) {
   const u = new URL(url);
-  const s = (u.hostname + u.pathname).replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  let p = u.pathname;
+  try {
+    p = decodeURIComponent(p);
+  } catch {}
+  p = p.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D');
+  const s = (u.hostname + p).replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, 60);
   return String(i + 1).padStart(2, '0') + '-' + (s || 'page');
 }
 
@@ -40,11 +45,17 @@ export function saveResults(dir, results) {
 // Runs inside the page (Playwright evaluate or WebDriver execute): layout facts a screenshot alone can hide.
 export function probe() {
   const de = document.documentElement;
-  const vw = window.innerWidth;
+  // Chrome on Android zooms a too-wide page out and widens innerWidth to the content, so compare with the
+  // phone's own CSS width (screen) too: the smaller one is what the user really has.
+  const screenW = window.screen && screen.width ? Math.min(screen.width, screen.height || screen.width) : window.innerWidth;
+  const vw = Math.min(window.innerWidth, screenW);
+  const vv = window.visualViewport;
   const nav = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || {};
   const out = {
     title: document.title,
     innerWidth: vw,
+    screenWidth: screenW,
+    scale: vv ? Math.round(vv.scale * 100) / 100 : 1,
     innerHeight: window.innerHeight,
     scrollWidth: de.scrollWidth,
     scrollHeight: Math.max(de.scrollHeight, document.body ? document.body.scrollHeight : 0),
