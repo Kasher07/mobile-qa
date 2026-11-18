@@ -19,10 +19,10 @@ const note = (s) => {
   results.notes.push(s);
 };
 
-function pickDevice() {
+function rankDevices() {
   const j = JSON.parse(run('xcrun', ['simctl', 'list', 'devices', 'available', '-j']));
   const want = (process.env.IOS_DEVICE || '').trim();
-  let best = null;
+  const list = [];
   for (const [rt, devs] of Object.entries(j.devices)) {
     const m = rt.match(/iOS-(\d+)-(\d+)/);
     if (!m) continue;
@@ -31,30 +31,30 @@ function pickDevice() {
       if (d.isAvailable === false) continue;
       const fit = want ? d.name === want : /^iPhone \d+$/.test(d.name);
       if (!fit) continue;
-      const score = ver * 1000 + Number((d.name.match(/\d+/) || [0])[0]);
-      if (!best || score > best.score) best = { name: d.name, udid: d.udid, runtime: 'iOS ' + m[1] + '.' + m[2], score };
+      list.push({ name: d.name, udid: d.udid, runtime: 'iOS ' + m[1] + '.' + m[2], score: ver * 1000 + Number((d.name.match(/\d+/) || [0])[0]) });
     }
   }
-  if (!best) {
+  if (!list.length) {
     const names = [...new Set(Object.values(j.devices).flat().filter((d) => /^iPhone/.test(d.name)).map((d) => d.name))];
     throw new Error('no iOS simulator matches "' + (want || 'iPhone NN') + '"; available: ' + names.join(', '));
   }
-  return best;
+  return list.sort((a, b) => b.score - a.score);
 }
 
-const dev = pickDevice();
-results.device = dev.name + ' / ' + dev.runtime;
-results.browser = 'Safari (' + dev.runtime + ')';
-console.log('device ' + results.device + ' ' + dev.udid);
-try {
-  run('xcrun', ['simctl', 'boot', dev.udid]);
-} catch (e) {
-  if (!/Booted/.test(String(e.stderr))) throw e;
+function boot(d) {
+  try {
+    run('xcrun', ['simctl', 'boot', d.udid]);
+  } catch (e) {
+    if (!/Booted/.test(String(e.stderr))) throw e;
+  }
+  run('xcrun', ['simctl', 'bootstatus', d.udid, '-b'], { timeout: 600000 });
+  try {
+    run('xcrun', ['simctl', 'status_bar', d.udid, 'override', '--time', '9:41', '--batteryState', 'charged', '--batteryLevel', '100', '--cellularBars', '4', '--wifiBars', '3']);
+  } catch {}
 }
-run('xcrun', ['simctl', 'bootstatus', dev.udid, '-b'], { timeout: 600000 });
-try {
-  run('xcrun', ['simctl', 'status_bar', dev.udid, 'override', '--time', '9:41', '--batteryState', 'charged', '--batteryLevel', '100', '--cellularBars', '4', '--wifiBars', '3']);
-} catch {}
+
+const candidates = rankDevices();
+let dev = candidates[0];
 
 function shot(file) {
   const p = path.join(OUT, file);
@@ -191,7 +191,8 @@ async function startDriver() {
 // Close Safari's first-run tips before automation starts: a tap during a WebDriver session makes Safari show
 // "Safari is Running an Automated Test" over the page. The dismissal persists, so the automated Safari opens clean.
 // Taps happen only here, on a fixed neutral page, never on a page under test.
-if (axe && urls.length) {
+async function warmUp() {
+  if (!axe || !urls.length) return;
   try {
     run('xcrun', ['simctl', 'openurl', dev.udid, 'https://example.com/']);
     await sleep(8000);
@@ -201,10 +202,35 @@ if (axe && urls.length) {
     run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
     await sleep(1500);
   } catch (e) {
-    console.log('warm-up failed: ' + String(e.stderr || e.message || e).slice(0, 200));
+    note('warm-up failed on ' + dev.name + ': ' + String(e.stderr || e.message || e).slice(0, 200));
   }
 }
-const hasWd = await startDriver();
+// Some runner images carry a simulator whose Safari never accepts automation (and even openurl fails): try the next
+// best device before giving up (2026-11-18: the same UDID failed in two baselines while others worked).
+let hasWd = false;
+for (const [n, cand] of candidates.slice(0, 3).entries()) {
+  dev = cand;
+  results.device = dev.name + ' / ' + dev.runtime;
+  results.browser = 'Safari (' + dev.runtime + ')';
+  console.log('device ' + results.device + ' ' + dev.udid);
+  try {
+    boot(dev);
+  } catch (e) {
+    note('boot failed on ' + dev.name + ' ' + dev.udid + ': ' + String(e.stderr || e.message).slice(0, 160));
+    continue;
+  }
+  await warmUp();
+  hasWd = await startDriver();
+  if (hasWd) break;
+  note('no WebDriver session on ' + dev.name + ' ' + dev.runtime + ' ' + dev.udid + (n < 2 ? ', trying the next simulator' : ''));
+  if (driver) driver.kill();
+  driver = null;
+  if (n < Math.min(2, candidates.length - 1)) {
+    try {
+      run('xcrun', ['simctl', 'shutdown', dev.udid]);
+    } catch {}
+  }
+}
 results.mode = hasWd ? 'webdriver' : 'openurl';
 for (const [i, url] of urls.entries()) {
   const name = slug(url, i);
