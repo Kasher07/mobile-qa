@@ -1,0 +1,125 @@
+name: mobile-qa
+run-name: ${{ inputs.request_id }}
+
+# Real-phone screenshots for KIT: iOS Simulator Safari (macOS runner) and Android emulator Chrome (Linux runner).
+# Public repo = standard runners are free and unlimited. Triggered only by bin/mobile-qa.mjs (workflow_dispatch);
+# inputs reach scripts through env, never through shell interpolation.
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: Public URLs, one per line
+        required: true
+        type: string
+      platforms:
+        description: ios, android or ios,android
+        default: ios,android
+        type: string
+      request_id:
+        description: Caller id (becomes the run name)
+        required: true
+        type: string
+      max_segments:
+        description: Screens per page (scroll positions)
+        default: '6'
+        type: string
+      ios_device:
+        description: Simulator name, empty = newest plain iPhone
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  URLS: ${{ inputs.urls }}
+  MAX_SEGMENTS: ${{ inputs.max_segments }}
+
+jobs:
+  ios:
+    if: contains(inputs.platforms, 'ios')
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      IOS_DEVICE: ${{ inputs.ios_device }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Safari on iOS Simulator
+        run: node runner/ios.mjs
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: out/ios
+          retention-days: 1
+          if-no-files-found: warn
+
+  android:
+    if: contains(inputs.platforms, 'android')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-35-google_apis-x86_64-pixel_7-v1
+      - name: Create AVD snapshot (cache miss only)
+        if: steps.avd-cache.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "AVD snapshot created"
+      - name: Chrome on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: node runner/android.mjs
+      - name: Shrink screenshots
+        if: always()
+        run: |
+          [ -d out/android ] || exit 0
+          IM=$(command -v magick || command -v convert || true)
+          [ -n "$IM" ] || { echo "no ImageMagick, keeping PNG"; exit 0; }
+          cd out/android
+          for f in *.png; do [ -e "$f" ] || continue; "$IM" "$f" -resize 'x1600>' -quality 72 "${f%.png}.jpg" && rm "$f"; done
+          [ -f results.json ] && sed -i 's/\.png"/.jpg"/g' results.json || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/android
+          retention-days: 1
+          if-no-files-found: warn

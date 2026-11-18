@@ -1,0 +1,15 @@
+{
+  "name": "mobile-qa",
+  "private": true,
+  "type": "module",
+  "description": "Real-phone screenshots (iOS Simulator Safari, Android emulator Chrome) on GitHub Actions",
+  "bin": {
+    "mobile-qa": "bin/mobile-qa.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "playwright-core": "1.65.1"
+  }
+}
