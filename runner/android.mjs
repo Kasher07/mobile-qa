@@ -15,7 +15,7 @@ const [device] = await android.devices();
 if (!device) throw new Error('no adb device');
 const sh = async (c) => (await device.shell(c)).toString().trim();
 results.device = (await sh('getprop ro.product.model')) + ' / Android ' + (await sh('getprop ro.build.version.release'));
-results.browser = 'Chrome ' + (await sh('dumpsys package com.android.chrome | grep versionName | head -1')).replace(/.*versionName=/, '');
+results.browser = 'Chrome ' + (await sh('dumpsys package com.android.chrome 2>/dev/null | grep -m1 versionName')).replace(/.*versionName=/, '');
 console.log('device ' + results.device + ' | ' + results.browser);
 await sh('am set-debug-app --persistent com.android.chrome').catch(() => {});
 // Without the permission Chrome opens a full-screen "Chrome notifications" promo over the first page.

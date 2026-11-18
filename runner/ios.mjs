@@ -163,6 +163,21 @@ async function startDriver() {
   return false;
 }
 
+// Close Safari's first-run tips before automation starts: a tap during a WebDriver session makes Safari show
+// "Safari is Running an Automated Test" over the page. The dismissal persists, so the automated Safari opens clean.
+if (axe && urls.length) {
+  try {
+    run('xcrun', ['simctl', 'openurl', dev.udid, urls[0]]);
+    await sleep(8000);
+    await dismissTips();
+    await sleep(1000);
+    await dismissTips();
+    run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
+    await sleep(1500);
+  } catch (e) {
+    console.log('warm-up failed: ' + String(e.stderr || e.message || e).slice(0, 200));
+  }
+}
 const hasWd = await startDriver();
 results.mode = hasWd ? 'webdriver' : 'openurl';
 for (const [i, url] of urls.entries()) {
@@ -173,7 +188,6 @@ for (const [i, url] of urls.entries()) {
     if (hasWd) {
       await wd('POST', '/session/' + sid + '/url', { url });
       await sleep(2000);
-      await dismissTips();
       await exec('window.scrollTo(0, 0);');
       cur.probe = await exec('return (' + probe.toString() + ')();');
       cur.status = cur.probe.navStatus;
