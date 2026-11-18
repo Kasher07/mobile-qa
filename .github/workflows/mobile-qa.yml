@@ -150,7 +150,9 @@ jobs:
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: if [ "$TEST_FAULT" = "android-setup" ]; then echo "TEST: failing the first emulator step on purpose"; exit 1; fi; node runner/android.mjs
+          script: |
+            if [ "$TEST_FAULT" = "android-setup" ]; then echo "TEST - failing the first emulator step on purpose"; exit 1; fi
+            node runner/android.mjs
       # The emulator package download from Google fails now and then ("Error on ZipFile unknown archive"): one retry.
       - name: Chrome on Android emulator (retry after a setup failure)
         if: steps.emu1.outcome == 'failure'

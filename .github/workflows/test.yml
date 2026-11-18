@@ -16,4 +16,5 @@ jobs:
         with:
           node-version: 22
       - run: node --check bin/mobile-qa.mjs && for f in runner/*.mjs; do node --check "$f"; done
+      - run: npm ci --no-audit --no-fund
       - run: node --test test/*.test.mjs
