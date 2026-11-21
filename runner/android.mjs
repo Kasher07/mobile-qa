@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { _android as android } from 'playwright-core';
-import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies, isBlockedWrite } from './private.mjs';
+import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies, isBlockedWrite, sameHost } from './private.mjs';
 import { settleProbe, waitSettled } from './lib.mjs';
 import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
@@ -51,7 +51,7 @@ async function ensureChromeOnTop(cur) {
 // If a guard cannot be installed no page is loaded and the error is recorded.
 let guardError = null;
 async function launch() {
-  const ctx = await device.launchBrowser(PRIV ? { serviceWorkers: 'block' } : undefined);
+  const ctx = await device.launchBrowser(PRIV ? { serviceWorkers: 'block', args: ['--disable-features=Translate,TranslateUI'] } : undefined);
   if (!PRIV) return ctx;
   try {
     await ctx.addCookies(toPlaywrightCookies(PRIV));
@@ -72,7 +72,7 @@ async function launch() {
     return ctx;
   }
   try {
-    await ctx.routeWebSocket((u) => u.host === PRIV.host, (ws) => {
+    await ctx.routeWebSocket((u) => sameHost(u.href, PRIV.base), (ws) => {
       blocked.push('WEBSOCKET');
       ws.close().catch(() => {});
     });

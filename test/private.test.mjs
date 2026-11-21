@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { parse } from 'yaml';
-import { sealJob, openJob, seal, unseal, resultAad, checkPrivateTarget, cookiesFor, buildJob, allowedLine, sealDir, toWebDriverCookies, toPlaywrightCookies, validateJob, loadPrivateJob, takeSecrets, cookieTargetOk, isBlockedWrite, untrusted, leakVerdict } from '../runner/private.mjs';
+import { sealJob, openJob, seal, unseal, resultAad, checkPrivateTarget, cookiesFor, buildJob, allowedLine, sealDir, toWebDriverCookies, toPlaywrightCookies, validateJob, loadPrivateJob, takeSecrets, cookieTargetOk, isBlockedWrite, untrusted, leakVerdict, sameHost, rawArtifactLeaks, maskCommand } from '../runner/private.mjs';
 import { leakScan, acquireLock, makeCleaner, listPrivateRuns } from '../bin/private-qa.mjs';
+import { settleProbe } from '../runner/lib.mjs';
 import { waitSettled } from '../runner/lib.mjs';
 import { checkUrl, parseArgs } from '../bin/mobile-qa.mjs';
 import { readUrls } from '../runner/lib.mjs';
@@ -237,6 +238,8 @@ test('item 3: lock file is exclusive, stale locks of dead pids are taken over', 
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).pid, 333);
   rel2();
   fs.writeFileSync(f, 'garbage');
+  assert.throws(() => acquireLock(f, { pid: 445, alive: () => true, maxAgeMs: 60000 }).constructor, /could not take/, 'a fresh unreadable lock may be mid-write: not taken over');
+  fs.utimesSync(f, new Date(0), new Date(0));
   acquireLock(f, { pid: 444, alive: () => true })();
   fs.rmSync(path.dirname(f), { recursive: true, force: true });
 });
@@ -350,4 +353,173 @@ test('item 2/8: the client says iOS writes are not blocked, prints untrusted dat
   assert.match(src, /D:\/Kit\/tmp_research\/mobile-qa-private/);
   assert.ok(!/os\.tmpdir\(\), 'mobile-qa'/.test(src), 'never %TEMP% for results');
   assert.match(src, /fs\.rmSync\(tgz, \{ force: true \}\)/);
+});
+
+const CLI = new URL('../bin/mobile-qa.mjs', import.meta.url);
+const cliPath = CLI.pathname.replace(/^\/([A-Za-z]:)/, '$1');
+const STUB = `import fs from 'node:fs'; import path from 'node:path';
+const dir = process.env.STUB_DIR; const args = process.argv.slice(2);
+const log = (s) => fs.appendFileSync(path.join(dir, 'calls.log'), s + '\\n');
+const F = path.join(dir, 'runs.json');
+const load = () => (fs.existsSync(F) ? JSON.parse(fs.readFileSync(F, 'utf8')) : []);
+const save = (r) => fs.writeFileSync(F, JSON.stringify(r));
+const stdin = () => { try { return fs.readFileSync(0, 'utf8'); } catch { return ''; } };
+const now = new Date().toISOString();
+if (args[0] === 'auth') console.log('tok');
+else if (args[0] === 'api') console.log(JSON.stringify({ workflow_runs: /page=1/.test(args[1]) ? load().map((r) => ({ id: r.id, display_title: r.title, status: r.status, created_at: now, updated_at: now })) : [] }));
+else if (args[0] === 'secret' && args[1] === 'set') { stdin(); log('secret-set'); }
+else if (args[0] === 'secret') console.log(JSON.stringify([{ name: 'PRIVATE_QA_KEY', updatedAt: 'x' }]));
+else if (args[0] === 'workflow') { const i = JSON.parse(stdin()); save([...load(), { id: 100, title: i.request_id, status: 'in_progress' }]); log('dispatch'); }
+else if (args[0] === 'run' && args[1] === 'view') { const r = load().find((x) => String(x.id) === args[2]); console.log(JSON.stringify({ status: r ? r.status : 'completed', conclusion: null, attempt: 1, jobs: [] })); }
+else if (args[0] === 'run' && args[1] === 'cancel') { log('cancel'); save(load().map((r) => ({ ...r, status: 'completed' }))); }
+else if (args[0] === 'run' && args[1] === 'delete') { log('delete'); save(load().filter((r) => String(r.id) !== args[2])); }
+`;
+function harness() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mq-cli-'));
+  fs.writeFileSync(path.join(dir, 'stub.mjs'), STUB);
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify(state));
+  const env = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, MOBILE_QA_GH_SCRIPT: path.join(dir, 'stub.mjs'), MOBILE_QA_TEST_FAST: '1', MOBILE_QA_LOCK: path.join(dir, 'l.lock'),
+    STUB_DIR: dir, KITQA_BASE: BASE, KITQA_STORAGE_STATE: path.join(dir, 'state.json'), MOBILE_QA_PRIVATE_OUT: path.join(dir, 'out') };
+  return { dir, env, calls: () => (fs.existsSync(path.join(dir, 'calls.log')) ? fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split('\n') : []) };
+}
+
+test('H1: Ctrl-C in a private call runs the private cleanup to the end (real CLI, gh stub; the signal is delivered with process.emit in a child)', () => {
+  const h = harness();
+  try {
+    fs.writeFileSync(path.join(h.dir, 'child.mjs'), [
+      "import fs from 'node:fs';",
+      "process.argv = [process.execPath, " + JSON.stringify(cliPath) + ", '--private', '/#sales'];",
+      "await import(" + JSON.stringify(CLI.href) + ");",
+      "const log = process.env.STUB_DIR + '/calls.log';",
+      "for (let i = 0; i < 200 && !(fs.existsSync(log) && fs.readFileSync(log, 'utf8').includes('dispatch')); i++) await new Promise((r) => setTimeout(r, 50));",
+      "await new Promise((r) => setTimeout(r, 300));",
+      "process.emit('SIGINT');",
+    ].join('\n'));
+    const r = spawnSync(process.execPath, [path.join(h.dir, 'child.mjs')], { env: h.env, encoding: 'utf8', timeout: 60000 });
+    const c = h.calls();
+    assert.equal(r.status, 2, r.stdout + r.stderr);
+    const second = c.indexOf('secret-set', c.indexOf('secret-set') + 1);
+    assert.ok(second > 0, 'secret replaced: ' + c.join(','));
+    assert.ok(c.indexOf('cancel') > second && c.indexOf('delete') > c.indexOf('cancel'), 'secret, then cancel, then delete: ' + c.join(','));
+    assert.ok(!fs.existsSync(h.env.MOBILE_QA_LOCK), 'lock released');
+    assert.match(r.stdout, /interrupted, cleaning up/);
+  } finally {
+    fs.rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('L3: anything that throws after the lock is taken still releases it (real CLI, output path is a file)', () => {
+  const h = harness();
+  try {
+    fs.writeFileSync(path.join(h.dir, 'afile'), 'x');
+    const r = spawnSync(process.execPath, [cliPath, '--private', '/#sales', '--out', path.join(h.dir, 'afile')], { env: h.env, encoding: 'utf8', timeout: 30000 });
+    assert.notEqual(r.status, 0, r.stdout + r.stderr);
+    assert.ok(!fs.existsSync(h.env.MOBILE_QA_LOCK), 'lock released after a throw: ' + r.stdout + r.stderr);
+  } finally {
+    fs.rmSync(h.dir, { recursive: true, force: true });
+  }
+});
+
+test('M1: a failed secret rotation is reported to the caller (exit 2 path)', async () => {
+  const bad = makeCleaner({ baseId: 'pq-m', log() {}, sleep: async () => {}, secretSet: () => true, tracked: () => [], replaceSecret: async () => false, cancel: async () => {}, del: async () => {}, listRuns: async () => [] });
+  await bad.cleanup();
+  assert.equal(bad.rotationFailed(), true);
+  const ok = makeCleaner({ baseId: 'pq-m', log() {}, sleep: async () => {}, secretSet: () => true, tracked: () => [], replaceSecret: async () => true, cancel: async () => {}, del: async () => {}, listRuns: async () => [] });
+  await ok.cleanup();
+  assert.equal(ok.rotationFailed(), false);
+  assert.match(fs.readFileSync(new URL('../bin/private-qa.mjs', import.meta.url), 'utf8'), /cleaner\.rotationFailed\(\)[\s\S]{0,120}code = 2/);
+});
+
+test('M2: a run GitHub accepted late is found by the second look, after a wait', async () => {
+  const calls = [];
+  let look = 0;
+  const waits = [];
+  await makeCleaner({ baseId: 'pq-late', log() {}, sleep: async (ms) => waits.push(ms), secretSet: () => false, tracked: () => [], replaceSecret: async () => true,
+    cancel: async (id) => calls.push('cancel ' + id), del: async (id) => calls.push('delete ' + id),
+    listRuns: async () => (++look === 2 ? [{ databaseId: 55, displayTitle: 'pq-late', status: 'queued' }] : []) }).cleanup();
+  assert.deepEqual(waits, [10000]);
+  assert.deepEqual(calls, ['cancel 55', 'delete 55']);
+});
+
+test('M3: any non-.enc file in the raw artifact is a leak', () => {
+  const enc = Buffer.from('4f1c9a7b2d3e5f60718293a4b5c6d7e8', 'hex');
+  assert.equal(rawArtifactLeaks([{ name: 'ios.enc', buf: enc }]), 0);
+  assert.equal(rawArtifactLeaks([{ name: 'results.json', buf: Buffer.from('{}') }]), 1);
+  assert.equal(rawArtifactLeaks([{ name: 'notes.txt', buf: Buffer.from('hello') }]), 1);
+  assert.ok(rawArtifactLeaks([{ name: 'a.enc', buf: Buffer.from('xx' + HOST + 'yy') }], [HOST]) >= 1);
+  assert.ok(rawArtifactLeaks([{ name: 'a.enc', buf: Buffer.from([0x1f, 0x8b, 1, 2, 3]) }]) >= 1);
+});
+
+test('M4: every console method goes through the allow-list', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mq-priv-con-'));
+  try {
+    const lib = new URL('../runner/private.mjs', import.meta.url).href;
+    fs.writeFileSync(path.join(dir, 'r.mjs'), [
+      "import { loadPrivateJob, installPrivateLogging } from '" + lib + "';",
+      'const P = loadPrivateJob(); installPrivateLogging(P, process.env, "ios");',
+      "const secret = P.urls[0] + ' Customer Nguyen Van A';",
+      "console.table([{ a: secret }]); console.dir({ a: secret }); console.trace(secret); console.assert(false, secret);",
+      "console.group(secret); console.groupCollapsed(secret); console.count(secret); console.time(secret); console.timeEnd(secret); console.timeLog(secret);",
+      "console.log(secret); console.debug(secret); console.dirxml(secret); console.countReset(secret); console.groupEnd();",
+      "console.log('[1/1] ');",
+    ].join('\n'));
+    const r = spawnSync(process.execPath, [path.join(dir, 'r.mjs')], { cwd: dir, encoding: 'utf8', env: { ...process.env, PRIVATE_JOB: sealJob(mkJob(), KEY, 'pq-4'), PRIVATE_RID: 'pq-4', PRIVATE_QA_KEY: KEY } });
+    const shown = (r.stdout + r.stderr).split('\n').filter((l) => !l.startsWith('::add-mask::')).join('\n');
+    for (const s of [HOST, 'Nguyen', 'Customer', 'sales']) assert.ok(!shown.includes(s), 'leaked ' + s + ': ' + shown);
+    assert.match(shown, /\[1\/1\]/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('M5: the WebSocket guard and the write guard compare host names (ports and schemes do not matter)', () => {
+  assert.equal(sameHost('wss://' + HOST + ':443/ws', BASE), true);
+  assert.equal(sameHost('ws://' + HOST + ':8080/ws', BASE), true);
+  assert.equal(sameHost('wss://other.test/ws', BASE), false);
+  assert.equal(sameHost('wss://' + HOST + '.evil.test/ws', BASE), false);
+  assert.equal(isBlockedWrite('POST', 'https://' + HOST + ':8443/api', BASE), true);
+  assert.equal(isBlockedWrite('GET', 'https://' + HOST + ':8443/api', BASE), false);
+  assert.match(fs.readFileSync(new URL('../runner/android.mjs', import.meta.url), 'utf8'), /routeWebSocket\(\(u\) => sameHost\(u\.href, PRIV\.base\)/);
+});
+
+test('L1: untrusted() removes invisible, bidi, tag and private-use characters', () => {
+  const dirty = 'a\u200Bb\u202Ec\u{E0041}d\uE000e\u0378f\u2066g\uFEFFh';
+  assert.equal(untrusted(dirty), 'abcdefgh');
+});
+
+test('L2: a lock older than the deadline is stale whatever its pid; takeover is by rename, one winner', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mq-lock2-')), 'l.lock');
+  const t0 = Date.now();
+  fs.writeFileSync(f, JSON.stringify({ pid: 4242, start: new Date(t0 - 3 * 3600000).toISOString() }));
+  const rel = acquireLock(f, { pid: 1, alive: () => true, now: () => t0 }); // pid is "alive" but the lock is 3 h old
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).pid, 1);
+  assert.throws(() => acquireLock(f, { pid: 2, alive: () => true, now: () => t0 }), /another private call/);
+  rel();
+  assert.ok(!fs.readdirSync(path.dirname(f)).some((n) => n.includes('.stale-')), 'moved-away stale locks are removed');
+  assert.match(fs.readFileSync(new URL('../bin/private-qa.mjs', import.meta.url), 'utf8'), /renameSync\(file, gone\)/);
+});
+
+test('L4: ::add-mask:: values escape %, CR and LF', () => {
+  assert.equal(maskCommand('a%b\r\nc'), '::add-mask::a%25b%0D%0Ac');
+  assert.equal(maskCommand('plain'), '::add-mask::plain');
+});
+
+test('L5: "loading" matches as a word only', () => {
+  const run = (t) => { globalThis.document = { body: { innerText: t } }; try { return settleProbe().loading; } finally { delete globalThis.document; } };
+  assert.equal(run('Uploading files, Downloading report'), false);
+  assert.equal(run('Page is loading'), true);
+  assert.equal(run('Loading...'), true);
+  assert.equal(run('Đơn hàng | Đang tải…'), true);
+  assert.equal(run('Chưa tải xong, Preloading'), false);
+});
+
+test('N1: the private Android launch turns Chrome translation offers off', () => {
+  assert.match(fs.readFileSync(new URL('../runner/android.mjs', import.meta.url), 'utf8'), /--disable-features=Translate/);
+});
+
+test('public CLI still installs its own signal handlers and the private one does not', () => {
+  const src = fs.readFileSync(new URL('../bin/mobile-qa.mjs', import.meta.url), 'utf8');
+  assert.match(src, /function installPublicSignalHandlers/);
+  assert.ok(src.indexOf('runPrivate(opts') < src.indexOf('installPublicSignalHandlers();'), 'private returns before the public handlers are installed');
+  assert.ok(!/^for \(const sig of/m.test(src), 'no signal handler at module load');
 });

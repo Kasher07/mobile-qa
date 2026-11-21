@@ -162,17 +162,43 @@ export function cookieTargetOk(currentUrl, base) {
 }
 
 // Android guard: a request is blocked when it is a same-origin write.
-export function isBlockedWrite(method, url, base) {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase())) return false;
+// Same host name (any port or scheme): used by the Android write guard and the WebSocket guard alike.
+export function sameHost(url, base) {
   try {
-    return new URL(url).origin === new URL(base).origin;
+    return new URL(url).hostname === new URL(base).hostname;
   } catch {
     return false;
   }
 }
 
+// Android guard: a request is blocked when it is a write to the site's host.
+export function isBlockedWrite(method, url, base) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase())) return false;
+  return sameHost(url, base);
+}
+
 // Text that came from the runner or the page: no control characters, bounded.
-export const untrusted = (s, max = 200) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').slice(0, max);
+export const untrusted = (s, max = 200) =>
+  String(s ?? '')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ') // control characters and line separators
+    .replace(/[\p{Cf}\p{Co}\p{Cn}\p{Cs}]+/gu, '') // format (zero-width, bidi, Unicode tags), private use, unassigned, surrogates
+    .slice(0, max);
+
+// M3: anything in the raw artifact that is not a .enc file is a leak; readable markers in the ciphertext too.
+export function rawArtifactLeaks(files, needles = []) {
+  let n = 0;
+  for (const f of files) {
+    if (!String(f.name).endsWith('.enc')) n++;
+    const head = f.buf.subarray(0, 8);
+    if (head.toString('latin1').includes('PNG') || head.subarray(0, 2).toString('hex') === '1f8b') n++;
+    const text = f.buf.toString('latin1');
+    for (const v of needles) if (v && text.includes(v)) n++;
+  }
+  return n;
+}
+
+// L4: values written to ::add-mask:: are escaped the way the runner command parser expects.
+export const maskCommand = (v) => '::add-mask::' + String(v).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
 
 // Leak verdict of the client's scans. Cookie values and the key are masked by GitHub in the log, so they cannot be checked there.
 export function leakVerdict({ logHost, rawLeak, logScanned }) {
@@ -208,9 +234,11 @@ export const allowedLine = (s) => ALLOWED.some((r) => r.test(s));
 
 export function installPrivateLogging(job, env = process.env, platform = 'run') {
   // Runner-side masking of secrets (defence in depth; the allow-list below is the control).
-  const mask = [...job.cookies.map((c) => c.value), job._key].filter((v) => v && v.length >= 8 && !/[\r\n]/.test(v));
-  for (const v of mask) process.stdout.write('::add-mask::' + v + '\n');
-  for (const k of ['log', 'info', 'warn', 'error', 'debug']) {
+  const mask = [...job.cookies.map((c) => c.value), job._key].filter((v) => v && v.length >= 4);
+  for (const v of mask) process.stdout.write(maskCommand(v) + '\n');
+  // Every console method goes through the allow-list (table, dir, trace, group, ... not only log/info/warn/error/debug).
+  for (const k of Object.keys(console)) {
+    if (typeof console[k] !== 'function' || /^[A-Z]/.test(k) || k === 'context') continue;
     console[k] = (...a) => {
       const s = a.map(String).join(' ').split('\n')[0];
       if (allowedLine(s)) process.stdout.write(s + '\n');

@@ -286,11 +286,15 @@ function cleanup(reason) {
   })();
   return cleaning;
 }
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
-  process.on(sig, () => {
-    log('interrupted, cleaning up');
-    cleanup('interrupted').finally(() => process.exit(2));
-  });
+// Public calls only: a private call registers its own handlers (bin/private-qa.mjs); these would run the public cleanup on an empty
+// list and exit before the private cleanup finished.
+function installPublicSignalHandlers() {
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
+    process.on(sig, () => {
+      log('interrupted, cleaning up');
+      cleanup('interrupted').finally(() => process.exit(2));
+    });
+  }
 }
 
 // A caller killed hard (TerminateProcess on Windows runs no handler) leaves its run public. Every call first
@@ -387,6 +391,7 @@ function findResults(dir) {
 async function main() {
   opts = parseArgs(process.argv.slice(2));
   if (opts.private) return runPrivate(opts, { verdict, starvedAction, iosPools: IOS_POOLS, InputError });
+  installPublicSignalHandlers();
   const urls = [];
   if (opts.sweepOnly) opts.urls = [];
   for (const raw of [...new Set(opts.urls)]) {

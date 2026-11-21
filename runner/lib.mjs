@@ -129,7 +129,7 @@ export function writeResults(dir, results) {
 // Private runs: wait until the page has settled (no loading text, visible text unchanged for 3 samples), bounded.
 export function settleProbe() {
   const t = document.body ? document.body.innerText : '';
-  return { len: t.trim().length, loading: /đang tải|loading/i.test(t) };
+  return { len: t.trim().length, loading: /(?<![\p{L}\p{N}_])(đang tải|loading)(?![\p{L}\p{N}_])/iu.test(t) };
 }
 export async function waitSettled(sample, wait, { maxMs = 25000, stepMs = 1000, stable = 3 } = {}) {
   const t0 = Date.now();
