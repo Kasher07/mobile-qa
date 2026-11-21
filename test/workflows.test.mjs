@@ -19,6 +19,6 @@ for (const f of fs.readdirSync(new URL('../.github/workflows/', import.meta.url)
 test('mobile-qa.yml keeps its dispatch inputs', () => {
   const wf = parse(fs.readFileSync(new URL('../.github/workflows/mobile-qa.yml', import.meta.url), 'utf8'));
   const inputs = wf.on.workflow_dispatch.inputs;
-  for (const k of ['urls', 'platforms', 'request_id', 'max_segments', 'ios_device', 'ios_runner', 'ios_mode', 'test_fault']) assert.ok(inputs[k], 'missing input ' + k);
+  for (const k of ['urls', 'platforms', 'request_id', 'max_segments', 'ios_device', 'ios_runner', 'ios_mode', 'test_fault', 'private_job']) assert.ok(inputs[k], 'missing input ' + k);
   assert.ok(Object.keys(inputs).length <= 10, 'GitHub allows at most 10 dispatch inputs');
 });

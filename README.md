@@ -12,6 +12,23 @@ targets, viewport meta, HTTP status) and, on Android, JS errors, console errors 
 node bin/mobile-qa.mjs https://example.com https://example.com/pricing [--platforms ios,android] [--out DIR]
 ```
 
+## Private pages (kit-qa qa-agent sites)
+
+```bash
+kit-qa exec easycustom -- node bin/mobile-qa.mjs --private /#sales /#inventory [--platforms ios,android]
+```
+
+Shows the signed-in pages on the real phones. Only paths on the site's own origin are accepted (a full URL on another
+host, credentials or a token site are refused). The 2 h QA Agent session cookies of that host (not `QA_AGENT_KEY`) are
+sealed with a fresh AES-256-GCM key kept in the repo secret `PRIVATE_QA_KEY` (set through stdin, one private run at a
+time) and only ciphertext is sent as the workflow input `private_job`. The runner sets the cookies (Android:
+`context.addCookies`; iOS: WebDriver Add Cookie on the open origin), only loads and scrolls (Android also aborts
+same-origin non-GET requests and counts them), prints page numbers only in its log, and seals every result before
+upload. The client unseals locally, scans the run log and the raw artifact for the host name and cookie values, deletes
+the run and replaces the secret with random bytes (also on failure or Ctrl-C; leftovers are swept on the next call).
+The QA session is not logged out (that would kill it for other kit-qa users): it expires by itself within 2 h.
+`MOBILE_QA_REF=<branch>` runs that branch's workflow (to test before merging).
+
 Self-check: `npm test`; fixtures at https://kasher07.github.io/mobile-qa/; fault paths with `MOBILE_QA_TEST_STARVE_IOS=1`,
 `MOBILE_QA_TEST_FAULT=android-setup` and `--ios-mode openurl`.
 

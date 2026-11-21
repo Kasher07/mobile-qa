@@ -3,13 +3,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { _android as android } from 'playwright-core';
+import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies } from './private.mjs';
 import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
 const STARTED = Date.now();
 
 const OUT = path.resolve('out/android');
 fs.mkdirSync(OUT, { recursive: true });
-const urls = readUrls();
+// Private run (qa-agent site): sealed job with the session cookies; the log keeps page numbers only; read-only.
+const PRIV = loadPrivateJob();
+if (PRIV) installPrivateLogging(PRIV);
+const urls = PRIV ? PRIV.urls : readUrls();
+const blocked = [];
 const MAX_SEG = maxSegments();
 const results = { platform: 'android', device: null, browser: null, mode: 'playwright-android', pages: [] };
 
@@ -41,6 +46,10 @@ async function ensureChromeOnTop(cur) {
 }
 
 const context = await device.launchBrowser();
+if (PRIV) {
+  await context.addCookies(toPlaywrightCookies(PRIV));
+  console.log('[private] cookies set: ' + PRIV.cookies.length);
+}
 let page = context.pages()[0] || (await context.newPage());
 // A freshly booted emulator can lack DNS for a while; a page under test must not fail for that.
 for (let t = 0; t < 12; t++) {
@@ -71,6 +80,17 @@ const infraNoise = (t) => /^\[Report Only\]/.test(t) || /Refused to connect to '
 // Each page gets its own tab: a page left scrolled with work in flight blocked the next navigation in the same tab
 // (Moioi baseline, 2026-11-18). Dialogs (beforeunload, alert) are accepted so they never hold a navigation.
 function attach(p) {
+  if (PRIV) {
+    // Read-only: same-origin writes from the page are aborted and counted (as kit-qa shot does).
+    p.route('**/*', (route) => {
+      const req = route.request();
+      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method()) && req.url().startsWith(PRIV.base + '/')) {
+        blocked.push(req.method() + ' ' + new URL(req.url()).pathname);
+        return route.abort('blockedbyclient');
+      }
+      return route.continue();
+    }).catch(() => {});
+  }
   p.on('dialog', (d) => d.accept().catch(() => {}));
   p.on('console', (m) => {
     if (!cur || m.type() !== 'error' || noise((m.location() || {}).url)) return;
@@ -81,6 +101,7 @@ function attach(p) {
     if (cur) cur.pageErrors.push(String((e && e.message) || e).slice(0, 300));
   });
   p.on('requestfailed', (r) => {
+    if (r.failure() && /BLOCKED_BY_CLIENT/.test(r.failure().errorText)) return;
     const aborted = r.failure() && /ERR_ABORTED/.test(r.failure().errorText);
     let crossOrigin = false;
     try {
@@ -127,7 +148,7 @@ async function checkPage(cur, url, name) {
 }
 
 for (const [i, url] of urls.entries()) {
-  const name = slug(url, i);
+  const name = PRIV ? 'p' + String(i + 1).padStart(2, '0') : slug(url, i);
   cur = newPage(url, name);
   results.pages.push(cur);
   if (Date.now() - STARTED > JOB_BUDGET_MS) {
@@ -143,7 +164,8 @@ for (const [i, url] of urls.entries()) {
       prev.close({ runBeforeUnload: false }).catch(() => {});
     }
   }
-  console.log('[' + (i + 1) + '/' + urls.length + '] ' + url);
+  console.log('[' + (i + 1) + '/' + urls.length + '] ' + (PRIV ? '' : url));
+  const blockedBefore = blocked.length;
   const t0 = Date.now();
   try {
     try {
@@ -173,7 +195,8 @@ for (const [i, url] of urls.entries()) {
       cur.shots.push(f);
     } catch {}
   }
-  console.log('    ' + (cur.error ? 'error: ' + cur.error : 'ok') + ' in ' + Math.round((Date.now() - t0) / 1000) + ' s, ' + cur.shots.length + ' screens');
+  if (PRIV) cur.blockedWrites = blocked.slice(blockedBefore);
+  console.log('    ' + (cur.error ? (PRIV ? 'error' : 'error: ' + cur.error) : 'ok') + ' in ' + Math.round((Date.now() - t0) / 1000) + ' s, ' + cur.shots.length + ' screens');
   saveResults(OUT, results);
 }
 cur = null;

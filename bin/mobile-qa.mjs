@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // mobile-qa: real-phone screenshots of PUBLIC pages on GitHub Actions in the public repo Kasher07/mobile-qa
 // (iOS Simulator Safari + Android emulator Chrome), then download the results and delete the run.
+// Private pages (kit-qa qa-agent sites): kit-qa exec <site> -- node bin/mobile-qa.mjs --private </path> [more paths] (see README)
 // Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android] [--out DIR] [--segments N]
 //        [--ios-device "iPhone SE (3rd generation)"] [--file urls.txt] [--keep] [--sweep-only]
 // Exit: 0 no issues, 1 issues found, 2 run failed / bad input / tool error.
@@ -9,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runPrivate } from './private-qa.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -31,7 +33,7 @@ export function readUrlFile(f) {
   return fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !l.trim().startsWith('#')).flatMap((l) => l.match(/https?:\/\/[^\s<>`"')]+/g) || []);
 }
 export function parseArgs(argv) {
-  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, urls: [] };
+  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, private: false, urls: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--platforms') opts.platforms = argv[++i];
@@ -40,6 +42,7 @@ export function parseArgs(argv) {
     else if (a === '--ios-device') opts.iosDevice = argv[++i] || '';
     else if (a === '--keep') opts.keep = true;
     else if (a === '--sweep-only') opts.sweepOnly = true;
+    else if (a === '--private') opts.private = true;
     else if (a === '--ios-mode') opts.iosMode = argv[++i];
     else if (a === '--file') opts.urls.push(...readUrlFile(argv[++i]));
     else if (a === '-h' || a === '--help') {
@@ -52,6 +55,7 @@ export function parseArgs(argv) {
   if (!Number.isInteger(opts.segments) || opts.segments < 1 || opts.segments > 12) throw new InputError('--segments must be 1..12');
   if (/[\r\n]/.test(opts.iosDevice)) throw new InputError('bad --ios-device');
   if (!/^(webdriver|openurl)$/.test(opts.iosMode)) throw new InputError('--ios-mode must be webdriver or openurl');
+  if (opts.private && (opts.keep || opts.sweepOnly)) throw new InputError('--private cannot be combined with --keep or --sweep-only (a private run is always deleted)');
   return opts;
 }
 
@@ -382,6 +386,7 @@ function findResults(dir) {
 
 async function main() {
   opts = parseArgs(process.argv.slice(2));
+  if (opts.private) return runPrivate(opts, { verdict, starvedAction, iosPools: IOS_POOLS, InputError });
   const urls = [];
   if (opts.sweepOnly) opts.urls = [];
   for (const raw of [...new Set(opts.urls)]) {

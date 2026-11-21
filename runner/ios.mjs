@@ -3,13 +3,17 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { loadPrivateJob, installPrivateLogging, toWebDriverCookies } from './private.mjs';
 import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
 const STARTED = Date.now();
 
 const OUT = path.resolve('out/ios');
 fs.mkdirSync(OUT, { recursive: true });
-const urls = readUrls();
+// Private run (qa-agent site): sealed job with the session cookies; the log keeps page numbers only.
+const PRIV = loadPrivateJob();
+if (PRIV) installPrivateLogging(PRIV);
+const urls = PRIV ? PRIV.urls : readUrls();
 const MAX_SEG = maxSegments();
 const run = (cmd, args, opts) =>
   execFileSync(cmd, args, Object.assign({ encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }, opts));
@@ -174,7 +178,7 @@ async function startDriver() {
     try {
       run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
     } catch {}
-    driver = spawn('safaridriver', ['-p', '4444'], { stdio: 'inherit' });
+    driver = spawn('safaridriver', ['-p', '4444'], { stdio: PRIV ? 'ignore' : 'inherit' });
     for (let i = 0; i < 40; i++) {
       try {
         if ((await fetch('http://127.0.0.1:4444/status')).ok) break;
@@ -247,8 +251,25 @@ for (const [n, cand] of candidates.slice(0, 2).entries()) {
   }
 }
 results.mode = hasWd ? 'webdriver' : 'openurl';
+// Cookies go in through WebDriver "Add Cookie", which needs an open document on the site: a plain text file there, then
+// every page is a fresh load. HttpOnly/Secure/__Host- cookies are added with no domain (host-only).
+let cookieError = null;
+if (PRIV) {
+  if (!hasWd) cookieError = 'no WebDriver session: cookies cannot be set';
+  else {
+    try {
+      await wd('POST', '/session/' + sid + '/url', { url: PRIV.base + '/robots.txt' });
+      await sleep(1500);
+      for (const c of toWebDriverCookies(PRIV)) await wd('POST', '/session/' + sid + '/cookie', { cookie: c });
+      console.log('[private] cookies set: ' + PRIV.cookies.length);
+    } catch (e) {
+      cookieError = 'cookie setup failed: ' + String(e.message).split('\n')[0].slice(0, 200);
+    }
+  }
+  if (cookieError) note('private: ' + cookieError);
+}
 for (const [i, url] of urls.entries()) {
-  const name = slug(url, i);
+  const name = PRIV ? 'p' + String(i + 1).padStart(2, '0') : slug(url, i);
   const cur = newPage(url, name);
   results.pages.push(cur);
   if (Date.now() - STARTED > JOB_BUDGET_MS) {
@@ -256,8 +277,9 @@ for (const [i, url] of urls.entries()) {
     saveResults(OUT, results);
     continue;
   }
-  console.log('[' + (i + 1) + '/' + urls.length + '] ' + url);
+  console.log('[' + (i + 1) + '/' + urls.length + '] ' + (PRIV ? '' : url));
   try {
+    if (PRIV && cookieError) cur.error = cookieError;
     if (hasWd) {
       await wd('POST', '/session/' + sid + '/url', { url });
       await sleep(2000);
@@ -268,7 +290,7 @@ for (const [i, url] of urls.entries()) {
         cur.probe = await exec('return (' + probe.toString() + ')();');
       }
       cur.status = cur.probe.navStatus;
-      if (!cur.status) {
+      if (!cur.status && !PRIV) {
         // Safari may not expose responseStatus: ask the server directly (same URL, from the runner).
         try {
           // Browser UA: some sites (Cloudflare bot rules, anti-scraping) answer 403 to a bare client.

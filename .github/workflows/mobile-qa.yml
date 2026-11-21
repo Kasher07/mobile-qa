@@ -43,6 +43,11 @@ on:
         type: choice
         options: [webdriver, openurl]
 
+      private_job:
+        description: Sealed job of a private (qa-agent) run, base64 ciphertext; empty = public run
+        default: ''
+        type: string
+
 permissions:
   contents: read
 
@@ -81,12 +86,35 @@ jobs:
           dirname "$BIN" >> "$GITHUB_PATH"
           "$BIN" --help > /dev/null 2>&1 || "$BIN" list-simulators > /dev/null
       - name: Safari on iOS Simulator
+        if: inputs.private_job == ''
         run: node runner/ios.mjs
-      - if: always()
+      # Private run: the secret is exposed to these two steps only (never job-wide). Nothing readable is uploaded.
+      - name: Safari on iOS Simulator (private)
+        if: inputs.private_job != ''
+        run: node runner/ios.mjs
+        env:
+          PRIVATE_JOB: ${{ inputs.private_job }}
+          PRIVATE_RID: ${{ inputs.request_id }}
+          PRIVATE_QA_KEY: ${{ secrets.PRIVATE_QA_KEY }}
+      - name: Seal results (private)
+        if: always() && inputs.private_job != ''
+        run: node runner/private-seal.mjs out/ios ios
+        env:
+          PRIVATE_RID: ${{ inputs.request_id }}
+          PRIVATE_QA_KEY: ${{ secrets.PRIVATE_QA_KEY }}
+      - if: always() && inputs.private_job == ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ios
           path: out/ios
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: warn
+      - if: always() && inputs.private_job != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios
+          path: sealed/ios
           retention-days: 1
           overwrite: true
           if-no-files-found: warn
@@ -138,6 +166,7 @@ jobs:
           key: avd-35-google_apis-x86_64-pixel_7-v2
       - name: Chrome on Android emulator
         id: emu1
+        if: inputs.private_job == ''
         continue-on-error: true
         env:
           TEST_FAULT: ${{ inputs.test_fault || 'none' }}
@@ -155,7 +184,7 @@ jobs:
             node runner/android.mjs
       # The emulator package download from Google fails now and then ("Error on ZipFile unknown archive"): one retry.
       - name: Chrome on Android emulator (retry after a setup failure)
-        if: steps.emu1.outcome == 'failure'
+        if: inputs.private_job == '' && steps.emu1.outcome == 'failure'
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
@@ -166,11 +195,60 @@ jobs:
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
           script: node runner/android.mjs
-      - if: always()
+      # Private run: same two steps with the secret in their own env; the secret is exposed to these steps only.
+      - name: Chrome on Android emulator (private)
+        id: emu1p
+        if: inputs.private_job != ''
+        continue-on-error: true
+        env:
+          PRIVATE_JOB: ${{ inputs.private_job }}
+          PRIVATE_RID: ${{ inputs.request_id }}
+          PRIVATE_QA_KEY: ${{ secrets.PRIVATE_QA_KEY }}
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: node runner/android.mjs
+      - name: Chrome on Android emulator (private, retry after a setup failure)
+        if: inputs.private_job != '' && steps.emu1p.outcome == 'failure'
+        env:
+          PRIVATE_JOB: ${{ inputs.private_job }}
+          PRIVATE_RID: ${{ inputs.request_id }}
+          PRIVATE_QA_KEY: ${{ secrets.PRIVATE_QA_KEY }}
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          force-avd-creation: false
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: node runner/android.mjs
+      - name: Seal results (private)
+        if: always() && inputs.private_job != ''
+        run: node runner/private-seal.mjs out/android android
+        env:
+          PRIVATE_RID: ${{ inputs.request_id }}
+          PRIVATE_QA_KEY: ${{ secrets.PRIVATE_QA_KEY }}
+      - if: always() && inputs.private_job == ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android
           path: out/android
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: warn
+      - if: always() && inputs.private_job != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android
+          path: sealed/android
           retention-days: 1
           overwrite: true
           if-no-files-found: warn
