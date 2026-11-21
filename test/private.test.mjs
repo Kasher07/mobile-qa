@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { parse } from 'yaml';
-import { sealJob, openJob, seal, unseal, resultAad, checkPrivateTarget, cookiesFor, buildJob, allowedLine, sealDir, toWebDriverCookies, toPlaywrightCookies, validateJob } from '../runner/private.mjs';
-import { leakScan } from '../bin/private-qa.mjs';
+import { sealJob, openJob, seal, unseal, resultAad, checkPrivateTarget, cookiesFor, buildJob, allowedLine, sealDir, toWebDriverCookies, toPlaywrightCookies, validateJob, loadPrivateJob, takeSecrets, cookieTargetOk, isBlockedWrite, untrusted, leakVerdict } from '../runner/private.mjs';
+import { leakScan, acquireLock, makeCleaner, listPrivateRuns } from '../bin/private-qa.mjs';
+import { waitSettled } from '../runner/lib.mjs';
 import { checkUrl, parseArgs } from '../bin/mobile-qa.mjs';
 import { readUrls } from '../runner/lib.mjs';
 
@@ -111,7 +112,7 @@ test('a private runner prints no URL, host, cookie, console or page text (also o
     fs.writeFileSync(script, [
       "import { loadPrivateJob, installPrivateLogging } from '" + lib + "';",
       'const PRIV = loadPrivateJob();',
-      'installPrivateLogging(PRIV);',
+      "installPrivateLogging(PRIV, process.env, 'android');",
       "console.log('[1/2] ' + PRIV.urls[0]);",
       "console.log('[2/2] ');",
       "console.log('[private] cookies set: ' + PRIV.cookies.length);",
@@ -134,7 +135,8 @@ test('a private runner prints no URL, host, cookie, console or page text (also o
     assert.match(all, /ok in 3 s, 2 screens/);
     assert.match(all, /fatal error, details are sealed/);
     assert.match(all, /::add-mask::S3SS10N/);
-    assert.ok(fs.existsSync(path.join(dir, 'out', 'fatal.txt')), 'the crash detail goes to the sealed folder');
+    assert.ok(fs.existsSync(path.join(dir, 'out', 'android', 'fatal.txt')), 'the crash detail goes into out/<platform>, the folder that is sealed');
+    assert.ok(!fs.existsSync(path.join(dir, 'out', 'fatal.txt')), 'and never next to it, where nothing seals it');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -165,6 +167,8 @@ test('public mode is unchanged', () => {
   assert.match(t.stdout, /token sites/);
 });
 
+const PRIV_IF = new Set(["inputs.private_job != ''", "always() && inputs.private_job != ''", "inputs.private_job != '' && steps.emu1p.outcome == 'failure'"]);
+const PUB_IF = new Set(["inputs.private_job == ''", "inputs.private_job == '' && steps.emu1.outcome == 'failure'"]);
 test('workflow: the secret reaches only private steps, never job or workflow env; public steps cannot see it', () => {
   const wf = parse(fs.readFileSync(new URL('../.github/workflows/mobile-qa.yml', import.meta.url), 'utf8'));
   assert.equal(wf.permissions.contents, 'read');
@@ -180,14 +184,170 @@ test('workflow: the secret reaches only private steps, never job or workflow env
       assert.ok(!other, name + ': secret outside step env: ' + (s.name || s.uses));
       if (uses) {
         guarded++;
-        assert.match(s.if, /inputs\.private_job != ''/, name + ': ' + s.name + ' must run only for private runs');
+        assert.ok(PRIV_IF.has(s.if), name + ': ' + s.name + ' has an unexpected if: ' + s.if);
       }
-      if (/runner\/(ios|android)\.mjs/.test(JSON.stringify(s)) && !uses) assert.match(s.if || '', /inputs\.private_job == ''/, name + ': a public runner step must be skipped in private runs');
+      if (/runner\/(ios|android)\.mjs/.test(JSON.stringify(s)) && !uses) assert.ok(PUB_IF.has(s.if), name + ': a public runner step must be skipped in private runs, got: ' + s.if);
+      if (/actions\/cache\/(restore|save)/.test(s.uses || '')) assert.ok(/^inputs\.private_job == ''/.test(s.if || ''), name + ': private runs must not use the AVD cache');
       if (s.uses && s.uses.startsWith('actions/upload-artifact')) {
-        const isPriv = /private_job != ''/.test(s.if || '');
+        const isPriv = PRIV_IF.has(s.if);
         assert.equal(s.with.path.startsWith('sealed/'), isPriv, name + ': private runs upload only sealed/, public ones only out/');
       }
     }
   }
   assert.ok(guarded >= 5, 'expected the private runner, seal and emulator steps, got ' + guarded);
+});
+
+test('item 1: iOS cookies only go to the job origin', () => {
+  assert.equal(cookieTargetOk(BASE + '/robots.txt', BASE), true);
+  assert.equal(cookieTargetOk('https://login.other.test/x', BASE), false);
+  assert.equal(cookieTargetOk('http://' + HOST + '/robots.txt', BASE), false);
+  assert.equal(cookieTargetOk('https://' + HOST + '.evil.test/', BASE), false);
+  assert.equal(cookieTargetOk('about:blank', BASE), false);
+  assert.equal(cookieTargetOk(undefined, BASE), false);
+});
+
+test('item 2: same-origin writes are blocked, reads and cross-origin pass', () => {
+  assert.equal(isBlockedWrite('POST', BASE + '/api/x', BASE), true);
+  assert.equal(isBlockedWrite('delete', BASE + '/api/x?a=1', BASE), true);
+  assert.equal(isBlockedWrite('GET', BASE + '/api/x', BASE), false);
+  assert.equal(isBlockedWrite('OPTIONS', BASE + '/api/x', BASE), false);
+  assert.equal(isBlockedWrite('POST', 'https://analytics.other.test/c', BASE), false);
+  assert.equal(isBlockedWrite('POST', BASE + '.evil.test/x', BASE), false);
+  assert.equal(isBlockedWrite('PUT', 'not a url', BASE), false);
+});
+
+test('item 2: the android runner installs its guards fail-closed (source check)', () => {
+  const src = fs.readFileSync(new URL('../runner/android.mjs', import.meta.url), 'utf8');
+  assert.match(src, /serviceWorkers: 'block'/);
+  assert.match(src, /await ctx\.route\('\*\*\/\*'/, 'one awaited context-level route');
+  assert.match(src, /routeWebSocket/);
+  assert.match(src, /if \(guardError\) throw new Error\(guardError\)/, 'no page loads without the guard');
+  assert.match(src, /d\.type\(\) !== 'beforeunload'/);
+  assert.ok(!/p\.route\(/.test(src), 'no per-page route: the context-level one covers every tab');
+});
+
+test('item 3: lock file is exclusive, stale locks of dead pids are taken over', () => {
+  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mq-lock-')), 'l.lock');
+  const rel = acquireLock(f, { pid: 111, alive: () => true });
+  assert.throws(() => acquireLock(f, { pid: 222, alive: () => true }), /another private call/);
+  rel();
+  assert.ok(!fs.existsSync(f));
+  fs.writeFileSync(f, JSON.stringify({ pid: 999, start: 'x' }));
+  const rel2 = acquireLock(f, { pid: 333, alive: (p) => p !== 999 }); // 999 is dead
+  assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).pid, 333);
+  rel2();
+  fs.writeFileSync(f, 'garbage');
+  acquireLock(f, { pid: 444, alive: () => true })();
+  fs.rmSync(path.dirname(f), { recursive: true, force: true });
+});
+
+test('item 3: cleanup replaces the secret first, then cancels and deletes, finds lost runs, and stops dispatch', async () => {
+  const calls = [];
+  const tracked = [{ id: 1, status: 'in_progress', deleted: false }, { id: 2, status: 'completed', deleted: true }];
+  const c = makeCleaner({
+    baseId: 'pq-x', log: () => {}, secretSet: () => true, tracked: () => tracked,
+    replaceSecret: async () => calls.push('secret'),
+    cancel: async (id) => calls.push('cancel ' + id),
+    del: async (id) => calls.push('delete ' + id),
+    listRuns: async () => [{ databaseId: 1, displayTitle: 'pq-x', status: 'in_progress' }, { databaseId: 7, displayTitle: 'pq-x-p1', status: 'queued' }, { databaseId: 8, displayTitle: 'pq-other', status: 'queued' }],
+  });
+  c.assertRunning();
+  const p = c.cleanup();
+  assert.throws(() => c.assertRunning(), /no new run/, 'dispatch stops as soon as cleanup starts');
+  await p;
+  assert.deepEqual(calls, ['secret', 'cancel 1', 'delete 1', 'cancel 7', 'delete 7']);
+  await c.cleanup();
+  assert.equal(calls.length, 5, 'cleanup runs once');
+  const none = [];
+  await makeCleaner({ baseId: 'pq-y', log() {}, secretSet: () => false, tracked: () => [], replaceSecret: async () => none.push('secret'), cancel: async () => {}, del: async () => {}, listRuns: async () => [] }).cleanup();
+  assert.deepEqual(none, [], 'secret untouched when it was never set');
+});
+
+test('item 3: the leftover sweep reads every page, not the newest 50', async () => {
+  const mk = (n, pq) => Array.from({ length: n }, (_, i) => ({ displayTitle: (pq && i === n - 1 ? 'pq-late' : 'mq-' + i) }));
+  const pages = [mk(100), mk(100), mk(100, true), mk(5)];
+  const seen = [];
+  const found = await listPrivateRuns(async (p) => { seen.push(p); return pages[p - 1] || []; });
+  assert.deepEqual(found.map((r) => r.displayTitle), ['pq-late']);
+  assert.deepEqual(seen, [1, 2, 3, 4]);
+});
+
+test('item 4: the key and job are gone from the environment once read', () => {
+  const env = { PRIVATE_JOB: sealJob(mkJob(), KEY, 'pq-5'), PRIVATE_QA_KEY: KEY, PRIVATE_RID: 'pq-5', PATH: 'x' };
+  const job = loadPrivateJob(env);
+  assert.equal(job.cookies.length, 1);
+  assert.ok(!('PRIVATE_QA_KEY' in env) && !('PRIVATE_JOB' in env));
+  assert.equal(JSON.stringify(job).includes(KEY), false, 'the key is not part of the serialised job');
+  const e2 = { PRIVATE_QA_KEY: KEY, PRIVATE_JOB: 'x' };
+  assert.deepEqual(takeSecrets(e2), { job: 'x', key: KEY });
+  assert.deepEqual(e2, {});
+  // a child process started after the load does not see them
+  const saved = { ...process.env };
+  process.env.PRIVATE_JOB = sealJob(mkJob(), KEY, 'pq-6');
+  process.env.PRIVATE_QA_KEY = KEY;
+  process.env.PRIVATE_RID = 'pq-6';
+  loadPrivateJob();
+  const r = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.env.PRIVATE_QA_KEY) + String(process.env.PRIVATE_JOB))'], { encoding: 'utf8' });
+  assert.equal(r.stdout, 'undefinedundefined');
+  Object.assign(process.env, saved);
+  delete process.env.PRIVATE_JOB;
+  delete process.env.PRIVATE_QA_KEY;
+});
+
+test('item 4: the seal step takes the key out of the environment before tar runs', () => {
+  const src = fs.readFileSync(new URL('../runner/private-seal.mjs', import.meta.url), 'utf8');
+  assert.ok(src.indexOf('takeSecrets()') < src.indexOf('sealDir('));
+  for (const f of ['ios', 'android']) assert.match(fs.readFileSync(new URL('../runner/' + f + '.mjs', import.meta.url), 'utf8'), /loadPrivateJob\(\)/);
+});
+
+test('item 6: a hostname in the log or a readable marker is a failure; cookie/key are not reported as 0', () => {
+  assert.equal(leakVerdict({ logHost: 0, rawLeak: 0, logScanned: true }).fail, false);
+  assert.equal(leakVerdict({ logHost: 1, rawLeak: 0, logScanned: true }).fail, true);
+  assert.equal(leakVerdict({ logHost: 0, rawLeak: 2, logScanned: true }).fail, true);
+  const v = leakVerdict({ logHost: 0, rawLeak: 0, logScanned: true }).lines.join('\n');
+  assert.match(v, /cannot be checked/);
+  assert.ok(!/cookie[^\n]*\b0\b/.test(v) && !/key[^\n]*\b0\b/.test(v));
+  assert.match(leakVerdict({ logHost: 0, rawLeak: 0, logScanned: false }).lines.join('\n'), /not scanned/);
+});
+
+test('item 7: free text after [private] is dropped, only fixed messages pass', () => {
+  for (const s of ['[private] ' + HOST, '[private] Nguyen Van A paid 5 trieu', '[private] cookies set: ' + COOKIE, '[private] fatal error: ' + HOST, 'device ' + HOST + ' / Android 15 | Chrome 1', 'device Acme Customer / iOS 26.2 UDID']) assert.ok(!allowedLine(s), s);
+  for (const s of ['[private] cookies set: 1', '[private] emulator network not up', '[private] fatal error, details are sealed', '[private] sealed ios: 123 bytes', '[private] read-only guard active', 'device iPhone 17 / iOS 26.2 ABCDEF01-2345-6789-ABCD-EF0123456789']) assert.ok(allowedLine(s), s);
+});
+
+test('item 8: untrusted text loses control characters and is truncated', () => {
+  assert.equal(untrusted('a\u001b[31mred\u0007\nb\u0085c'), 'a [31mred b c');
+  assert.equal(untrusted('x'.repeat(500), 50).length, 50);
+  assert.equal(untrusted(undefined), '');
+});
+
+test('item 9: cookie domains: the host or a parent with a dot, never a bare suffix', () => {
+  const mk = (domain) => ({ cookies: [{ name: 'n', value: 'v'.repeat(10), domain, path: '/', expires: -1 }] });
+  assert.equal(cookiesFor(mk(HOST), HOST).length, 1);
+  assert.equal(cookiesFor(mk('.example-shop.test'), HOST).length, 1);
+  assert.equal(cookiesFor(mk('.test'), HOST).length, 0, 'bare suffix');
+  assert.equal(cookiesFor(mk('com'), 'a.example.com').length, 0);
+  assert.equal(cookiesFor(mk('.co.uk'), 'shop.example.co.uk').length, 0, 'two-label suffix');
+  assert.equal(cookiesFor(mk('.example.co.uk'), 'shop.example.co.uk').length, 1);
+  assert.equal(cookiesFor(mk('other.test'), HOST).length, 0);
+  assert.throws(() => checkPrivateTarget('https://' + HOST + './', ['/x']), /trailing dot/);
+});
+
+test('item 11: waitSettled waits for loading text to go and the text to stop changing', async () => {
+  const seq = [{ len: 20, loading: true }, { len: 20, loading: true }, { len: 300, loading: false }, { len: 900, loading: false }, { len: 900, loading: false }, { len: 900, loading: false }];
+  let i = 0;
+  const r = await waitSettled(async () => seq[Math.min(i++, seq.length - 1)], async () => {}, { maxMs: 5000, stepMs: 0 });
+  assert.equal(r.settled, true);
+  assert.ok(i >= 5, 'did not stop at the first non-loading sample, used ' + i);
+  const stuck = await waitSettled(async () => ({ len: 20, loading: true }), (ms) => new Promise((res) => setTimeout(res, ms)), { maxMs: 60, stepMs: 10 });
+  assert.equal(stuck.settled, false);
+});
+
+test('item 2/8: the client says iOS writes are not blocked, prints untrusted data under a marker, and defaults to the scratch folder', () => {
+  const src = fs.readFileSync(new URL('../bin/private-qa.mjs', import.meta.url), 'utf8');
+  assert.match(src, /iOS: writes are not blocked/);
+  assert.match(src, /\[untrusted\]/);
+  assert.match(src, /D:\/Kit\/tmp_research\/mobile-qa-private/);
+  assert.ok(!/os\.tmpdir\(\), 'mobile-qa'/.test(src), 'never %TEMP% for results');
+  assert.match(src, /fs\.rmSync\(tgz, \{ force: true \}\)/);
 });

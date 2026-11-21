@@ -3,7 +3,8 @@
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadPrivateJob, installPrivateLogging, toWebDriverCookies } from './private.mjs';
+import { loadPrivateJob, installPrivateLogging, toWebDriverCookies, cookieTargetOk } from './private.mjs';
+import { settleProbe, waitSettled } from './lib.mjs';
 import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
 const STARTED = Date.now();
@@ -12,7 +13,7 @@ const OUT = path.resolve('out/ios');
 fs.mkdirSync(OUT, { recursive: true });
 // Private run (qa-agent site): sealed job with the session cookies; the log keeps page numbers only.
 const PRIV = loadPrivateJob();
-if (PRIV) installPrivateLogging(PRIV);
+if (PRIV) installPrivateLogging(PRIV, process.env, 'ios');
 const urls = PRIV ? PRIV.urls : readUrls();
 const MAX_SEG = maxSegments();
 const run = (cmd, args, opts) =>
@@ -255,13 +256,17 @@ results.mode = hasWd ? 'webdriver' : 'openurl';
 // every page is a fresh load. HttpOnly/Secure/__Host- cookies are added with no domain (host-only).
 let cookieError = null;
 if (PRIV) {
-  if (!hasWd) cookieError = 'no WebDriver session: cookies cannot be set';
+  if (!hasWd) cookieError = 'no WebDriver session: cookies cannot be set, nothing loaded';
   else {
     try {
       await wd('POST', '/session/' + sid + '/url', { url: PRIV.base + '/robots.txt' });
       await sleep(1500);
-      for (const c of toWebDriverCookies(PRIV)) await wd('POST', '/session/' + sid + '/cookie', { cookie: c });
-      console.log('[private] cookies set: ' + PRIV.cookies.length);
+      // Cookies only go to the job's origin: a redirect elsewhere gets none and nothing signed-in is loaded.
+      if (!cookieTargetOk(await wd('GET', '/session/' + sid + '/url'), PRIV.base)) cookieError = 'origin redirected, cookies not set';
+      else {
+        for (const c of toWebDriverCookies(PRIV)) await wd('POST', '/session/' + sid + '/cookie', { cookie: c });
+        console.log('[private] cookies set: ' + PRIV.cookies.length);
+      }
     } catch (e) {
       cookieError = 'cookie setup failed: ' + String(e.message).split('\n')[0].slice(0, 200);
     }
@@ -279,10 +284,17 @@ for (const [i, url] of urls.entries()) {
   }
   console.log('[' + (i + 1) + '/' + urls.length + '] ' + (PRIV ? '' : url));
   try {
-    if (PRIV && cookieError) cur.error = cookieError;
+    if (PRIV && cookieError) {
+      cur.error = cookieError; // load nothing signed-in
+      saveResults(OUT, results);
+      continue;
+    }
     if (hasWd) {
       await wd('POST', '/session/' + sid + '/url', { url });
       await sleep(2000);
+      if (PRIV) {
+        cur.settle = await waitSettled(() => exec('return (' + settleProbe.toString() + ')();'), sleep);
+      }
       await exec('window.scrollTo(0, 0);');
       cur.probe = await exec('return (' + probe.toString() + ')();');
       for (let t = 0; t < 2 && cur.probe.challenge; t++) {

@@ -131,15 +131,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci --no-audit --no-fund
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       # The AVD snapshot is saved right after it is created (clean), never after browsing real sites.
+      # Private runs neither restore nor save the shared AVD cache (it must not carry state between a private run and others).
       - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: avd-cache
+        if: inputs.private_job == ''
         with:
           path: |
             ~/.android/avd/*
@@ -157,7 +159,7 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
           script: echo "AVD snapshot created"
-      - if: steps.avd-cache.outputs.cache-hit != 'true'
+      - if: inputs.private_job == '' && steps.avd-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |

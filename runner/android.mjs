@@ -3,7 +3,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { _android as android } from 'playwright-core';
-import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies } from './private.mjs';
+import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies, isBlockedWrite } from './private.mjs';
+import { settleProbe, waitSettled } from './lib.mjs';
 import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
 const STARTED = Date.now();
@@ -12,7 +13,7 @@ const OUT = path.resolve('out/android');
 fs.mkdirSync(OUT, { recursive: true });
 // Private run (qa-agent site): sealed job with the session cookies; the log keeps page numbers only; read-only.
 const PRIV = loadPrivateJob();
-if (PRIV) installPrivateLogging(PRIV);
+if (PRIV) installPrivateLogging(PRIV, process.env, 'android');
 const urls = PRIV ? PRIV.urls : readUrls();
 const blocked = [];
 const MAX_SEG = maxSegments();
@@ -45,27 +46,57 @@ async function ensureChromeOnTop(cur) {
   }
 }
 
-let context = await device.launchBrowser();
-if (PRIV) {
-  await context.addCookies(toPlaywrightCookies(PRIV));
-  console.log('[private] cookies set: ' + PRIV.cookies.length);
+// Private run guards (all fail closed): service workers blocked; ONE context-level route, registered and awaited before any page
+// loads, aborts same-origin writes from every page and tab (also pages the site opens itself); same-origin WebSockets are closed.
+// If a guard cannot be installed no page is loaded and the error is recorded.
+let guardError = null;
+async function launch() {
+  const ctx = await device.launchBrowser(PRIV ? { serviceWorkers: 'block' } : undefined);
+  if (!PRIV) return ctx;
+  try {
+    await ctx.addCookies(toPlaywrightCookies(PRIV));
+    await ctx.route('**/*', (route) => {
+      const req = route.request();
+      if (isBlockedWrite(req.method(), req.url(), PRIV.base)) {
+        blocked.push(req.method() + ' ' + new URL(req.url()).pathname);
+        return route.abort('blockedbyclient');
+      }
+      return route.continue();
+    });
+    guardError = null;
+    console.log('[private] cookies set: ' + PRIV.cookies.length);
+    console.log('[private] read-only guard active');
+  } catch (e) {
+    guardError = 'read-only guard could not be installed: ' + String(e.message).split('\n')[0].slice(0, 160);
+    results.notes.push(guardError);
+    return ctx;
+  }
+  try {
+    await ctx.routeWebSocket((u) => u.host === PRIV.host, (ws) => {
+      blocked.push('WEBSOCKET');
+      ws.close().catch(() => {});
+    });
+  } catch (e) {
+    results.notes.push('websocket blocking is not available on this context: ' + String(e.message).split('\n')[0].slice(0, 120));
+  }
+  return ctx;
 }
+let context = await launch();
 // Chrome sometimes closes its page or refuses new targets ("Target.createTarget: Not supported") mid-run: a fresh tab, and if
-// that fails too, a restarted Chrome (new context, cookies set again).
+// that fails too, a restarted Chrome (new context, guards installed again).
 async function newTab() {
   try {
     return await withTimeout(context.newPage(), 30000, 'new tab');
   } catch {
     await withTimeout(context.close(), 20000, 'close').catch(() => {});
-    context = await device.launchBrowser();
-    if (PRIV) await context.addCookies(toPlaywrightCookies(PRIV));
+    context = await launch();
     return context.pages()[0] || (await context.newPage());
   }
 }
 let page = context.pages()[0] || (await context.newPage());
 // A freshly booted emulator can lack DNS for a while; a page under test must not fail for that.
 let netUp = false;
-for (let t = 0; t < 12; t++) {
+for (let t = 0; t < 12 && !guardError; t++) {
   try {
     await page.goto('https://example.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
     netUp = true;
@@ -75,7 +106,7 @@ for (let t = 0; t < 12; t++) {
     await page.waitForTimeout(5000);
   }
 }
-if (!netUp) {
+if (!netUp && !guardError) {
   results.notes.push('the emulator network never came up before the first page (12 tries over ~2 min)');
   console.log('[private] emulator network not up');
 }
@@ -98,18 +129,8 @@ const infraNoise = (t) => /^\[Report Only\]/.test(t) || /Refused to connect to '
 // Each page gets its own tab: a page left scrolled with work in flight blocked the next navigation in the same tab
 // (Moioi baseline, 2026-11-18). Dialogs (beforeunload, alert) are accepted so they never hold a navigation.
 function attach(p) {
-  if (PRIV) {
-    // Read-only: same-origin writes from the page are aborted and counted (as kit-qa shot does).
-    p.route('**/*', (route) => {
-      const req = route.request();
-      if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method()) && req.url().startsWith(PRIV.base + '/')) {
-        blocked.push(req.method() + ' ' + new URL(req.url()).pathname);
-        return route.abort('blockedbyclient');
-      }
-      return route.continue();
-    }).catch(() => {});
-  }
-  p.on('dialog', (d) => d.accept().catch(() => {}));
+  // Private runs: only beforeunload is accepted (it blocks navigation); confirm/prompt/alert are dismissed.
+  p.on('dialog', (d) => (PRIV && d.type() !== 'beforeunload' ? d.dismiss() : d.accept()).catch(() => {}));
   p.on('console', (m) => {
     if (!cur || m.type() !== 'error' || noise((m.location() || {}).url)) return;
     if (infraNoise(m.text())) cur.infraNoise = (cur.infraNoise || 0) + 1;
@@ -136,12 +157,17 @@ attach(page);
 
 const stamp = (t0, s) => console.log('      ' + Math.round((Date.now() - t0) / 1000) + 's ' + s);
 async function checkPage(cur, url, name) {
+  if (guardError) throw new Error(guardError); // fail closed: nothing is loaded without the read-only guard
   const t0 = Date.now();
   const resp = await gotoOnce(url);
   stamp(t0, 'loaded');
   cur.status = resp ? resp.status() : null;
   await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
   await page.waitForTimeout(1200);
+  if (PRIV) {
+    cur.settle = await waitSettled(() => page.evaluate(settleProbe), (ms) => page.waitForTimeout(ms));
+    if (!cur.settle.settled) cur.notes = ['page did not settle within ' + Math.round(cur.settle.ms / 1000) + ' s (still loading text or changing)'];
+  }
   await page.evaluate(() => window.scrollTo(0, 0));
   cur.probe = await page.evaluate(probe);
   stamp(t0, 'probed');

@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildJob, sealJob, unseal, resultAad } from '../runner/private.mjs';
+import { buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict } from '../runner/private.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -17,11 +17,13 @@ const REF = process.env.MOBILE_QA_REF || 'main'; // the branch whose workflow ru
 const WORKFLOW = 'mobile-qa.yml';
 const SECRET = 'PRIVATE_QA_KEY';
 const DEADLINE_MS = 75 * 60000;
+export const DEFAULT_OUT = process.env.MOBILE_QA_PRIVATE_OUT || 'D:/Kit/tmp_research/mobile-qa-private';
+const LOCK_FILE = path.join(os.tmpdir(), 'mobile-qa-private.lock');
 const log = (s) => console.log('[mobile-qa:private] ' + s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ageMin = (t) => (Date.now() - Date.parse(t)) / 60000;
 
-// Pure part (tested): what the leak scan looks for in text.
+// What the leak scan looks for in text.
 export function leakScan(text, needles) {
   const hits = {};
   for (const [name, value] of Object.entries(needles)) {
@@ -29,6 +31,82 @@ export function leakScan(text, needles) {
     hits[name] = list.filter((v) => text.includes(v) || text.includes(encodeURIComponent(v))).length;
   }
   return hits;
+}
+
+// ---- local lock: two private calls on this machine cannot overlap (they share one secret). A lock of a dead PID is taken over.
+const pidAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+};
+export function acquireLock(file, { pid = process.pid, alive = pidAlive, now = Date.now } = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(file, 'wx');
+      fs.writeSync(fd, JSON.stringify({ pid, start: new Date(now()).toISOString() }));
+      fs.closeSync(fd);
+      return () => {
+        try {
+          if (JSON.parse(fs.readFileSync(file, 'utf8')).pid === pid) fs.rmSync(file, { force: true });
+        } catch { /* gone */ }
+      };
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let holder = null;
+      try { holder = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* unreadable lock: stale */ }
+      if (holder && holder.pid && alive(holder.pid)) throw new Error('another private call is running on this machine (pid ' + holder.pid + ', started ' + holder.start + ')');
+      fs.rmSync(file, { force: true }); // stale: its process is gone
+    }
+  }
+  throw new Error('could not take the private-call lock');
+}
+
+// ---- all pq- runs of the workflow, over enough pages (not just the newest 50)
+export async function listPrivateRuns(fetchPage, maxPages = 10) {
+  const out = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const runs = await fetchPage(page);
+    if (!runs.length) break;
+    out.push(...runs.filter((r) => /^pq-/.test(r.displayTitle || '')));
+    if (runs.length < 100) break;
+  }
+  return out;
+}
+
+// ---- cleanup: stops any further dispatch, replaces the secret FIRST, then cancels and deletes this call's runs, including a
+// run GitHub accepted but the client lost track of (found by the call's base id in the run title).
+export function makeCleaner(d) {
+  let stopping = false;
+  let cleaning = null;
+  return {
+    assertRunning() {
+      if (stopping) throw new Error('cleaning up: no new run is dispatched');
+    },
+    isStopping: () => stopping,
+    cleanup() {
+      stopping = true;
+      cleaning ??= (async () => {
+        if (d.secretSet()) await d.replaceSecret();
+        const seen = new Set();
+        const handle = async (id, status) => {
+          if (seen.has(id)) return;
+          seen.add(id);
+          if (status !== 'completed') await d.cancel(id);
+          await d.del(id);
+        };
+        for (const a of d.tracked()) if (!a.deleted) await handle(a.id, a.status);
+        try {
+          for (const r of await d.listRuns()) if ((r.displayTitle || '').startsWith(d.baseId)) await handle(r.databaseId, r.status);
+        } catch (e) {
+          d.log('could not look for lost runs: ' + String(e.message).slice(0, 100));
+        }
+      })();
+      return cleaning;
+    },
+  };
 }
 
 export async function runPrivate(opts, deps) {
@@ -58,13 +136,65 @@ export async function runPrivate(opts, deps) {
       return '?';
     }
   };
-  const listRuns = () => JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '50', '--json', 'databaseId,displayTitle,status,createdAt,updatedAt']));
-  const mine = (r) => /^pq-/.test(r.displayTitle || '');
+  const norm = (x) => ({ databaseId: x.id, displayTitle: x.display_title, status: x.status, createdAt: x.created_at, updatedAt: x.updated_at, runStartedAt: x.run_started_at });
+  const listRuns = () => listPrivateRuns((page) => JSON.parse(gh(['api', 'repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/runs?event=workflow_dispatch&per_page=100&page=' + page])).workflow_runs.map(norm));
 
-  // ---- one private run at a time (they share the secret); leftovers of a killed caller are removed first
-  const sweepAndLock = () => {
+  let release = null;
+  try {
+    release = acquireLock(LOCK_FILE);
+  } catch (e) {
+    throw new InputError(e.message);
+  }
+
+  const keyHex = randomBytes(32).toString('hex');
+  const baseId = 'pq-' + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '') + '-' + randomBytes(2).toString('hex');
+  const outDir = path.join(path.resolve(opts.out || DEFAULT_OUT), baseId);
+  fs.mkdirSync(outDir, { recursive: true });
+  const needles = { host: [host], cookie: job.cookies.map((c) => c.value), key: [keyHex] };
+  const attempts = [];
+  let secretSet = false;
+  let leak = false;
+
+  async function replaceSecret() {
+    const before = secretTime();
+    try {
+      setKey(randomBytes(32).toString('hex'));
+      log('secret replaced with random bytes (updated ' + before + ' -> ' + secretTime() + ')');
+    } catch (e) {
+      log('WARNING: could not replace the secret: ' + String(e.stderr || e.message).slice(0, 150));
+    }
+  }
+  const cleaner = makeCleaner({
+    log,
+    baseId,
+    secretSet: () => secretSet,
+    replaceSecret,
+    tracked: () => attempts,
+    listRuns,
+    cancel: async (id) => {
+      try { gh(['run', 'cancel', String(id), '-R', REPO]); } catch { /* ending */ }
+      for (let t = 0; t < 24; t++) {
+        await sleep(5000);
+        try { if (JSON.parse(gh(['run', 'view', String(id), '-R', REPO, '--json', 'status'])).status === 'completed') break; } catch { break; }
+      }
+    },
+    del: async (id) => {
+      try {
+        gh(['run', 'delete', String(id), '-R', REPO]);
+        const a = attempts.find((x) => x.id === id);
+        if (a) a.deleted = true;
+      } catch {
+        log('could not delete a run; the next private call sweeps it: https://github.com/' + REPO + '/actions/runs/' + id);
+      }
+    },
+  });
+  const cleanup = () => cleaner.cleanup();
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, () => { log('interrupted, cleaning up'); cleanup().finally(() => { release(); process.exit(2); }); });
+
+  // ---- leftovers of a killed caller (any age beyond the thresholds), over all pages
+  const sweepLeftovers = async () => {
     let stale = false;
-    const all = listRuns().filter(mine);
+    const all = await listRuns();
     for (const r of all) {
       if (r.status !== 'completed' && ageMin(r.createdAt) > 180) {
         try { gh(['run', 'cancel', String(r.databaseId), '-R', REPO]); log('cancelled abandoned run'); stale = true; } catch { /* ending */ }
@@ -77,59 +207,16 @@ export async function runPrivate(opts, deps) {
     if (stale) { try { setKey(randomBytes(32).toString('hex')); log('secret replaced after leftovers'); } catch { /* set below */ } }
   };
 
-  const keyHex = randomBytes(32).toString('hex');
-  const baseId = 'pq-' + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '') + '-' + randomBytes(2).toString('hex');
-  const outDir = path.join(path.resolve(opts.out || path.join(os.tmpdir(), 'mobile-qa')), baseId);
-  fs.mkdirSync(outDir, { recursive: true });
-  const needles = { host: [host], cookie: job.cookies.map((c) => c.value), key: [keyHex] };
-  const attempts = [];
-  let secretSet = false;
-  let cleaning = null;
-
-  async function removeRun(a) {
-    if (a.deleted) return;
-    try {
-      gh(['run', 'delete', String(a.id), '-R', REPO]);
-      a.deleted = true;
-    } catch {
-      log('could not delete ' + a.rid + '; the next private call sweeps it: https://github.com/' + REPO + '/actions/runs/' + a.id);
-    }
-  }
-  function cleanup() {
-    cleaning ??= (async () => {
-      for (const a of attempts) {
-        if (a.deleted) continue;
-        if (a.status !== 'completed') {
-          try { gh(['run', 'cancel', String(a.id), '-R', REPO]); } catch { /* ending */ }
-          for (let t = 0; t < 24; t++) {
-            await sleep(5000);
-            try { if (JSON.parse(gh(['run', 'view', String(a.id), '-R', REPO, '--json', 'status'])).status === 'completed') break; } catch { break; }
-          }
-        }
-        await removeRun(a);
-      }
-      if (secretSet) {
-        const before = secretTime();
-        try {
-          setKey(randomBytes(32).toString('hex'));
-          log('secret replaced with random bytes (updated ' + before + ' -> ' + secretTime() + ')');
-        } catch (e) {
-          log('WARNING: could not replace the secret: ' + String(e.stderr || e.message).slice(0, 150));
-        }
-      }
-    })();
-    return cleaning;
-  }
-  for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, () => { log('interrupted, cleaning up'); cleanup().finally(() => process.exit(2)); });
-
   async function dispatch(platforms, pool, suffix, dir) {
+    cleaner.assertRunning();
     const rid = baseId + suffix;
     const inputs = { urls: 'private', platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: iosPools[pool], ios_mode: opts.iosMode, private_job: sealJob(job, keyHex, rid) };
     gh(['workflow', 'run', WORKFLOW, '-R', REPO, '--ref', REF, '--json'], { input: JSON.stringify(inputs) });
     let id = null;
     for (let t = 0; !id && t < 24; t++) {
+      cleaner.assertRunning();
       await sleep(5000);
-      id = listRuns().find((r) => r.displayTitle === rid)?.databaseId ?? null;
+      id = (await listRuns()).find((r) => r.displayTitle === rid)?.databaseId ?? null;
     }
     if (!id) throw new Error('could not find the run of ' + rid);
     const a = { rid, id, platforms, pool, dir, status: 'queued', conclusion: null, deleted: false, reruns: 0, finished: false, replaced: false, ok: false };
@@ -171,39 +258,49 @@ export async function runPrivate(opts, deps) {
     for (const p of a.platforms.split(',')) {
       const f = path.join(raw, p, p + '.enc');
       if (!fs.existsSync(f)) continue;
+      const tgz = path.join(a.dir, p + '.tgz');
       try {
-        const tgz = path.join(a.dir, p + '.tgz');
         fs.writeFileSync(tgz, unseal(fs.readFileSync(f), keyHex, resultAad(a.rid, p)));
         fs.mkdirSync(path.join(a.dir, p), { recursive: true });
         execFileSync('tar', ['-xzf', p + '.tgz', '-C', p], { cwd: a.dir, stdio: ['ignore', 'pipe', 'pipe'] });
-        fs.rmSync(tgz);
         got += fs.existsSync(path.join(a.dir, p, 'results.json')) ? 1 : 0;
       } catch (e) {
         log(a.rid + ': could not unseal ' + p + ': ' + String(e.message).slice(0, 100));
+      } finally {
+        fs.rmSync(tgz, { force: true });
       }
     }
     fs.rmSync(raw, { recursive: true, force: true });
+    let logHost = 0;
+    let logScanned = false;
     try {
       const text = gh(['run', 'view', String(a.id), '-R', REPO, '--log']);
-      const h = leakScan(text, needles);
-      log(a.rid + ': run log checked (' + text.split('\n').length + ' lines): hostname ' + h.host + ', cookie values ' + h.cookie + ', key ' + h.key + ' occurrence(s)');
-      fs.writeFileSync(path.join(a.dir, 'run-log-check.txt'), 'lines ' + text.split('\n').length + '\nhostname ' + h.host + '\ncookie ' + h.cookie + '\nkey ' + h.key + '\n');
+      logHost = leakScan(text, { host: needles.host }).host;
+      logScanned = true;
+      log(a.rid + ': run log checked (' + text.split('\n').length + ' lines): hostname ' + logHost + ' occurrence(s)');
     } catch (e) {
-      log(a.rid + ': run log could not be read, leak scan NOT done: ' + String(e.stderr || e.message).split('\n')[0].slice(0, 120));
+      log(a.rid + ': run log could not be read: ' + String(e.stderr || e.message).split('\n')[0].slice(0, 120));
+    }
+    const v = leakVerdict({ logHost, rawLeak, logScanned });
+    for (const l of v.lines) log(a.rid + ': ' + l);
+    if (v.fail) {
+      leak = true;
+      log('WARNING: LEAK DETECTED, treat this run as exposed: rotate the QA session and the secret, and look at the run above');
     }
     return got === a.platforms.split(',').length;
   }
 
   let code = 2;
   try {
-    sweepAndLock();
+    await sweepLeftovers();
+    secretSet = true; // before the call: a failure half-way must still end with the secret replaced
     setKey(keyHex);
-    secretSet = true;
     await dispatch(opts.platforms, 0, '', outDir);
     const t0 = Date.now();
     await sleep(30000);
     let apiErrors = 0;
     while (attempts.some((a) => !a.finished)) {
+      cleaner.assertRunning();
       if (Date.now() - t0 > DEADLINE_MS) { log('timed out'); throw new Error('timed out'); }
       for (const a of attempts.filter((x) => !x.finished)) {
         let v;
@@ -221,11 +318,11 @@ export async function runPrivate(opts, deps) {
         a.conclusion = v.conclusion;
         if (a.status !== 'completed') continue;
         if (a.conclusion !== 'success' && a.reruns < 2) {
-          const jobs = (v.jobs || []).map((j) => ({ name: j.name, conclusion: j.conclusion, runner_name: j.runnerName || (j.startedAt && j.startedAt !== '0001-01-01T00:00:00Z' ? 'x' : ''), steps: j.steps || [] }));
+          const jobs = (v.jobs || []).map((j) => ({ name: j.name, conclusion: j.conclusion, runner_name: j.startedAt && j.startedAt !== '0001-01-01T00:00:00Z' ? 'x' : '', steps: j.steps || [] }));
           const act = starvedAction(jobs, a.pool, iosPools.length);
           if (act.action === 'move') {
             a.ok = collect(a);
-            await removeRun(a);
+            await cleanerDel(a);
             a.replaced = true;
             a.finished = true;
             log(a.rid + ': GitHub gave no runner to ' + act.redo + ' on ' + iosPools[a.pool] + ', moving it to ' + iosPools[a.pool + 1]);
@@ -244,48 +341,65 @@ export async function runPrivate(opts, deps) {
         }
         a.ok = collect(a);
         if (a.conclusion !== 'success') log(a.rid + ': run ' + a.conclusion);
-        await removeRun(a);
+        await cleanerDel(a);
         a.finished = true;
       }
       if (attempts.some((x) => !x.finished)) await sleep(20000 + Math.floor(Math.random() * 3000));
     }
 
-    // ---- summary: paths only, never the hostname
+    // ---- summary: paths only, never the hostname; text from the runner or the page is untrusted data
     let issues = 0;
-    let blockedTotal = 0;
-    const scrub = (s) => String(s).split(host).join('<site>');
-    const lines = ['# mobile-qa private ' + baseId, ''];
+    const T = (s, n) => untrusted(String(s).split(host).join('<site>'), n);
+    const lines = ['# mobile-qa private ' + baseId, '', 'Trusted (computed here): paths, counts, file paths. Everything after a "[untrusted]" tag is text from the runner or the page: control characters removed, truncated, not verified.', ''];
     const files = [];
     const find = (d) => { for (const e of fs.existsSync(d) ? fs.readdirSync(d, { withFileTypes: true }) : []) { const p = path.join(d, e.name); if (e.isDirectory()) find(p); else if (e.name === 'results.json') files.push(p); } };
     for (const a of attempts) find(a.dir);
     for (const f of [...new Set(files)]) {
       const res = JSON.parse(fs.readFileSync(f, 'utf8'));
       const dir = path.dirname(f);
-      lines.push('## ' + res.platform + ': ' + res.device + ', ' + res.browser + ' (' + res.mode + ')', '');
-      for (const n of res.notes || []) lines.push('note: ' + scrub(n));
+      const plat = res.platform === 'ios' ? 'ios' : 'android';
+      lines.push('## ' + plat + ' [untrusted] ' + T(res.device, 80) + ', ' + T(res.browser, 80) + ' (' + T(res.mode, 40) + ')', '');
+      if (plat === 'ios') lines.push('iOS: writes are not blocked (Safari has no request interception; the run only loads and scrolls).', '');
+      for (const n of res.notes || []) lines.push('note [untrusted]: ' + T(n, 300));
       for (const p of res.pages || []) {
         const { bad, notes } = verdict(p);
         issues += bad.length;
-        const u = new URL(p.url);
+        let where = '?';
+        try { const u = new URL(p.url); where = u.pathname + u.hash; } catch { /* keep ? */ }
         const bw = (p.blockedWrites || []).length;
-        blockedTotal += bw;
-        lines.push('- ' + u.pathname + u.hash + ' :: ' + (bad.length ? 'ISSUES: ' + scrub(bad.join(' | ')) : 'ok') + (notes.length ? ' (' + scrub(notes.join(', ')) + ')' : '') + (res.platform === 'android' ? ' [blocked writes: ' + bw + ']' : ''));
-        for (const s of p.shots || []) lines.push('  - ' + path.join(dir, s));
+        const st = p.settle && !p.settle.settled ? ' (page did not settle in ' + Math.round(p.settle.ms / 1000) + ' s)' : '';
+        lines.push('- ' + T(where, 80) + ' :: ' + (bad.length ? 'ISSUES: [untrusted] ' + T(bad.join(' | '), 300) : 'ok') + (notes.length ? ' [untrusted] (' + T(notes.join(', '), 300) + ')' : '') + st + (plat === 'android' ? ' [blocked writes/websockets: ' + bw + ']' : ''));
+        for (const s of p.shots || []) lines.push('  - ' + path.join(dir, String(s).replace(/[^A-Za-z0-9._-]/g, '_')));
       }
       lines.push('');
     }
     const failed = attempts.filter((a) => !a.replaced && (a.conclusion !== 'success' || !a.ok));
     if (failed.length) lines.push('Runs without full results: ' + failed.map((a) => a.rid + ' (' + a.conclusion + ')').join(', '));
-    lines.push('', 'Session: kit-qa\'s QA Agent session was not logged out (a logout would kill it for every other kit-qa user); it expires by itself within 2 h.');
+    lines.push('', 'Session: the QA Agent session was not logged out (a logout would kill it for every other kit-qa user); it expires by itself within 2 h.');
+    if (leak) lines.push('', 'LEAK DETECTED in this run (see the warnings above).');
     fs.writeFileSync(path.join(outDir, 'summary.md'), lines.join('\n'));
     console.log(lines.join('\n'));
     log('summary: ' + path.join(outDir, 'summary.md'));
-    code = !files.length || failed.length ? 2 : issues ? 1 : 0;
+    log('these screenshots show real admin data: delete ' + outDir + ' after you have looked at them');
+    code = leak || !files.length || failed.length ? 2 : issues ? 1 : 0;
   } catch (e) {
     log('error: ' + e.message);
     code = 2;
   } finally {
-    await cleanup();
+    try {
+      await cleanup();
+    } finally {
+      release();
+    }
   }
   return code;
+
+  async function cleanerDel(a) {
+    try {
+      gh(['run', 'delete', String(a.id), '-R', REPO]);
+      a.deleted = true;
+    } catch {
+      log('could not delete ' + a.rid + '; cleanup retries');
+    }
+  }
 }

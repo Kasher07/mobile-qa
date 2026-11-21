@@ -51,6 +51,7 @@ export function checkPrivateTarget(baseRaw, rawPaths) {
   if (b.protocol !== 'https:') throw new PrivateInputError('private mode needs an https site (the runner cannot reach local or plain-http apps)');
   if (b.username || b.password) throw new PrivateInputError('credentials in the site URL');
   const host = b.hostname.toLowerCase();
+  if (host.endsWith('.')) throw new PrivateInputError('the site host has a trailing dot: use the plain host name');
   if (!hostOk(host)) throw new PrivateInputError('the site host is not public (the runner cannot reach it)');
   const origin = b.origin;
   if (!rawPaths.length) throw new PrivateInputError('no paths. Usage: kit-qa exec <site> -- node bin/mobile-qa.mjs --private /#sales /#inventory');
@@ -76,13 +77,16 @@ export function checkPrivateTarget(baseRaw, rawPaths) {
   return { origin, host, paths };
 }
 
+const SUFFIX_2LD = /^(co|com|org|net|gov|edu|ac)\.[a-z]{2}$/; // common two-label public suffixes (co.uk, com.vn, ...)
+
 // Playwright storageState cookies that belong to host (and only those), not expired.
 export function cookiesFor(state, host, now = Date.now()) {
   const out = [];
   for (const c of (state && state.cookies) || []) {
     const d = String(c.domain || '').toLowerCase().replace(/^\./, '');
     if (!c.name || typeof c.value !== 'string' || !d) continue;
-    if (!(host === d || host.endsWith('.' + d))) continue;
+    // the site host itself, or a parent domain that has a dot inside (never a bare suffix such as "com" or "co.uk")
+    if (!(host === d || (host.endsWith('.' + d) && d.includes('.') && !SUFFIX_2LD.test(d)))) continue;
     if (c.expires && c.expires > 0 && c.expires * 1000 < now) continue;
     out.push({ name: c.name, value: c.value, hostOnly: !String(c.domain).startsWith('.'), domain: d, path: c.path || '/', secure: !!c.secure, httpOnly: !!c.httpOnly,
       sameSite: ['Strict', 'Lax', 'None'].includes(c.sameSite) ? c.sameSite : 'Lax', expires: c.expires && c.expires > 0 ? Math.floor(c.expires) : -1 });
@@ -115,9 +119,52 @@ export function validateJob(job) {
 
 // ---- runner side
 // null when this is not a private run. Needs PRIVATE_JOB (sealed), PRIVATE_RID, PRIVATE_QA_KEY from the step env.
+// The key and the sealed job are taken out of the environment at once, so child processes (axe, xcrun, adb, ...) never see them.
+export function takeSecrets(env = process.env) {
+  const got = { job: env.PRIVATE_JOB, key: env.PRIVATE_QA_KEY };
+  delete env.PRIVATE_JOB;
+  delete env.PRIVATE_QA_KEY;
+  return got;
+}
 export function loadPrivateJob(env = process.env) {
-  if (!env.PRIVATE_JOB) return null;
-  return openJob(env.PRIVATE_JOB, env.PRIVATE_QA_KEY, env.PRIVATE_RID || '');
+  const { job: b64, key } = takeSecrets(env);
+  if (!b64) return null;
+  const job = openJob(b64, key, env.PRIVATE_RID || '');
+  Object.defineProperty(job, '_key', { value: key, enumerable: false }); // only for log masking
+  return job;
+}
+
+// iOS: cookies are added only while the open document is on the job's origin (a redirect elsewhere must not get them).
+export function cookieTargetOk(currentUrl, base) {
+  try {
+    return new URL(currentUrl).origin === new URL(base).origin;
+  } catch {
+    return false;
+  }
+}
+
+// Android guard: a request is blocked when it is a same-origin write.
+export function isBlockedWrite(method, url, base) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(String(method).toUpperCase())) return false;
+  try {
+    return new URL(url).origin === new URL(base).origin;
+  } catch {
+    return false;
+  }
+}
+
+// Text that came from the runner or the page: no control characters, bounded.
+export const untrusted = (s, max = 200) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').slice(0, max);
+
+// Leak verdict of the client's scans. Cookie values and the key are masked by GitHub in the log, so they cannot be checked there.
+export function leakVerdict({ logHost, rawLeak, logScanned }) {
+  const lines = [];
+  let fail = false;
+  if (logHost > 0) { fail = true; lines.push('LEAK: the hostname appears ' + logHost + ' time(s) in the public run log'); }
+  if (rawLeak > 0) { fail = true; lines.push('LEAK: ' + rawLeak + ' readable marker(s) in the raw artifact'); }
+  if (!logScanned) lines.push('run log not scanned (could not be read)');
+  lines.push('note: cookie values and the key cannot be checked in the log, GitHub masks them; they are protected by the encryption and the log allow-list');
+  return { fail, lines };
 }
 
 // Playwright cookie objects (url form so __Host- cookies stay host-only).
@@ -133,16 +180,17 @@ const ALLOWED = [
   /^\[\d+\/\d+\]\s*$/,
   /^\s+\d+s (loaded|probed|screen \d+)$/,
   /^\s+(ok|error) in \d+ s, \d+ screens$/,
-  /^device [A-Za-z0-9 ._/()|-]+$/,
+  /^device [A-Za-z0-9_ ]+ \/ (iOS|Android) [\d.]+( [0-9A-F-]{36}| \| Chrome [\d.]+)$/,
   /^webdriver session ok \(round \d, \d+ s\)$/,
-  /^(ios|android) \| [A-Za-z0-9 ._/()|=-]+$/,
-  /^\[private\] [A-Za-z0-9 ._:,()/=-]+$/,
+  /^(ios|android) \| [A-Za-z0-9_ ]+ \/ (iOS|Android) [\d.]+ \| (Safari \(iOS [\d.]+\)|Chrome [\d.]+) \| mode=(webdriver|openurl|playwright-android)$/,
+  // the only "[private]" messages: fixed texts, never free text
+  /^\[private\] (cookies set: \d+|emulator network not up|fatal error, details are sealed|sealed (ios|android): \d+ bytes|read-only guard active)$/,
 ];
 export const allowedLine = (s) => ALLOWED.some((r) => r.test(s));
 
-export function installPrivateLogging(job, env = process.env) {
+export function installPrivateLogging(job, env = process.env, platform = 'run') {
   // Runner-side masking of secrets (defence in depth; the allow-list below is the control).
-  const mask = [...job.cookies.map((c) => c.value), env.PRIVATE_QA_KEY].filter((v) => v && v.length >= 8 && !/[\r\n]/.test(v));
+  const mask = [...job.cookies.map((c) => c.value), job._key].filter((v) => v && v.length >= 8 && !/[\r\n]/.test(v));
   for (const v of mask) process.stdout.write('::add-mask::' + v + '\n');
   for (const k of ['log', 'info', 'warn', 'error', 'debug']) {
     console[k] = (...a) => {
@@ -152,8 +200,9 @@ export function installPrivateLogging(job, env = process.env) {
   }
   const fatal = (e) => {
     try {
-      fs.mkdirSync('out', { recursive: true });
-      fs.writeFileSync('out/fatal.txt', String((e && e.stack) || e));
+      const dir = path.join('out', platform); // the folder that is sealed and uploaded
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'fatal.txt'), String((e && e.stack) || e));
     } catch {}
     process.stdout.write('[private] fatal error, details are sealed\n');
     process.exit(1);

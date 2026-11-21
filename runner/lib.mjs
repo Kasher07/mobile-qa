@@ -125,3 +125,23 @@ export function writeResults(dir, results) {
     console.log('- ' + p.url + ' :: ' + (p.error ? 'ERROR ' + p.error : 'ok') + ' overflowX=' + !!pr.overflowX + ' shots=' + p.shots.length);
   }
 }
+
+// Private runs: wait until the page has settled (no loading text, visible text unchanged for 3 samples), bounded.
+export function settleProbe() {
+  const t = document.body ? document.body.innerText : '';
+  return { len: t.trim().length, loading: /đang tải|loading/i.test(t) };
+}
+export async function waitSettled(sample, wait, { maxMs = 25000, stepMs = 1000, stable = 3 } = {}) {
+  const t0 = Date.now();
+  let last = -1;
+  let same = 0;
+  while (Date.now() - t0 < maxMs) {
+    const s = await sample().catch(() => null);
+    if (s && !s.loading && s.len > 0 && s.len === last) same++;
+    else same = 0;
+    if (same >= stable - 1) return { settled: true, ms: Date.now() - t0 };
+    last = s ? s.len : -1;
+    await wait(stepMs);
+  }
+  return { settled: false, ms: Date.now() - t0 };
+}
