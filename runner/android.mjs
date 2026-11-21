@@ -45,10 +45,22 @@ async function ensureChromeOnTop(cur) {
   }
 }
 
-const context = await device.launchBrowser();
+let context = await device.launchBrowser();
 if (PRIV) {
   await context.addCookies(toPlaywrightCookies(PRIV));
   console.log('[private] cookies set: ' + PRIV.cookies.length);
+}
+// Chrome sometimes closes its page or refuses new targets ("Target.createTarget: Not supported") mid-run: a fresh tab, and if
+// that fails too, a restarted Chrome (new context, cookies set again).
+async function newTab() {
+  try {
+    return await withTimeout(context.newPage(), 30000, 'new tab');
+  } catch {
+    await withTimeout(context.close(), 20000, 'close').catch(() => {});
+    context = await device.launchBrowser();
+    if (PRIV) await context.addCookies(toPlaywrightCookies(PRIV));
+    return context.pages()[0] || (await context.newPage());
+  }
 }
 let page = context.pages()[0] || (await context.newPage());
 // A freshly booted emulator can lack DNS for a while; a page under test must not fail for that.
@@ -188,13 +200,14 @@ for (const [i, url] of urls.entries()) {
       cur.pageErrors = [];
       cur.failedRequests = [];
       const prev = page;
-      page = await withTimeout(context.newPage(), 30000, 'new tab');
+      page = await newTab();
       attach(page);
       prev.close({ runBeforeUnload: false }).catch(() => {});
       await withTimeout(checkPage(cur, url, name), PAGE_LIMIT_MS, 'page (retry)');
     }
   } catch (e) {
     cur.error = String((e && e.message) || e).split('\n')[0].slice(0, 300);
+    if (PRIV) results.notes.push('error detail ' + (i + 1) + ': ' + String((e && e.stack) || e).slice(0, 600) + ' | logcat: ' + (await sh("logcat -d -t 400 | grep -i -E 'FATAL|crash|lmkd|Killing|Out of memory|renderer' | tail -6").catch(() => '')).slice(0, 900));
     try {
       const f = name + '-error.png';
       fs.writeFileSync(path.join(OUT, f), await withTimeout(device.screenshot(), 20000, 'screenshot'));
