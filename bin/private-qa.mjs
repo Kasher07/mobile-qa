@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict } from '../runner/private.mjs';
+import { buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict, gitBashPaths } from '../runner/private.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -113,7 +113,7 @@ export async function runPrivate(opts, deps) {
   const { verdict, starvedAction, iosPools, InputError } = deps;
   let built;
   try {
-    built = buildJob(process.env, opts.urls);
+    built = buildJob(process.env, process.platform === 'win32' ? gitBashPaths(opts.urls) : opts.urls);
   } catch (e) {
     throw new InputError(e.message);
   }

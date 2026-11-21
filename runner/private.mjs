@@ -40,6 +40,24 @@ const hostOk = (h) =>
 
 export class PrivateInputError extends Error {}
 
+// Git Bash on Windows rewrites an argument that starts with "/" into a path under its install folder
+// ("/admin" arrives as "C:/Program Files/Git/admin", and a shell in between may split it at the space). Undo that,
+// so "--private /admin /admin/users" works from the shell every KIT session uses (2026-11-21: the first run by hand failed).
+export function gitBashPaths(args, root = process.env.EXEPATH || 'C:/Program Files/Git') {
+  const norm = (s) => String(s).replace(/\\/g, '/');
+  const r = norm(root).replace(/\/(?:bin|usr\/bin|mingw64\/bin)\/?$/i, '').replace(/\/+$/, '');
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    let a = norm(args[i]);
+    const sp = r.indexOf(' ');
+    if (sp > 0 && a.toLowerCase() === r.slice(0, sp).toLowerCase() && i + 1 < args.length && norm(args[i + 1]).toLowerCase().startsWith(r.slice(sp + 1).toLowerCase())) a = a + ' ' + norm(args[++i]);
+    if (a.toLowerCase() === r.toLowerCase()) out.push('/');
+    else if (a.toLowerCase().startsWith(r.toLowerCase() + '/')) out.push(a.slice(r.length));
+    else out.push(String(args[i]));
+  }
+  return out;
+}
+
 // baseRaw: KITQA_BASE. rawPaths: what the caller typed. Returns { origin, host, paths } (paths start with "/").
 export function checkPrivateTarget(baseRaw, rawPaths) {
   let b;
