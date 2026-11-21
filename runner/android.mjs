@@ -16,7 +16,7 @@ if (PRIV) installPrivateLogging(PRIV);
 const urls = PRIV ? PRIV.urls : readUrls();
 const blocked = [];
 const MAX_SEG = maxSegments();
-const results = { platform: 'android', device: null, browser: null, mode: 'playwright-android', pages: [] };
+const results = { platform: 'android', device: null, browser: null, mode: 'playwright-android', notes: [], pages: [] };
 
 const [device] = await android.devices();
 if (!device) throw new Error('no adb device');
@@ -52,14 +52,20 @@ if (PRIV) {
 }
 let page = context.pages()[0] || (await context.newPage());
 // A freshly booted emulator can lack DNS for a while; a page under test must not fail for that.
+let netUp = false;
 for (let t = 0; t < 12; t++) {
   try {
     await page.goto('https://example.com/', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    netUp = true;
     break;
   } catch (e) {
     console.log('network not ready (' + String(e.message).split('\n')[0].slice(0, 80) + '), waiting');
     await page.waitForTimeout(5000);
   }
+}
+if (!netUp) {
+  results.notes.push('the emulator network never came up before the first page (12 tries over ~2 min)');
+  console.log('[private] emulator network not up');
 }
 async function gotoOnce(url) {
   try {
