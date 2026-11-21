@@ -179,7 +179,7 @@ for (const [i, url] of urls.entries()) {
     } catch (e) {
       // The emulator stalls now and then in its first minutes (launcher ANRs): one more try in a fresh tab. A page that
       // really hangs fails again and is reported; a retry is always written in the notes.
-      if (!/did not finish|net::ERR_/.test(String(e.message)) || Date.now() - STARTED > JOB_BUDGET_MS - PAGE_LIMIT_MS) throw e;
+      if (!/did not finish|net::ERR_|has been closed/.test(String(e.message)) || Date.now() - STARTED > JOB_BUDGET_MS - PAGE_LIMIT_MS) throw e;
       console.log('    retrying after: ' + String(e.message).split('\n')[0].slice(0, 100));
       cur.retried = String(e.message).split('\n')[0].slice(0, 120);
       for (const f of cur.shots) fs.rmSync(path.join(OUT, f), { force: true });
