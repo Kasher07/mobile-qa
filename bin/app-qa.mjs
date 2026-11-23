@@ -130,7 +130,9 @@ async function sweepAndLock() {
       if (r.status === 'completed' && ageMin(r.updatedAt) > 30) { try { gh(['run', 'delete', String(r.databaseId), '-R', REPO]); log('deleted leftover run ' + r.displayTitle); } catch { /* gone */ } }
     }
     const active = runs.filter((r) => r.status !== 'completed' && ageMin(r.createdAt) <= 180).map((r) => r.displayTitle);
-    const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt'])).filter((x) => x.tagName.startsWith('app-qa-'));
+    // A release handed to a background iOS process (title ends in 'ios-background') needs no lock: iOS has its own key
+    // copy on Codemagic and the process deletes it; only GitHub runs share APP_QA_KEY.
+    const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,name'])).filter((x) => x.tagName.startsWith('app-qa-') && !(/ios-background$/.test(x.name || '') && ageMin(x.createdAt) <= 180));
     for (const r of rels.filter((x) => ageMin(x.createdAt) > 180)) { try { gh(['release', 'delete', r.tagName, '-R', REPO, '--cleanup-tag', '-y']); log('deleted leftover release ' + r.tagName); } catch { /* gone */ } }
     const held = [...active, ...rels.filter((x) => ageMin(x.createdAt) <= 180).map((x) => x.tagName)];
     if (!held.length) return;
@@ -259,6 +261,7 @@ try {
         appId, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: current }), { mode: 0o600 });
       spawn(process.execPath, [path.join(import.meta.dirname, 'app-qa-ios-bg.mjs'), stateFile], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
       handedOff = true;
+      try { gh(['release', 'edit', tag, '-R', REPO, '--title', tag + ' ios-background']); } catch { /* the lock then waits for it */ }
       log('iOS continues in the background; its result: ' + path.join(outDir, 'ios-background') + ' (printed by the next app-qa call)');
     }
   }
