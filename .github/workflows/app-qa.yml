@@ -296,9 +296,13 @@ jobs:
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
-          target: google_apis
+          # AOSP image (no Google apps): the Pixel Launcher of google_apis froze ("isn't responding") over the app on
+          # these CPU-rendered emulators (2026-11-23, 3 of 4 runs); the app needs no Google services.
+          target: default
           arch: x86_64
           profile: pixel_7
+          cores: 4
+          ram-size: 4096M
           force-avd-creation: false
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true

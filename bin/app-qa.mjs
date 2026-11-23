@@ -194,6 +194,9 @@ try {
       const t0 = Date.parse(v.jobs.map((j) => j.startedAt).filter(Boolean).sort()[0] || 0);
       const mins = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 6000) / 10;
       for (const j of v.jobs) if (j.startedAt && j.completedAt) log('time ' + j.name + ': starts +' + mins(new Date(t0).toISOString(), j.startedAt) + ' min, takes ' + mins(j.startedAt, j.completedAt) + ' min');
+      const steps = v.jobs.flatMap((j) => (j.steps || []).filter((x) => x.startedAt && x.completedAt && !x.startedAt.startsWith('0001'))
+        .map((x) => j.name + ' | ' + x.name + ' | ' + Math.round((Date.parse(x.completedAt) - Date.parse(x.startedAt)) / 1000) + ' s'));
+      fs.writeFileSync(path.join(outDir, 'timings.txt'), steps.join('\n') + '\n');
       for (const j of v.jobs.filter((x) => x.conclusion !== 'success')) {
         try {
           const ann = JSON.parse(gh(['api', 'repos/' + REPO + '/check-runs/' + j.databaseId + '/annotations']));
