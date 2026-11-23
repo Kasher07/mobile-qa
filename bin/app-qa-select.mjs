@@ -66,7 +66,7 @@ export function selectFlows(map, changed, flowNames, darkDefault = []) {
   const why = [];
   for (const f of changed) {
     const flow = /^\.maestro\/(.+)\.yaml$/.exec(f)?.[1];
-    if (flow && flowNames.includes(flow)) { light.add(flow); continue; }
+    if (flow && flowNames.includes(flow)) { light.add(flow); why.push(f); continue; }
     if (ignored(f)) continue;
     if (all(f)) return { ...every, dark: map.dark?.flows || darkDefault, why: f + ' affects every screen' };
     const hits = rules.filter((r) => r.hit(f));
