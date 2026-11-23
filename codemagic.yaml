@@ -1,4 +1,4 @@
-# iOS side of app-qa on a Codemagic Mac mini M2 (free personal plan: 500 min/month, one build at a time). Started only
+# iOS side of app-qa on a Codemagic Mac mini M2 (free personal plan: 500 min/month and one build at a time, per account; bin/app-qa-pool.mjs picks the account). Started only
 # through the Codemagic API by bin/app-qa.mjs, with ASSET_TAG, APP_ID, APP_QA_KEY, REUSE and SHARDS as build
 # variables. Same recipe and encryption as .github/workflows/app-qa.yml, but every iOS flow runs on one simulator in
 # one Maestro session: a GitHub shard paid ~9 min of Mac setup, boot and driver start per flow (2026-11-23).

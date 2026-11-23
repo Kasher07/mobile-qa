@@ -85,36 +85,78 @@ export function summarize({ outDir, platform, shards, log }) {
 
 // ---- Codemagic (free personal plan: 500 macOS M2 minutes a month, one build at a time)
 export const kitDir = () => path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), '.cache'), 'kit-app-qa');
-export function codemagicConfig() {
+/** Build states Codemagic never leaves; everything else (queued, preparing, fetching, building, ...) is still going. */
+export const CM_FINAL = ['finished', 'failed', 'canceled', 'timeout', 'skipped', 'warning'];
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+const readToken = (f) => { try { return fs.readFileSync(f, 'utf8').trim(); } catch { return ''; } };
+/**
+ * Every configured Codemagic account, in order: codemagic.json + codemagic.token (account 1), then codemagic-<n>.json +
+ * codemagic-<n>.token (n >= 2) in the kit folder. A free personal plan gives each account 500 build minutes a month and
+ * one build at a time, so more accounts = more capacity. CODEMAGIC_TOKEN in the environment is a single-account
+ * override: that token with the app id of account 1 (what a run of one account used before the pool existed).
+ * Entry: { index, label: '#n', token, appId, workflowId }. An incomplete pair (no token or no appId) is skipped.
+ */
+export function codemagicConfigs() {
   const dir = kitDir();
-  const token = process.env.CODEMAGIC_TOKEN || (fs.existsSync(path.join(dir, 'codemagic.token')) ? fs.readFileSync(path.join(dir, 'codemagic.token'), 'utf8').trim() : '');
-  const conf = fs.existsSync(path.join(dir, 'codemagic.json')) ? JSON.parse(fs.readFileSync(path.join(dir, 'codemagic.json'), 'utf8')) : null;
-  return token && conf?.appId ? { token, appId: conf.appId, workflowId: conf.workflowId || 'app-qa-ios' } : null;
+  const entry = (index, token, conf) => (token && conf?.appId ? { index, label: '#' + index, token, appId: conf.appId, workflowId: conf.workflowId || 'app-qa-ios' } : null);
+  if (process.env.CODEMAGIC_TOKEN) return [entry(1, process.env.CODEMAGIC_TOKEN, readJson(path.join(dir, 'codemagic.json')))].filter(Boolean);
+  const out = [entry(1, readToken(path.join(dir, 'codemagic.token')), readJson(path.join(dir, 'codemagic.json')))];
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { /* no kit folder yet */ }
+  for (const n of names.map((f) => /^codemagic-(\d+)\.json$/.exec(f)?.[1]).filter(Boolean).map(Number).filter((n) => n >= 2).sort((a, b) => a - b)) {
+    out.push(entry(n, readToken(path.join(dir, 'codemagic-' + n + '.token')), readJson(path.join(dir, 'codemagic-' + n + '.json'))));
+  }
+  return out.filter(Boolean);
 }
+/** The first configured account (older callers). */
+export const codemagicConfig = () => codemagicConfigs()[0] || null;
 export function codemagic(cm, log) {
   const api = async (method, url, body) => {
     const r = await fetch('https://api.codemagic.io' + url, { method, headers: { 'x-auth-token': cm.token, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-    if (!r.ok) throw new Error('Codemagic ' + method + ' ' + url + ': HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
+    if (!r.ok) {
+      const e = new Error('Codemagic ' + method + ' ' + url + ': HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
+      e.status = r.status;
+      throw e;
+    }
     return r.json();
   };
   return {
     api,
+    /**
+     * Builds of the app, newest first (GET /builds?appId=&limit=&skip=; each build has status, createdAt, startedAt,
+     * finishedAt). Pages on until a page is short or its oldest build was created before sinceMs.
+     */
+    async listBuilds({ sinceMs = 0, limit = 50, maxPages = 10 } = {}) {
+      const out = [];
+      for (let page = 0; page < maxPages; page++) {
+        const { builds = [] } = await api('GET', '/builds?appId=' + encodeURIComponent(cm.appId) + '&limit=' + limit + '&skip=' + page * limit);
+        out.push(...builds);
+        if (builds.length < limit || Date.parse(builds[builds.length - 1].createdAt) < sinceMs) break;
+      }
+      return out;
+    },
     start: async (variables) => (await api('POST', '/builds', { appId: cm.appId, workflowId: cm.workflowId, branch: 'main', environment: { variables } })).buildId,
     cancel: (id) => api('POST', '/builds/' + id + '/cancel'),
     /** Waits for the end; onFetched() runs once the build has its encrypted input (the release can go). */
-    async wait(id, { onFetched } = {}) {
+    async wait(id, { onFetched, notFoundRetryMs = 5000 } = {}) {
       let last = '';
       let fetched = false;
+      let seen = false;
       const t0 = Date.now();
       for (;;) {
         let build;
-        try { build = (await api('GET', '/builds/' + id)).build; } catch (e) { log(String(e.message).slice(0, 160)); await sleep(20000); continue; }
+        try { build = (await api('GET', '/builds/' + id)).build; seen = true; } catch (e) {
+          // Right after POST /builds the id is not readable for a few seconds: 404 NOT_FOUND (2026-11-23: the same id
+          // answered "queued" 21 s later, same token). Not an error until it stays 404 for 3 minutes.
+          if (e.status === 404 && !seen && Date.now() - t0 < 3 * 60000) { await sleep(notFoundRetryMs); continue; }
+          log(String(e.message).slice(0, 160)); await sleep(20000); continue;
+        }
         const actions = build.buildActions || [];
         if (!fetched && actions.some((a) => /Fetch and decrypt/.test(a.name) && a.status === 'success')) { fetched = true; await onFetched?.(); }
         const step = actions.find((a) => a.status === 'building')?.name;
         const line = 'ios (Codemagic): ' + build.status + (step ? ' (' + step + ')' : '');
         if (line !== last) { log(line); last = line; }
-        if (['finished', 'failed', 'canceled', 'timeout', 'skipped'].includes(build.status)) {
+        if (CM_FINAL.includes(build.status)) {
           if (!fetched) await onFetched?.();
           log('time ios (Codemagic): ' + Math.round((Date.now() - t0) / 6000) / 10 + ' min');
           for (const a of actions) if (a.startedAt && a.finishedAt) log('time ios | ' + a.name + ' | ' + Math.round((Date.parse(a.finishedAt) - Date.parse(a.startedAt)) / 1000) + ' s');

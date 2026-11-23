@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { codemagic, codemagicConfig, kitDir, makeLog, openArtifacts, summarize } from './app-qa-lib.mjs';
+import { codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, summarize } from './app-qa-lib.mjs';
 import { clearPendingIos, writeLastPass } from './app-qa-select.mjs';
 import { storeShell } from './app-qa-shell.mjs';
 
@@ -45,7 +45,12 @@ function deleteRelease() {
 let ok = false;
 let lines = [];
 try {
-  const cm = codemagic(codemagicConfig(), log);
+  // The account the build was started on (state files of older runs have none: they were account 1).
+  const confs = codemagicConfigs();
+  const conf = confs.find((c) => st.cmAppId && c.appId === st.cmAppId) || confs.find((c) => c.index === st.cmAccount) || confs[0];
+  if (!conf) throw new Error('no Codemagic account configured');
+  log('polling Codemagic account ' + conf.label);
+  const cm = codemagic(conf, log);
   const build = await cm.wait(st.buildId, { onFetched: deleteRelease });
   await cm.download(build, work, st.outDir);
   openArtifacts({ outDir: st.outDir, key, work, log, onApp: (platform, tgz) => {

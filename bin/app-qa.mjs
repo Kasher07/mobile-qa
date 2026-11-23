@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // app-qa: run an Expo app's Maestro flows on real release builds: Android on the GitHub emulator (one job per flow,
 // in parallel) in the public repo Kasher07/mobile-qa, iOS on a Codemagic Mac mini M2 (all flows in one simulator
-// session; GitHub Mac shards with --ios-on github or without a Codemagic token).
+// session) or on GitHub Mac shards. Which one: bin/app-qa-pool.mjs asks every Codemagic account (kit folder:
+// codemagic.json, codemagic-2.json, ...) whether it is idle and has minutes left; none does (or none is configured) =
+// GitHub shards, never a queue.
 //
 // Usage: node bin/app-qa.mjs --app <expo project dir> [--changed | --flows a,b [--dark a,b]] [--platforms ios,android]
-//        [--ios background|wait] [--ios-on codemagic|github] [--full] [--out DIR] [--app-id <id>] [--keep]
+//        [--ios background|wait] [--ios-on codemagic|codemagic:<n>|github] [--full] [--out DIR] [--app-id <id>] [--keep]
 //   --changed  only the flows the files changed since that platform's last passing run need (.maestro/flows-map.json);
 //              nothing changed that a flow covers = no run at all
 //   --flows    these flows (light), --dark these again in dark mode with the largest text
@@ -22,7 +24,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { codemagic, codemagicConfig, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
+import { codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
+import { chooseIosLane, parseIosOn, writeClaim } from './app-qa-pool.mjs';
 import { changedSince, readLastPass, readPendingIos, selectFlows, snapshot, writeLastPass, writePendingIos } from './app-qa-select.mjs';
 import { findShell, mediaHash, nativeFingerprint, shellKey, storeShell } from './app-qa-shell.mjs';
 
@@ -53,6 +56,7 @@ function parseArgs(argv) {
   if (!o.app) throw new Error('--app <expo project dir> is required');
   if (!/^(ios|android|ios,android|android,ios)$/.test(o.platforms)) throw new Error('--platforms must be ios, android or ios,android');
   for (const k of ['flows', 'dark']) if (o[k] != null && o[k] !== 'none' && !FLOWS_RE.test(o[k])) throw new Error('--' + k + ' takes flow names without .yaml, comma-separated');
+  parseIosOn(o.iosOn);
   if (!/^(background|wait)$/.test(o.ios)) throw new Error('--ios must be background or wait');
   if (o.changed && o.flows) throw new Error('--changed and --flows exclude each other');
   return o;
@@ -115,11 +119,25 @@ for (const p of opts.platforms.split(',')) {
 const platforms = Object.keys(plan).filter((p) => plan[p].length);
 if (!platforms.length) { log('no flow covers what changed: nothing to run (' + Math.round((Date.now() - started) / 100) / 10 + ' s)'); process.exit(previousIosFailed ? 1 : 0); }
 
-const cmConf = platforms.includes('ios') && opts.iosOn !== 'github' ? codemagicConfig() : null;
-if (opts.iosOn === 'codemagic' && !cmConf) throw new Error('--ios-on codemagic needs the Codemagic token and app id in ' + kitDir());
-const ghPlatforms = platforms.filter((p) => !(p === 'ios' && cmConf));
-const ghShards = [...new Map(ghPlatforms.flatMap((p) => plan[p]).map((s) => [s.pass + s.flow, s])).values()];
-const iosBackground = !!cmConf && opts.ios === 'background';
+// The iOS lane (a Codemagic account or GitHub shards) is picked later, right before the build starts (after the wait for
+// the lock, which can take minutes): until then iOS counts as a GitHub platform.
+const cmConfigs = codemagicConfigs();
+const force = parseIosOn(opts.iosOn);
+if (force?.lane === 'codemagic' && !platforms.includes('ios')) log('--ios-on has no effect: no iOS flow to run');
+if (force?.lane === 'codemagic' && platforms.includes('ios') && !cmConfigs.some((c) => !force.account || c.index === force.account)) {
+  throw new Error('--ios-on ' + opts.iosOn + ' needs that Codemagic account (token and app id) in ' + kitDir());
+}
+let cmConf = null;
+let ghPlatforms = platforms;
+let ghShards = [];
+let iosBackground = false;
+const useLane = (conf) => {
+  cmConf = conf;
+  ghPlatforms = platforms.filter((p) => !(p === 'ios' && cmConf));
+  ghShards = [...new Map(ghPlatforms.flatMap((p) => plan[p]).map((s) => [s.pass + s.flow, s])).values()];
+  iosBackground = !!cmConf && opts.ios === 'background';
+};
+useLane(null);
 // A snapshot says "everything that changed passed": only a --changed or full run, with the default dark pass, earns it.
 const savesSnapshot = !opts.flows && !opts.dark;
 
@@ -188,7 +206,7 @@ let dispatched = false;
 let cmBuildId = null;
 let handedOff = false;
 let ghDoneFile = null;
-const cm = cmConf ? codemagic(cmConf, log) : null;
+let cm = null;
 const findRun = () => JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '20', '--json', 'databaseId,displayTitle'])).find((x) => x.displayTitle === rid)?.databaseId ?? null;
 let cleaning = null;
 function cleanup() {
@@ -261,6 +279,12 @@ async function waitGithub() {
 let code = 0;
 try {
   await sweepAndLock();
+  if (platforms.includes('ios')) {
+    const lane = await chooseIosLane({ configs: cmConfigs, force, log });
+    log('ios lane: ' + (lane.conf ? 'Codemagic ' + lane.conf.label : 'GitHub macOS') + ' - ' + lane.why);
+    useLane(lane.conf);
+    if (lane.conf) { writeClaim(lane.conf.index, rid); cm = codemagic(lane.conf, log); }
+  }
   setKey(key.toString('hex'));
   gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
   if (cm) {
@@ -273,7 +297,7 @@ try {
       ghDoneFile = path.join(kitDir(), 'gh-done-' + rid);
       if (!ghPlatforms.length) fs.writeFileSync(ghDoneFile, '');
       fs.writeFileSync(stateFile, JSON.stringify({ buildId: cmBuildId, keyHex: key.toString('hex'), tag, repo: REPO, account: ACCOUNT, outDir: path.join(kitDir(), 'ios-results', rid),
-        appId, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: savesSnapshot ? current : null, ghDoneFile }), { mode: 0o600 });
+        cmAccount: cmConf.index, cmAppId: cmConf.appId, appId, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: savesSnapshot ? current : null, ghDoneFile }), { mode: 0o600 });
       const child = spawn(process.execPath, [path.join(import.meta.dirname, 'app-qa-ios-bg.mjs'), stateFile], { detached: true, stdio: 'ignore', windowsHide: true });
       await new Promise((ok, fail) => { child.once('spawn', ok); child.once('error', fail); });
       child.unref();

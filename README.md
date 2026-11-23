@@ -56,3 +56,40 @@ Self-check: `npm test`; fixtures at https://kasher07.github.io/mobile-qa/; fault
 The client dispatches `.github/workflows/mobile-qa.yml`, waits, downloads the artifacts and deletes the run, so URLs
 and screenshots do not stay public. Only public URLs are accepted (no localhost, private IPs, credentials or
 secret-looking query parameters).
+
+## App QA (bin/app-qa.mjs): where the iOS half runs
+
+`app-qa` runs an Expo app's Maestro flows on real release builds. Android always runs on the GitHub emulator (one job
+per flow; free on this public repo). iOS has three runners, and the tool picks one before every iOS run so no minutes are
+wasted and nothing queues:
+
+- **Codemagic account #1, #2, ...**: Mac mini M2, all iOS flows in one simulator session. Free personal plan: 500 build
+  minutes a month and one build at a time per account. Accounts are the file pairs `codemagic.json` + `codemagic.token`
+  (account 1) and `codemagic-<n>.json` + `codemagic-<n>.token` (n >= 2) in the kit folder (`%LOCALAPPDATA%/kit-app-qa`);
+  the json holds `{ "appId", "workflowId" }` (`app-qa-ios` in `codemagic.yaml`), the token file the account's API token.
+  Everything a job needs is a build variable, so a new account needs only the app added from this repo and its two files.
+  `CODEMAGIC_TOKEN` in the environment is a single-account override (that token with account 1's app id).
+- **GitHub macOS shards** (`--ios-on github`): free on this public repo but ~9 min of Mac setup per flow, so slower.
+
+The picking rule (`bin/app-qa-pool.mjs`, run right before the build starts):
+
+1. Ask each account for its builds: `GET /builds?appId=<id>&limit=50&skip=<n>` (newest first; each build has `status`,
+   `createdAt`, `startedAt`, `finishedAt`; paged until the month starts). The REST docs page only describes `POST
+   /builds`; the fields above were read from a real response.
+2. Busy = a build whose status is not final (`finished`, `failed`, `canceled`, `timeout`, `skipped`, `warning`) and was
+   created less than 4 h ago, or the account was claimed by another app-qa call on this machine less than 3 min ago
+   (`pool-claims.json`; the list can lag behind a just-started build).
+3. Minutes used = whole minutes (rounded up per build) from `startedAt` to `finishedAt` (to now while running) of the
+   builds started this calendar month, UTC. It is an estimate of the plan's billing month; quota 500
+   (`APP_QA_CM_MONTHLY_MINUTES` to change it).
+4. Take the **idle account with the most minutes left**, if it has at least **45** left (a build may run 40 min); ties
+   go to the lower number. That spreads the month's minutes evenly over the accounts.
+5. Every account busy, nearly out of minutes or unreachable (or none configured): **GitHub macOS shards**, never a
+   queue. The log says why: `ios lane: GitHub macOS - GitHub macOS shards instead of queueing: #1 busy, #2 only 30 min left`.
+
+`--ios-on github` forces GitHub; `--ios-on codemagic` forces Codemagic (the best account, queueing if all are busy);
+`--ios-on codemagic:2` forces account 2. A background iOS run records its account in its state file, so the detached
+process polls with the right token. Not done: splitting one `--ios wait` run across two accounts (a second build means a
+second native build, doubling its minutes for a modest time gain, and it cannot be tested without spending minutes).
+
+Self-check: `npm test` (the picker and config loader are pure/fake-API tests in `test/app-qa-pool.test.mjs`).
