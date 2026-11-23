@@ -241,7 +241,7 @@ async function waitGithub() {
       return;
     }
     if (Date.now() > deadline) throw new Error('timed out');
-    await sleep(20000);
+    await sleep(10000);
   }
 }
 
@@ -269,7 +269,7 @@ try {
     dispatched = true;
     gh(['workflow', 'run', WORKFLOW, '-R', REPO, '-f', 'request_id=' + rid, '-f', 'asset_tag=' + tag, '-f', 'platforms=' + ghPlatforms.join(','), '-f', 'app_id=' + appId,
       '-f', 'ios_runner=' + opts.iosRunner, '-f', 'shards=' + JSON.stringify(ghShards), '-f', 'reuse=' + reuse.filter((p) => ghPlatforms.includes(p)).join(',')]);
-    for (let t = 0; !runId && t < 24; t++) { await sleep(5000); runId = findRun(); }
+    for (let t = 0; !runId && t < 24; t++) { await sleep(3000); runId = findRun(); }
     if (!runId) throw new Error('run not found');
     log('run ' + rid + ': https://github.com/' + REPO + '/actions/runs/' + runId);
     await waitGithub();

@@ -7,7 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-export const makeLog = (prefix, sink) => (s) => { const line = '[' + prefix + '] ' + s; console.log(line); if (sink) fs.appendFileSync(sink, line + '\n'); };
+const t0 = Date.now();
+export const makeLog = (prefix, sink) => (s) => { const line = '[' + prefix + ' +' + Math.round((Date.now() - t0) / 1000) + 's] ' + s; console.log(line); if (sink) fs.appendFileSync(sink, line + '\n'); };
 
 /** IV(12) | tag(16) | ciphertext, AES-256-GCM. */
 export function seal(key, buf) {
