@@ -150,7 +150,7 @@ test('codemagicConfigs: CODEMAGIC_TOKEN is a single-account override; nothing co
   assert.deepEqual([c[0].index, c[0].token, c[0].appId], [1, 'from-env', 'app1']);
 }));
 
-test('codemagic().listBuilds pages with limit/skip until a short page or an old build', async () => {
+test('codemagic().listBuilds pages with limit/skip until a short page or an old build; the whole account unless onlyThisApp', async () => {
   const urls = [];
   const saved = globalThis.fetch;
   const mk = (n, createdAt) => Array.from({ length: n }, (_, i) => ({ index: i, createdAt }));
@@ -159,7 +159,10 @@ test('codemagic().listBuilds pages with limit/skip until a short page or an old 
   try {
     const all = await codemagic({ token: 't', appId: 'a b' }, () => {}).listBuilds({ sinceMs: Date.parse('2026-11-01T00:00:00Z'), limit: 2 });
     assert.equal(all.length, 4); // page 2 ends before the month: stop there
-    assert.deepEqual(urls, ['https://api.codemagic.io/builds?appId=a%20b&limit=2&skip=0', 'https://api.codemagic.io/builds?appId=a%20b&limit=2&skip=2']);
+    assert.deepEqual(urls, ['https://api.codemagic.io/builds?limit=2&skip=0', 'https://api.codemagic.io/builds?limit=2&skip=2']);
+    urls.length = 0;
+    await codemagic({ token: 't', appId: 'a b' }, () => {}).listBuilds({ limit: 2, onlyThisApp: true, maxPages: 1 });
+    assert.deepEqual(urls, ['https://api.codemagic.io/builds?appId=a%20b&limit=2&skip=0']);
   } finally { globalThis.fetch = saved; }
 });
 

@@ -98,7 +98,8 @@ const readToken = (f) => { try { return fs.readFileSync(f, 'utf8').trim(); } cat
  */
 export function codemagicConfigs() {
   const dir = kitDir();
-  const entry = (index, token, conf) => (token && conf?.appId ? { index, label: '#' + index, token, appId: conf.appId, workflowId: conf.workflowId || 'app-qa-ios' } : null);
+  // monthlyMinutes in the json (optional) overrides the plan size of that account (500 on the free personal plan).
+  const entry = (index, token, conf) => (token && conf?.appId ? { index, label: '#' + index, token, appId: conf.appId, workflowId: conf.workflowId || 'app-qa-ios', ...(Number(conf.monthlyMinutes) > 0 ? { monthlyMinutes: Number(conf.monthlyMinutes) } : {}) } : null);
   if (process.env.CODEMAGIC_TOKEN) return [entry(1, process.env.CODEMAGIC_TOKEN, readJson(path.join(dir, 'codemagic.json')))].filter(Boolean);
   const out = [entry(1, readToken(path.join(dir, 'codemagic.token')), readJson(path.join(dir, 'codemagic.json')))];
   let names = [];
@@ -107,6 +108,16 @@ export function codemagicConfigs() {
     out.push(entry(n, readToken(path.join(dir, 'codemagic-' + n + '.token')), readJson(path.join(dir, 'codemagic-' + n + '.json'))));
   }
   return out.filter(Boolean);
+}
+/**
+ * The account a background build was started on, from its state file (cmAppId, else cmAccount; a state file of an older run
+ * has neither and means the first account). A recorded account that is no longer configured throws: another account's token
+ * would answer 404 for that build id.
+ */
+export function accountForBuild(confs, st) {
+  const conf = st.cmAppId ? confs.find((c) => c.appId === st.cmAppId) : st.cmAccount ? confs.find((c) => c.index === st.cmAccount) : confs[0];
+  if (!conf) throw new Error('the Codemagic account of this build (#' + (st.cmAccount ?? '?') + ', app ' + (st.cmAppId ?? '?') + ') is not configured on this machine: build ' + st.buildId + ' keeps running there, read its result in Codemagic');
+  return conf;
 }
 /** The first configured account (older callers). */
 export const codemagicConfig = () => codemagicConfigs()[0] || null;
@@ -123,13 +134,15 @@ export function codemagic(cm, log) {
   return {
     api,
     /**
-     * Builds of the app, newest first (GET /builds?appId=&limit=&skip=; each build has status, createdAt, startedAt,
-     * finishedAt). Pages on until a page is short or its oldest build was created before sinceMs.
+     * Builds of the account, newest first (GET /builds?limit=&skip=; each build has appId, status, createdAt, startedAt,
+     * finishedAt). Without appId the list covers every app of the account (read from a real response 2026-11-23): the plan's
+     * minutes and its one-build-at-a-time limit belong to the account, not to one app. onlyThisApp adds ?appId=. Pages on
+     * until a page is short or its oldest build was created before sinceMs.
      */
-    async listBuilds({ sinceMs = 0, limit = 50, maxPages = 10 } = {}) {
+    async listBuilds({ sinceMs = 0, limit = 50, maxPages = 10, onlyThisApp = false } = {}) {
       const out = [];
       for (let page = 0; page < maxPages; page++) {
-        const { builds = [] } = await api('GET', '/builds?appId=' + encodeURIComponent(cm.appId) + '&limit=' + limit + '&skip=' + page * limit);
+        const { builds = [] } = await api('GET', '/builds?' + (onlyThisApp ? 'appId=' + encodeURIComponent(cm.appId) + '&' : '') + 'limit=' + limit + '&skip=' + page * limit);
         out.push(...builds);
         if (builds.length < limit || Date.parse(builds[builds.length - 1].createdAt) < sinceMs) break;
       }
@@ -137,19 +150,32 @@ export function codemagic(cm, log) {
     },
     start: async (variables) => (await api('POST', '/builds', { appId: cm.appId, workflowId: cm.workflowId, branch: 'main', environment: { variables } })).buildId,
     cancel: (id) => api('POST', '/builds/' + id + '/cancel'),
-    /** Waits for the end; onFetched() runs once the build has its encrypted input (the release can go). */
-    async wait(id, { onFetched, notFoundRetryMs = 5000 } = {}) {
+    /**
+     * Waits for the end; onFetched() runs once the build has its encrypted input (the release can go). Always ends: the
+     * deadline (default 60 min) is checked on every pass, also after an error; a 401, a 403 or a 404 that outlasts the
+     * start-up window (3 min) or follows a successful read throws at once (waiting cannot fix it); other errors (network,
+     * 5xx) are retried until the deadline, logged once per distinct message and then every tenth time.
+     */
+    async wait(id, { onFetched, notFoundRetryMs = 5000, notFoundWindowMs = 3 * 60000, deadlineMs = 60 * 60000, errorRetryMs = 20000, pollMs = 15000 } = {}) {
       let last = '';
       let fetched = false;
       let seen = false;
+      let lastError = '';
+      let errorRuns = 0;
       const t0 = Date.now();
       for (;;) {
+        if (Date.now() - t0 > deadlineMs) throw new Error('Codemagic build timed out after ' + Math.round(deadlineMs / 60000) + ' min (last status: ' + (last || 'never read') + ')');
         let build;
-        try { build = (await api('GET', '/builds/' + id)).build; seen = true; } catch (e) {
+        try { build = (await api('GET', '/builds/' + id)).build; seen = true; lastError = ''; errorRuns = 0; } catch (e) {
           // Right after POST /builds the id is not readable for a few seconds: 404 NOT_FOUND (2026-11-23: the same id
-          // answered "queued" 21 s later, same token). Not an error until it stays 404 for 3 minutes.
-          if (e.status === 404 && !seen && Date.now() - t0 < 3 * 60000) { await sleep(notFoundRetryMs); continue; }
-          log(String(e.message).slice(0, 160)); await sleep(20000); continue;
+          // answered "queued" 21 s later, same token). Not an error until it stays 404 past the window.
+          if (e.status === 404 && !seen && Date.now() - t0 < notFoundWindowMs) { await sleep(notFoundRetryMs); continue; }
+          if (e.status === 401 || e.status === 403 || e.status === 404) throw e;
+          const msg = String(e.message).slice(0, 160);
+          if (msg !== lastError || ++errorRuns % 10 === 0) log(msg);
+          lastError = msg;
+          await sleep(errorRetryMs);
+          continue;
         }
         const actions = build.buildActions || [];
         if (!fetched && actions.some((a) => /Fetch and decrypt/.test(a.name) && a.status === 'success')) { fetched = true; await onFetched?.(); }
@@ -162,8 +188,7 @@ export function codemagic(cm, log) {
           for (const a of actions) if (a.startedAt && a.finishedAt) log('time ios | ' + a.name + ' | ' + Math.round((Date.parse(a.finishedAt) - Date.parse(a.startedAt)) / 1000) + ' s');
           return build;
         }
-        if (Date.now() - t0 > 60 * 60000) throw new Error('Codemagic build timed out');
-        await sleep(15000);
+        await sleep(pollMs);
       }
     },
     /** Downloads the artefacts (one file each, or one zip) into the artifact-folder layout openArtifacts reads. */

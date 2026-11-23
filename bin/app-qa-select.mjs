@@ -44,24 +44,46 @@ const passFile = (appId, platform) => path.join(cacheDir(appId), 'last-pass-' + 
 export function readLastPass(appId, platform) {
   try { return JSON.parse(fs.readFileSync(passFile(appId, platform), 'utf8')).files; } catch { return null; }
 }
-// A background iOS run in flight counts as covering its content for 90 minutes: a second call with the same files
-// (a commit's land check, a re-run) does not queue a duplicate Codemagic build. Removed when that run ends.
-const pendingFile = (appId) => path.join(cacheDir(appId), 'pending-ios.json');
-export function readPendingIos(appId) {
-  try {
-    const p = JSON.parse(fs.readFileSync(pendingFile(appId), 'utf8'));
-    return Date.now() - Date.parse(p.at) < 90 * 60000 ? p.files : null;
-  } catch { return null; }
+// Background iOS runs in flight. Each run keeps its own pending-ios-<run id>.json (the content it covers, and when); a
+// new call that compares with the newest one (for 90 minutes) does not queue a duplicate Codemagic build. A run removes
+// its own file when it ends. The older single pending-ios.json (no run id) is still read as one entry.
+const pendingFile = (appId, rid) => path.join(cacheDir(appId), rid ? 'pending-ios-' + rid + '.json' : 'pending-ios.json');
+export function readPendingIosAll(appId, now = Date.now()) {
+  let names = [];
+  try { names = fs.readdirSync(cacheDir(appId)).filter((n) => n === 'pending-ios.json' || /^pending-ios-[A-Za-z0-9-]+\.json$/.test(n)); } catch { return []; }
+  const out = [];
+  for (const n of names) {
+    try {
+      const p = JSON.parse(fs.readFileSync(path.join(cacheDir(appId), n), 'utf8'));
+      if (now - Date.parse(p.at) < 90 * 60000) out.push({ rid: p.rid || null, at: p.at, files: p.files });
+    } catch { /* half-written or gone */ }
+  }
+  return out.sort((x, y) => Date.parse(y.at) - Date.parse(x.at));
 }
-export function writePendingIos(appId, files) {
+/** The content covered by the newest run still in flight, or null. */
+export function readPendingIos(appId) { return readPendingIosAll(appId)[0]?.files ?? null; }
+export function writePendingIos(appId, files, rid = null) {
   fs.mkdirSync(cacheDir(appId), { recursive: true });
-  fs.writeFileSync(pendingFile(appId), JSON.stringify({ at: new Date().toISOString(), files }));
+  fs.writeFileSync(pendingFile(appId, rid), JSON.stringify({ at: new Date().toISOString(), rid, files }));
 }
-export function clearPendingIos(appId) { fs.rmSync(pendingFile(appId), { force: true }); }
+export function clearPendingIos(appId, rid = null) { fs.rmSync(pendingFile(appId, rid), { force: true }); }
+
+/** Hash of a file map (or of "nothing"): what a run compared against, to tell later whether that is still the last pass. */
+export const fileMapHash = (files) => (files ? createHash('sha1').update(JSON.stringify(Object.keys(files).sort().map((k) => [k, files[k]]))).digest('hex') : 'none');
 
 export function writeLastPass(appId, platform, files) {
   fs.mkdirSync(cacheDir(appId), { recursive: true });
   fs.writeFileSync(passFile(appId, platform), JSON.stringify({ at: new Date().toISOString(), files }));
+}
+/**
+ * Moves a platform's last pass to `files` only if it is still what the run compared against (baseHash = fileMapHash of
+ * that base; undefined = a full run, which proves everything and always moves). A run that started from another run's
+ * pending content must not move the pass when that run failed or is still going. Returns whether it moved.
+ */
+export function moveLastPass(appId, platform, files, baseHash) {
+  if (baseHash !== undefined && baseHash !== null && fileMapHash(readLastPass(appId, platform)) !== baseHash) return false;
+  writeLastPass(appId, platform, files);
+  return true;
 }
 
 /**
@@ -101,31 +123,26 @@ export function selectFlows(map, changed, flowNames, darkDefault = []) {
 // ---- deciding whether (and where) device QA is worth running (owner 2026-11-23: no wasted QA minutes)
 
 const isLogicTs = (f) => /\.(ts|mts)$/.test(f) && !/\.test\.(ts|mts)$/.test(f);
-const union = (a, b) => [...new Set([...a, ...b])].sort();
 
 /**
  * selectFlows, with one extra input: covered = the set of changed-file candidates a green unit test imports directly
- * (the caller proves "green in this run"). A covered plain .ts module (no JSX), not under the map's "all" or "ignore":
- *   - no flow lists it: no device QA for it at all (the unit tests are the check);
- *   - a flow lists it: those flows run on Android only (free), never iOS: the tests cover the logic, the flow checks the
- *     wiring, and when unsure the cheap platform decides.
- * Everything else selects as before, for both platforms. Returns { android, ios, skipped, androidOnly } where android and
- * ios are selectFlows results. Without covered (or a map, or an earlier pass) both are the plain selectFlows result.
+ * (the caller proves "green in this run"). Coverage never turns an unknown file into a skipped one: the map says an
+ * unmapped file means every flow, and a file a rule lists keeps its flows on BOTH platforms (iOS runs them at the land
+ * step; Hermes on iOS and Android can differ). The only files dropped from the selection are covered plain .ts modules
+ * (no JSX, not under "all" or "ignore") that the map names in its explicit "unitOnly" globs (empty or absent by
+ * default): for those the unit tests are the check. Returns { android, ios, skipped } (android and ios are selectFlows
+ * results, equal today). Without covered, a map, or an earlier pass it is the plain selectFlows result.
  */
 export function splitByCoverage(map, changed, flowNames, darkDefault = [], covered = null) {
-  const plain = () => { const s = selectFlows(map, changed, flowNames, darkDefault); return { android: s, ios: s, skipped: [], androidOnly: [] }; };
-  if (!covered?.size || !map || changed === null) return plain();
+  const plain = () => { const s = selectFlows(map, changed, flowNames, darkDefault); return { android: s, ios: s, skipped: [] }; };
+  if (!covered?.size || !map || changed === null || !map.unitOnly?.length) return plain();
   const ignored = anyOf(map.ignore);
   const all = anyOf(map.all);
-  const listedBy = (map.rules || []).map((r) => anyOf(r.paths));
-  const eligible = changed.filter((f) => covered.has(f) && isLogicTs(f) && !ignored(f) && !all(f) && !f.startsWith('.maestro/'));
-  if (!eligible.length) return plain();
-  const androidOnly = eligible.filter((f) => listedBy.some((hit) => hit(f)));
-  const skipped = eligible.filter((f) => !androidOnly.includes(f));
-  const ios = selectFlows(map, changed.filter((f) => !eligible.includes(f)), flowNames, darkDefault);
-  const extra = selectFlows(map, androidOnly, flowNames, darkDefault);
-  const android = { light: union(ios.light, extra.light), dark: union(ios.dark, extra.dark), why: androidOnly.length ? [ios.light.length || ios.dark.length ? ios.why : '', extra.why + ' (unit-covered: Android only)'].filter(Boolean).join(', ') : ios.why };
-  return { android, ios, skipped, androidOnly };
+  const unitOnly = anyOf(map.unitOnly);
+  const skipped = changed.filter((f) => covered.has(f) && isLogicTs(f) && !ignored(f) && !all(f) && !f.startsWith('.maestro/') && unitOnly(f));
+  if (!skipped.length) return plain();
+  const s = selectFlows(map, changed.filter((f) => !skipped.includes(f)), flowNames, darkDefault);
+  return { android: s, ios: s, skipped };
 }
 
 /**
@@ -155,13 +172,13 @@ const PHRASES = {
     skip: { ignored: 'skipped - only tests, docs or maps changed', nothing: 'skipped - nothing changed since the last pass', covered: (f) => 'skipped - pure logic covered by green unit tests (' + f + ')', deferredOnly: (n) => 'skipped - iOS (' + n + ' flows) waits for the land/release step, nothing for Android' },
     android: (n, names) => 'Android ' + n + ' flow' + (n === 1 ? '' : 's') + ' (' + names + ')',
     androidNone: 'Android nothing to run',
-    ios: { run: (n, why) => 'iOS ' + n + ' flow' + (n === 1 ? '' : 's') + ' in the background (' + why + ')', defer: 'iOS waits for the land/release step (no iOS-specific change)', none: 'iOS nothing to run' },
+    ios: { run: (n, why, wait) => 'iOS ' + n + ' flow' + (n === 1 ? '' : 's') + (wait ? ', waiting for the result' : ' in the background') + ' (' + why + ')', defer: 'iOS waits for the land/release step (no iOS-specific change)', none: 'iOS nothing to run' },
   },
   vi: {
     skip: { ignored: 'bỏ qua - chỉ test/tài liệu/map đổi', nothing: 'bỏ qua - không có gì đổi từ lần đạt gần nhất', covered: (f) => 'bỏ qua - logic thuần đã có unit test xanh (' + f + ')', deferredOnly: (n) => 'bỏ qua - iOS (' + n + ' luồng) để tới bước đẩy/phát hành, Android không có gì cần chạy' },
     android: (n, names) => 'Android ' + n + ' luồng (' + names + ')',
     androidNone: 'Android không cần chạy',
-    ios: { run: (n, why) => 'iOS ' + n + ' luồng chạy nền (' + why + ')', defer: 'iOS để tới verify:land hoặc phát hành (không có thay đổi riêng iOS)', none: 'iOS không cần chạy' },
+    ios: { run: (n, why, wait) => 'iOS ' + n + ' luồng' + (wait ? ', chờ kết quả' : ' chạy nền') + ' (' + why + ')', defer: 'iOS để tới verify:land hoặc phát hành (không có thay đổi riêng iOS)', none: 'iOS không cần chạy' },
   },
 };
 
@@ -178,7 +195,7 @@ export function describeDecision(lang, d) {
   if (!nA && d.ios.mode !== 'run') {
     text = d.ios.mode === 'defer' ? t.skip.deferredOnly(nI) : d.skipped.length ? t.skip.covered(d.skipped.slice(0, 3).join(', ')) : d.noChange ? t.skip.nothing : t.skip.ignored;
   } else {
-    text = (nA ? t.android(nA, d.androidFlows.join(', ')) : t.androidNone) + '; ' + (d.ios.mode === 'run' ? t.ios.run(nI, d.ios.why) : d.ios.mode === 'defer' ? t.ios.defer : t.ios.none);
+    text = (nA ? t.android(nA, d.androidFlows.join(', ')) : t.androidNone) + '; ' + (d.ios.mode === 'run' ? t.ios.run(nI, d.ios.why, d.ios.wait) : d.ios.mode === 'defer' ? t.ios.defer : t.ios.none);
   }
   return { text: 'app-qa: ' + text, code };
 }

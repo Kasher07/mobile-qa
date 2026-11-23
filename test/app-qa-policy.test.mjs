@@ -20,49 +20,44 @@ const MAP = {
 };
 const cov = (...f) => new Set(f);
 
-test('splitByCoverage without a covered set is exactly selectFlows for both platforms', () => {
+const UNIT_ONLY_MAP = { ...MAP, unitOnly: ['src/lib/bible/dates.ts', 'src/lib/bible/pure/**'] };
+
+test('splitByCoverage without a covered set (or without unitOnly) is exactly selectFlows for both platforms', () => {
   const changed = ['src/lib/bible/reading-spot.ts'];
   const r = splitByCoverage(MAP, changed, FLOWS, [], null);
   assert.deepEqual(r.android, selectFlows(MAP, changed, FLOWS, []));
   assert.deepEqual(r.ios, r.android);
-  assert.deepEqual([r.skipped, r.androidOnly], [[], []]);
+  assert.deepEqual(r.skipped, []);
   assert.deepEqual(splitByCoverage(MAP, changed, FLOWS, [], cov()).ios, r.ios);
   assert.deepEqual(splitByCoverage(MAP, null, FLOWS, [], cov('x.ts')).ios.light, FLOWS); // never passed: everything
-});
-
-test('a unit-covered logic module that a flow lists runs those flows on Android only', () => {
-  const r = splitByCoverage(MAP, ['src/lib/bible/reading-spot.ts'], FLOWS, [], cov('src/lib/bible/reading-spot.ts'));
-  assert.deepEqual(r.android.light, ['01-read', '04-resume']);
-  assert.deepEqual([r.ios.light, r.ios.dark], [[], []]);
-  assert.deepEqual(r.androidOnly, ['src/lib/bible/reading-spot.ts']);
-  assert.match(r.android.why, /unit-covered: Android only/);
-});
-
-test('a unit-covered logic module that no flow lists needs no device QA at all', () => {
-  const m = { ...MAP, rules: MAP.rules.filter((x) => !x.paths.includes('src/lib/bible/dates.ts')) };
-  const r = splitByCoverage(m, ['src/lib/bible/dates.ts'], FLOWS, [], cov('src/lib/bible/dates.ts'));
-  assert.deepEqual([r.android.light, r.ios.light, r.skipped], [[], [], ['src/lib/bible/dates.ts']]);
-});
-
-test('covered does not shield: JSX files, "all" files, uncovered files and flow files keep their flows on both platforms', () => {
-  const covered = cov('src/app/(tabs)/kinh-thanh.tsx', 'src/lib/bible/settings.ts', 'src/lib/bible/store.ts');
-  const tsx = splitByCoverage(MAP, ['src/app/(tabs)/kinh-thanh.tsx'], FLOWS, [], covered);
-  assert.deepEqual([tsx.android.light, tsx.ios.light], [['01-read', '04-resume'], ['01-read', '04-resume']]);
-  const all = splitByCoverage(MAP, ['src/lib/bible/settings.ts'], FLOWS, [], covered);
-  assert.deepEqual([all.android.light.length, all.ios.light.length], [4, 4]);
-  const notCovered = splitByCoverage(MAP, ['src/lib/bible/manifest-check.ts'], FLOWS, [], covered);
-  assert.deepEqual([notCovered.android.light, notCovered.ios.light], [['02-translation'], ['02-translation']]);
-  const flow = splitByCoverage(MAP, ['.maestro/02-translation.yaml'], FLOWS, [], cov('.maestro/02-translation.yaml'));
-  assert.deepEqual(flow.ios.light, ['02-translation']);
+  // covered files that a rule lists keep their flows on BOTH platforms (the iOS run at land includes them) ...
+  const listed = splitByCoverage(MAP, changed, FLOWS, [], cov('src/lib/bible/reading-spot.ts'));
+  assert.deepEqual([listed.android.light, listed.ios.light], [['01-read', '04-resume'], ['01-read', '04-resume']]);
+  // ... and a covered file that no rule lists is an unmapped file: every flow, never skipped
   const unmapped = splitByCoverage(MAP, ['src/lib/new-thing.ts'], FLOWS, [], cov('src/lib/new-thing.ts'));
-  assert.equal(unmapped.skipped.length, 1); // covered and unlisted: the unit tests are the check
+  assert.deepEqual([unmapped.android.light, unmapped.ios.light, unmapped.skipped], [FLOWS, FLOWS, []]);
 });
 
-test('mixed change: the uncovered file decides iOS, the covered listed file only adds Android flows', () => {
-  const changed = ['src/lib/bible/manifest-check.ts', 'src/lib/bible/reading-spot.ts'];
-  const r = splitByCoverage(MAP, changed, FLOWS, [], cov('src/lib/bible/reading-spot.ts'));
-  assert.deepEqual(r.ios.light, ['02-translation']);
-  assert.deepEqual(r.android.light, ['01-read', '02-translation', '04-resume']);
+test('only an explicit unitOnly module that a green unit test covers is dropped from the selection, on both platforms', () => {
+  const r = splitByCoverage(UNIT_ONLY_MAP, ['src/lib/bible/dates.ts'], FLOWS, [], cov('src/lib/bible/dates.ts'));
+  assert.deepEqual([r.android.light, r.ios.light, r.skipped], [[], [], ['src/lib/bible/dates.ts']]);
+  const notCovered = splitByCoverage(UNIT_ONLY_MAP, ['src/lib/bible/dates.ts'], FLOWS, [], cov());
+  assert.deepEqual([notCovered.ios.light, notCovered.skipped], [['03-screens'], []]); // unit tests did not run green: its flow runs
+  const mixed = splitByCoverage(UNIT_ONLY_MAP, ['src/lib/bible/dates.ts', 'src/lib/bible/manifest-check.ts'], FLOWS, [], cov('src/lib/bible/dates.ts', 'src/lib/bible/manifest-check.ts'));
+  assert.deepEqual([mixed.ios.light, mixed.skipped], [['02-translation'], ['src/lib/bible/dates.ts']]);
+});
+
+test('covered does not shield: JSX files, "all" files, flow files and uncovered files keep their flows on both platforms', () => {
+  const m = { ...UNIT_ONLY_MAP, unitOnly: [...UNIT_ONLY_MAP.unitOnly, 'src/app/**', 'src/lib/bible/settings.ts', '.maestro/**'] };
+  const covered = cov('src/app/(tabs)/kinh-thanh.tsx', 'src/lib/bible/settings.ts', '.maestro/02-translation.yaml', 'src/lib/bible/store.ts');
+  const tsx = splitByCoverage(m, ['src/app/(tabs)/kinh-thanh.tsx'], FLOWS, [], covered);
+  assert.deepEqual([tsx.android.light, tsx.ios.light, tsx.skipped], [['01-read', '04-resume'], ['01-read', '04-resume'], []]);
+  const all = splitByCoverage(m, ['src/lib/bible/settings.ts'], FLOWS, [], covered);
+  assert.deepEqual([all.android.light.length, all.ios.light.length], [4, 4]);
+  const flow = splitByCoverage(m, ['.maestro/02-translation.yaml'], FLOWS, [], covered);
+  assert.deepEqual([flow.ios.light, flow.skipped], [['02-translation'], []]);
+  const notCovered = splitByCoverage(m, ['src/lib/bible/manifest-check.ts'], FLOWS, [], covered);
+  assert.deepEqual(notCovered.ios.light, ['02-translation']);
 });
 
 test('iosRisk: configs, native folders and iOS-only files count; plain JS screens do not', () => {
@@ -116,4 +111,10 @@ test('iosRisk: an ignored file (docs, tests, the map) that mentions the patterns
     fs.writeFileSync(path.join(dir, 'tabs.tsx'), 'NativeTabs');
     assert.equal(iosRisk(map, ['tabs.tsx'], dir, 'vi'), 'tabs.tsx (mã riêng iOS)');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('describeDecision: a gate run (--ios wait) says it waits for the result', () => {
+  const d = { androidFlows: [], ios: { mode: 'run', flows: ['03-screens'], why: 'land', wait: true }, skipped: [], noChange: false };
+  assert.equal(describeDecision('en', d).text, 'app-qa: Android nothing to run; iOS 1 flow, waiting for the result (land)');
+  assert.match(describeDecision('vi', d).text, /iOS 1 luồng, chờ kết quả \(land\)/);
 });

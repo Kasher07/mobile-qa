@@ -1,16 +1,17 @@
 // Which runner takes the iOS half of an app-qa call: one of the Codemagic accounts (Mac mini M2, all flows in one
 // simulator session) or GitHub macOS shards (free on this public repo, but ~9 min of Mac setup per flow).
 //
-// Rule (auto): ask every Codemagic account for its builds (GET /builds?appId=...). An account is busy while it has a
-// build that is not in a final state (a free personal plan runs one build at a time), or while an earlier app-qa call
-// on this machine claimed it less than 3 minutes ago (the build list can lag behind a just-started build). Minutes used
-// = build minutes started this calendar month (UTC), a running build counted up to now. Take the idle account with the
+// Rule (auto): ask every Codemagic account for its builds (GET /builds, every app of the account). An account is busy
+// while it has a build that is not in a final state (a free personal plan runs one build at a time), or while an earlier
+// app-qa call on this machine claimed it less than 3 minutes ago (the build list can lag behind a just-started build).
+// Minutes used = build minutes started this calendar month (UTC), a running build counted up to now. Choosing and
+// claiming happen under one lock file (pool.lock), so two calls at once never take the same account. Take the idle account with the
 // most minutes left, if it has at least 45 left (max_build_duration is 40); ties go to the lower number. Every account
 // busy, nearly out of minutes or unreachable: GitHub macOS shards, never a queue. --ios-on forces a lane.
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { CM_FINAL, codemagic, kitDir } from './app-qa-lib.mjs';
+import { CM_FINAL, codemagic, kitDir, sleep } from './app-qa-lib.mjs';
 
 export const MONTHLY_MINUTES = 500; // Codemagic free personal plan
 export const MIN_LEFT = 45; // a build may run 40 min (codemagic.yaml max_build_duration) plus rounding
@@ -89,17 +90,48 @@ export function writeClaim(index, rid, now = Date.now()) {
   } catch { /* the pick still stands; only the double-claim guard is lost */ }
 }
 
-/** Reads every account (in parallel; a failing one is marked, not fatal) and applies pickLane. */
-export async function chooseIosLane({ configs, force, log, now = Date.now(), quota = Number(process.env.APP_QA_CM_MONTHLY_MINUTES) || MONTHLY_MINUTES, api = (c) => codemagic(c, log) }) {
-  const claims = readClaims(now);
-  const accounts = await Promise.all(configs.map(async (c) => {
-    const base = { index: c.index, label: c.label, quota: c.monthlyMinutes || quota };
-    try {
-      const u = usage(await api(c).listBuilds({ sinceMs: monthStartMs(now) }), now);
-      const claimed = claims.some((x) => x.account === c.index);
-      return { ...base, ...u, busy: u.busy || claimed };
-    } catch (e) { return { ...base, busy: false, running: null, minutes: 0, error: String(e.message).replace(/\s+/g, ' ').slice(0, 80) }; }
-  }));
-  const pick = pickLane(accounts, force);
-  return { ...pick, conf: pick.account ? configs.find((c) => c.index === pick.account.index) : null };
+/**
+ * Runs fn while holding pool.lock (an exclusive 'wx' file in the kit folder). A lock older than staleMs is a dead owner's
+ * and is removed; after waitMs without getting it, or when the folder cannot be written, fn runs unlocked (the claim
+ * guard is then best effort, never a reason to fail a QA run). Two waiters that both find the same stale lock can in
+ * theory both take it: that needs a crash two minutes earlier and a tie, and costs at most one queued build.
+ */
+export async function withPoolLock(fn, { waitMs = 120000, staleMs = 120000, pollMs = 100 } = {}) {
+  const file = path.join(kitDir(), 'pool.lock');
+  let fd = null;
+  try { fs.mkdirSync(kitDir(), { recursive: true }); } catch { /* unlocked */ }
+  const t0 = Date.now();
+  for (;;) {
+    try { fd = fs.openSync(file, 'wx'); break; } catch (e) {
+      if (e.code !== 'EEXIST') break;
+      try { if (Date.now() - fs.statSync(file).mtimeMs > staleMs) { fs.rmSync(file, { force: true }); continue; } } catch { /* vanished: retry */ }
+      if (Date.now() - t0 > waitMs) break;
+      await sleep(pollMs);
+    }
+  }
+  try { return await fn(); } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* closed */ } fs.rmSync(file, { force: true }); }
+  }
+}
+
+/**
+ * Reads every account (in parallel; a failing one is marked, not fatal), applies pickLane and, when a Codemagic account
+ * is chosen and rid is given, records the claim - all under the pool lock, so a second call at the same moment sees it.
+ */
+export async function chooseIosLane({ configs, force, log, rid = null, now = Date.now(), quota = Number(process.env.APP_QA_CM_MONTHLY_MINUTES) || MONTHLY_MINUTES, api = (c) => codemagic(c, log), lock = {} }) {
+  const decide = async () => {
+    const claims = readClaims(now);
+    const accounts = await Promise.all(configs.map(async (c) => {
+      const base = { index: c.index, label: c.label, quota: c.monthlyMinutes || quota };
+      try {
+        const u = usage(await api(c).listBuilds({ sinceMs: monthStartMs(now) }), now);
+        const claimed = claims.some((x) => x.account === c.index);
+        return { ...base, ...u, busy: u.busy || claimed };
+      } catch (e) { return { ...base, busy: false, running: null, minutes: 0, error: String(e.message).replace(/\s+/g, ' ').slice(0, 80) }; }
+    }));
+    const pick = pickLane(accounts, force);
+    if (pick.account && rid) writeClaim(pick.account.index, rid, now);
+    return { ...pick, conf: pick.account ? configs.find((c) => c.index === pick.account.index) : null };
+  };
+  return force?.lane === 'github' || !configs.length ? decide() : withPoolLock(decide, lock);
 }

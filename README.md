@@ -73,15 +73,18 @@ wasted and nothing queues:
 
 The picking rule (`bin/app-qa-pool.mjs`, run right before the build starts):
 
-1. Ask each account for its builds: `GET /builds?appId=<id>&limit=50&skip=<n>` (newest first; each build has `status`,
-   `createdAt`, `startedAt`, `finishedAt`; paged until the month starts). The REST docs page only describes `POST
+1. Ask each account for its builds: `GET /builds?limit=50&skip=<n>` (newest first; each build has `appId`, `status`,
+   `createdAt`, `startedAt`, `finishedAt`; paged until the month starts). Without `appId` the list covers every app of
+   the account, which is what the plan's minutes and its one-build-at-a-time limit belong to (an account with other apps
+   is counted correctly; a token that cannot see an app cannot count it). The REST docs page only describes `POST
    /builds`; the fields above were read from a real response.
 2. Busy = a build whose status is not final (`finished`, `failed`, `canceled`, `timeout`, `skipped`, `warning`) and was
    created less than 4 h ago, or the account was claimed by another app-qa call on this machine less than 3 min ago
-   (`pool-claims.json`; the list can lag behind a just-started build).
+   (`pool-claims.json`; the list can lag behind a just-started build). Choosing and claiming happen under one lock file
+   (`pool.lock`, exclusive create, stale after 2 min), so two calls at the same moment never take the same account.
 3. Minutes used = whole minutes (rounded up per build) from `startedAt` to `finishedAt` (to now while running) of the
    builds started this calendar month, UTC. It is an estimate of the plan's billing month; quota 500
-   (`APP_QA_CM_MONTHLY_MINUTES` to change it).
+   (`APP_QA_CM_MONTHLY_MINUTES` for all accounts, or `"monthlyMinutes"` in one account's json).
 4. Take the **idle account with the most minutes left**, if it has at least **45** left (a build may run 40 min); ties
    go to the lower number. That spreads the month's minutes evenly over the accounts.
 5. Every account busy, nearly out of minutes or unreachable (or none configured): **GitHub macOS shards**, never a
@@ -89,7 +92,12 @@ The picking rule (`bin/app-qa-pool.mjs`, run right before the build starts):
 
 `--ios-on github` forces GitHub; `--ios-on codemagic` forces Codemagic (the best account, queueing if all are busy);
 `--ios-on codemagic:2` forces account 2. A background iOS run records its account in its state file, so the detached
-process polls with the right token. Not done: splitting one `--ios wait` run across two accounts (a second build means a
+process polls with the right token; if that account is no longer configured it fails with a message instead of trying
+another account's token. The wait always ends: 60 min at most, checked on every pass; a 401/403, or a 404 that outlasts the
+first 3 minutes (a build is not readable for a few seconds after it starts), ends it at once with a written failure; network
+errors and 5xx are retried until the deadline. Overlapping background runs: each run has its own pending file and result
+file (an unread failure is never overwritten; the next call reports every unread one), and a run moves the iOS last pass
+only while it still equals what the run was planned against, so a failed run cannot be hidden by a later one. Not done: splitting one `--ios wait` run across two accounts (a second build means a
 second native build, doubling its minutes for a modest time gain, and it cannot be tested without spending minutes).
 
 Self-check: `npm test` (the picker and config loader are pure/fake-API tests in `test/app-qa-pool.test.mjs`).
@@ -103,11 +111,13 @@ Self-check: `npm test` (the picker and config loader are pure/fake-API tests in 
 
 1. Only ignored files (tests, docs, maps) or nothing changed: **no run at all**.
 2. `--unit-covered a,b` (files a unit test that was green in the same verify run imports directly; the caller proves it):
-   a plain `.ts` module (no JSX, not in `all`) that no flow lists is skipped; one that a flow lists runs those flows on
-   **Android only** (free; the tests cover the logic, the flow the wiring). Screens, components, `all` files and anything
-   uncovered keep their flows on both platforms.
+   coverage never turns an unknown file into a skipped one. An unmapped file means every flow, and a file a rule lists keeps
+   its flows on both platforms. Only a covered plain `.ts` module (no JSX, not in `all` or `ignore`) that the map names in
+   its explicit `"unitOnly"` globs (empty by default) is dropped from the selection: for those the unit tests are the check.
 3. `--ios-when risk` (with `--ios background`): iOS starts now only when something iOS-specific changed since iOS last
    passed: a file matching `ios.paths` in the map, a file whose text matches `ios.content` (safe-area, NativeTabs, Glass,
    fonts ...), a changed flow, or no earlier iOS pass. Otherwise iOS is deferred without moving its snapshot, so the next call
    with `--ios-when always` (the default; a land step or a release) runs every iOS flow for everything changed since the
-   last iOS pass: several UI commits share one iOS run. `--ios wait` (store builds) is never deferred.
+   last iOS pass: several UI commits share one iOS run. `--ios wait` (a land step, store builds) is a gate: never deferred, and
+   it compares with the last pass only (never with a background run's pending content), so a hung or killed background run
+   cannot empty its plan. With nothing to run it returns at once without waiting.

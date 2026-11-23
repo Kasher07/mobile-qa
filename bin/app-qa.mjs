@@ -14,8 +14,8 @@
 //   --ios-when risk|always   with --changed and --ios background: "risk" starts iOS now only when something iOS-specific
 //              changed (flows-map.json "ios" rule); otherwise iOS waits for the next call that says "always" (a land step or a
 //              release), which runs every iOS flow for everything changed since iOS last passed. Default always.
-//   --unit-covered a,b   changed files (relative to the app) that a unit test green in this run imports directly: plain
-//              .ts logic is then skipped or run on Android only (see splitByCoverage in bin/app-qa-select.mjs)
+//   --unit-covered a,b   changed files (relative to the app) that a unit test green in this run imports directly: only
+//              those the map names in "unitOnly" are then skipped (see splitByCoverage in bin/app-qa-select.mjs)
 //   --lang vi|en   language of the one-line decision this tool prints
 //   --plan-only   print what would run (flows, lane decision line) and stop: nothing packed, started or written
 //   --ios      background (default): wait for Android only; iOS finishes in a detached process and the next call
@@ -32,8 +32,9 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
-import { chooseIosLane, parseIosOn, writeClaim } from './app-qa-pool.mjs';
-import { changedSince, describeDecision, iosRisk, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writeLastPass, writePendingIos } from './app-qa-select.mjs';
+import { markIosResultSeen, readUnseenIosResults } from './app-qa-ios-results.mjs';
+import { chooseIosLane, parseIosOn } from './app-qa-pool.mjs';
+import { changedSince, describeDecision, fileMapHash, iosRisk, moveLastPass, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writePendingIos } from './app-qa-select.mjs';
 import { findShell, mediaHash, nativeFingerprint, shellKey, storeShell } from './app-qa-shell.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
@@ -91,20 +92,17 @@ for (const f of [opts.flows, opts.dark].filter((x) => x && x !== 'none').join(',
   if (!flowNames.includes(f)) throw new Error('no flow .maestro/' + f + '.yaml');
 }
 
-// ---- the previous background iOS result, once
-const lastIos = path.join(kitDir(), 'last-ios-' + appId + '.json');
+// ---- background iOS results nobody has read yet (every one, oldest first; a failure is never overwritten by a later run)
 let previousIosFailed = false;
-let previous = null;
-try { previous = JSON.parse(fs.readFileSync(lastIos, 'utf8')); } catch { /* none yet, or unreadable */ }
-if (previous && !opts.planOnly) {
-  const r = previous;
-  if (!r.seen) {
+if (!opts.planOnly) {
+  for (const entry of readUnseenIosResults(appId)) {
+    const r = entry.rec;
     // A background iOS failure stops this call (exit 1) once, so a verify step or a commit notices it; the iOS
     // snapshot did not move, so --changed runs those iOS flows again.
-    previousIosFailed = !r.ok;
-    log('iOS of the previous call (' + r.at + '): ' + (r.ok ? 'passed' : 'FAILED') + ' - ' + r.outDir);
+    if (!r.ok) previousIosFailed = true;
+    log('iOS of an earlier call (' + r.at + '): ' + (r.ok ? 'passed' : 'FAILED') + ' - ' + r.outDir);
     for (const l of r.lines || []) log('  ' + l.replace(/^\[app-qa ios\] /, ''));
-    fs.writeFileSync(lastIos, JSON.stringify({ ...r, seen: true }, null, 1));
+    markIosResultSeen(entry);
   }
 }
 
@@ -120,11 +118,19 @@ const toShards = (light, dark) => [...light.map((flow) => ({ flow, pass: 'light'
 const plan = {};
 const covered = opts.unitCovered ? new Set(opts.unitCovered.split(',').filter(Boolean)) : null;
 const decided = { skipped: [], noChange: true, deferred: [], iosWhy: '' };
+// What each platform's plan was compared against (fileMapHash of its base; undefined = a full run, which proves everything).
+// The last pass moves only while it still equals this, so a run that built on another run's pending content cannot move it
+// when that run failed or has not finished.
+const baseHash = {};
+// A gate (--ios wait: land, store build) compares with the last pass only: a hung or killed background run cannot empty its plan.
+const gate = opts.ios === 'wait';
 for (const p of opts.platforms.split(',')) {
   if (opts.flows) plan[p] = toShards(opts.flows.split(','), opts.dark && opts.dark !== 'none' ? opts.dark.split(',') : []);
   else if (opts.changed) {
-    const pending = p === 'ios' ? readPendingIos(appId) : null;
-    const changes = changedSince(pending || readLastPass(appId, p), current);
+    const pending = p === 'ios' && !gate ? readPendingIos(appId) : null;
+    const base = pending || readLastPass(appId, p);
+    baseHash[p] = fileMapHash(base);
+    const changes = changedSince(base, current);
     const split = splitByCoverage(flowMap, changes, flowNames, darkDefault, covered);
     const sel = { ...(p === 'ios' ? split.ios : split.android) };
     if (pending) sel.why += '; compared with the iOS run still in the background';
@@ -145,7 +151,7 @@ if (opts.changed) {
   const names = (shards) => [...new Set(shards.map((x) => x.flow))];
   const d = describeDecision(opts.lang, {
     androidFlows: names(plan.android || []),
-    ios: plan.ios?.length ? { mode: 'run', flows: names(plan.ios), why: decided.iosWhy } : decided.deferred.length ? { mode: 'defer', flows: names(decided.deferred) } : { mode: 'none', flows: [] },
+    ios: plan.ios?.length ? { mode: 'run', flows: names(plan.ios), why: decided.iosWhy, wait: gate } : decided.deferred.length ? { mode: 'defer', flows: names(decided.deferred) } : { mode: 'none', flows: [] },
     skipped: [...new Set(decided.skipped)], noChange: decided.noChange,
   });
   log(d.text);
@@ -315,10 +321,10 @@ let code = 0;
 try {
   await sweepAndLock();
   if (platforms.includes('ios')) {
-    const lane = await chooseIosLane({ configs: cmConfigs, force, log });
+    const lane = await chooseIosLane({ configs: cmConfigs, force, log, rid });
     log('ios lane: ' + (lane.conf ? 'Codemagic ' + lane.conf.label : 'GitHub macOS') + ' - ' + lane.why);
     useLane(lane.conf);
-    if (lane.conf) { writeClaim(lane.conf.index, rid); cm = codemagic(lane.conf, log); }
+    if (lane.conf) cm = codemagic(lane.conf, log);
   }
   setKey(key.toString('hex'));
   gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
@@ -332,12 +338,12 @@ try {
       ghDoneFile = path.join(kitDir(), 'gh-done-' + rid);
       if (!ghPlatforms.length) fs.writeFileSync(ghDoneFile, '');
       fs.writeFileSync(stateFile, JSON.stringify({ buildId: cmBuildId, keyHex: key.toString('hex'), tag, repo: REPO, account: ACCOUNT, outDir: path.join(kitDir(), 'ios-results', rid),
-        cmAccount: cmConf.index, cmAppId: cmConf.appId, appId, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: savesSnapshot ? current : null, ghDoneFile }), { mode: 0o600 });
+        cmAccount: cmConf.index, cmAppId: cmConf.appId, appId, rid, baseHash: baseHash.ios, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: savesSnapshot ? current : null, ghDoneFile }), { mode: 0o600 });
       const child = spawn(process.execPath, [path.join(import.meta.dirname, 'app-qa-ios-bg.mjs'), stateFile], { detached: true, stdio: 'ignore', windowsHide: true });
       await new Promise((ok, fail) => { child.once('spawn', ok); child.once('error', fail); });
       child.unref();
       handedOff = true;
-      if (savesSnapshot) writePendingIos(appId, current);
+      if (savesSnapshot) writePendingIos(appId, current, rid);
       try { gh(['release', 'edit', tag, '-R', REPO, '--title', tag + ' ios-background']); } catch { /* the lock then waits for it */ }
       log('iOS continues in the background; its result: ' + path.join(kitDir(), 'ios-results', rid) + ' (printed by the next app-qa call)');
     }
@@ -360,7 +366,7 @@ try {
   openArtifacts({ outDir, key, work, log, onApp: keepShell });
   for (const p of platforms.filter((x) => !(x === 'ios' && iosBackground))) {
     const ok = summarize({ outDir, platform: p, shards: plan[p], log });
-    if (ok && savesSnapshot) writeLastPass(appId, p, current);
+    if (ok && savesSnapshot) { if (!moveLastPass(appId, p, current, baseHash[p])) log(p + ': last pass not moved (another run changed it meanwhile); the next --changed run covers the difference'); }
     else code = 1;
   }
   log('results: ' + outDir + ' (' + Math.round((Date.now() - started) / 6000) / 10 + ' min)');

@@ -2,15 +2,17 @@
 // iOS in the background (app-qa --ios background): started detached by bin/app-qa.mjs once the Codemagic build is
 // queued. Deletes the temporary GitHub release as soon as Codemagic has fetched it, waits for the build, opens the
 // results, keeps a fresh native build for JS-only runs, and records the outcome for the next app-qa call
-// (last-ios-<appId>.json; the iOS last-pass snapshot moves only when every iOS flow passed).
+// (ios-result-<appId>-<run id>.json, one file per run so an unread failure is never overwritten; the iOS last-pass snapshot
+// moves only when every iOS flow passed AND the last pass is still the base this run was planned against).
 // Usage: node bin/app-qa-ios-bg.mjs <state.json> (written by app-qa.mjs, readable only by this user, deleted here).
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, summarize } from './app-qa-lib.mjs';
-import { clearPendingIos, writeLastPass } from './app-qa-select.mjs';
+import { accountForBuild, codemagic, codemagicConfigs, makeLog, openArtifacts, summarize } from './app-qa-lib.mjs';
+import { writeIosResult } from './app-qa-ios-results.mjs';
+import { clearPendingIos, moveLastPass } from './app-qa-select.mjs';
 import { storeShell } from './app-qa-shell.mjs';
 
 const stateFile = process.argv[2];
@@ -21,7 +23,6 @@ fs.mkdirSync(st.outDir, { recursive: true });
 const logFile = path.join(st.outDir, 'ios-background.log');
 const log = makeLog('app-qa ios', logFile);
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'app-qa-ios-'));
-const resultFile = path.join(kitDir(), 'last-ios-' + st.appId + '.json');
 let releaseGone = false;
 // The release also feeds the Android jobs of the same call: it goes only once Codemagic has fetched it AND the caller
 // has finished with GitHub (it writes ghDoneFile in its cleanup).
@@ -45,10 +46,9 @@ function deleteRelease() {
 let ok = false;
 let lines = [];
 try {
-  // The account the build was started on (state files of older runs have none: they were account 1).
-  const confs = codemagicConfigs();
-  const conf = confs.find((c) => st.cmAppId && c.appId === st.cmAppId) || confs.find((c) => c.index === st.cmAccount) || confs[0];
-  if (!conf) throw new Error('no Codemagic account configured');
+  // The account the build was started on (state files of older runs have none: they were account 1). A recorded account
+  // that is not configured any more is an error, never a silent switch to another account (its token would 404).
+  const conf = accountForBuild(codemagicConfigs(), st);
   log('polling Codemagic account ' + conf.label);
   const cm = codemagic(conf, log);
   const build = await cm.wait(st.buildId, { onFetched: deleteRelease });
@@ -58,13 +58,13 @@ try {
     if (kept) log(platform + ': build kept for JS-only runs');
   } });
   ok = summarize({ outDir: st.outDir, platform: 'ios', shards: st.shards, log });
-  if (ok && st.snapshot) writeLastPass(st.appId, 'ios', st.snapshot);
+  if (ok && st.snapshot && !moveLastPass(st.appId, 'ios', st.snapshot, st.baseHash)) log('last pass not moved: it is no longer the base this run was planned against (another run moved it or an earlier run did not pass)');
 } catch (e) {
   log('error: ' + e.message);
 } finally {
-  clearPendingIos(st.appId);
+  clearPendingIos(st.appId, st.rid ?? null);
   try { lines = fs.readFileSync(logFile, 'utf8').split('\n').filter((l) => /ios\/(light|dark)|no results|error/.test(l)); } catch { /* none */ }
-  fs.writeFileSync(resultFile, JSON.stringify({ at: new Date().toISOString(), ok, outDir: st.outDir, flows: st.shards, lines, seen: false }, null, 1));
+  writeIosResult(st.appId, st.rid || path.basename(st.outDir), { at: new Date().toISOString(), ok, outDir: st.outDir, flows: st.shards, lines });
   log('iOS ' + (ok ? 'passed' : 'FAILED') + ' (results: ' + st.outDir + ')');
   fs.rmSync(work, { recursive: true, force: true });
   // Wait (at most 30 min) for the caller to be done with GitHub before the release goes; the next call sweeps it
