@@ -22,8 +22,18 @@ if [ "$PASS" = dark ]; then
 else
   adb shell cmd uimode night no
 fi
+# A cold emulator's launcher can raise "Pixel Launcher isn't responding" over the app (2026-11-23, and 2026-11-23
+# app-qa round 1). That dialog belongs to the emulator, not the app: answer "Wait" (BACK) whenever it holds the focus.
+( while true; do
+    if adb shell dumpsys window 2>/dev/null | grep -qE "mCurrentFocus=.*Application Not Responding"; then
+      adb shell input keyevent KEYCODE_BACK; echo "system ANR dialog dismissed" >> "$OUT/checks.txt"
+    fi
+    sleep 2
+  done ) &
+ANR_WATCH=$!
 status=0
 ( cd "$OUT" && maestro test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
+kill "$ANR_WATCH" 2>/dev/null || true
 adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID" | tail -200 > "$OUT/logcat-errors.txt" || true
 exit $status

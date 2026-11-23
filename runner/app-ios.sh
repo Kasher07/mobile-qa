@@ -25,6 +25,12 @@ else
   xcrun simctl ui "$UDID" appearance light
 fi
 xcrun simctl install "$UDID" "$APP"
+# A freshly booted simulator's trust daemon is cold: the app's first HTTPS handshake waited ~11 s in certificate
+# verification and was cancelled (2026-11-23, NSURLErrorDomain -1200), which a warm phone never does. One HTTPS page
+# in Safari warms it before the flow starts.
+xcrun simctl openurl "$UDID" https://www.apple.com > /dev/null 2>&1 || true
+sleep 8
+xcrun simctl terminate "$UDID" com.apple.mobilesafari > /dev/null 2>&1 || true
 status=0
 ( cd "$OUT" && maestro --device "$UDID" test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
