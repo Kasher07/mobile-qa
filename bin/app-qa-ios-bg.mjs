@@ -68,4 +68,10 @@ try {
     if (!releaseGone) await new Promise((r) => setTimeout(r, 15000));
   }
   if (st.ghDoneFile) fs.rmSync(st.ghDoneFile, { force: true });
+  // Keep the five newest iOS result folders (screenshots are a few MB each).
+  try {
+    const dir = path.dirname(st.outDir);
+    const old = fs.readdirSync(dir).map((n) => ({ n, t: fs.statSync(path.join(dir, n)).mtimeMs })).sort((a, b) => b.t - a.t).slice(5);
+    for (const o of old) fs.rmSync(path.join(dir, o.n), { recursive: true, force: true });
+  } catch { /* nothing to prune */ }
 }
