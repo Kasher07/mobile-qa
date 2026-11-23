@@ -97,3 +97,85 @@ export function selectFlows(map, changed, flowNames, darkDefault = []) {
   }
   return { light: [...light].filter((x) => flowNames.includes(x)).sort(), dark: [...dark].filter((x) => flowNames.includes(x)), why: why.length ? why.join(', ') : 'only ignored files changed' };
 }
+
+// ---- deciding whether (and where) device QA is worth running (owner 2026-11-23: no wasted QA minutes)
+
+const isLogicTs = (f) => /\.(ts|mts)$/.test(f) && !/\.test\.(ts|mts)$/.test(f);
+const union = (a, b) => [...new Set([...a, ...b])].sort();
+
+/**
+ * selectFlows, with one extra input: covered = the set of changed-file candidates a green unit test imports directly
+ * (the caller proves "green in this run"). A covered plain .ts module (no JSX), not under the map's "all" or "ignore":
+ *   - no flow lists it: no device QA for it at all (the unit tests are the check);
+ *   - a flow lists it: those flows run on Android only (free), never iOS: the tests cover the logic, the flow checks the
+ *     wiring, and when unsure the cheap platform decides.
+ * Everything else selects as before, for both platforms. Returns { android, ios, skipped, androidOnly } where android and
+ * ios are selectFlows results. Without covered (or a map, or an earlier pass) both are the plain selectFlows result.
+ */
+export function splitByCoverage(map, changed, flowNames, darkDefault = [], covered = null) {
+  const plain = () => { const s = selectFlows(map, changed, flowNames, darkDefault); return { android: s, ios: s, skipped: [], androidOnly: [] }; };
+  if (!covered?.size || !map || changed === null) return plain();
+  const ignored = anyOf(map.ignore);
+  const all = anyOf(map.all);
+  const listedBy = (map.rules || []).map((r) => anyOf(r.paths));
+  const eligible = changed.filter((f) => covered.has(f) && isLogicTs(f) && !ignored(f) && !all(f) && !f.startsWith('.maestro/'));
+  if (!eligible.length) return plain();
+  const androidOnly = eligible.filter((f) => listedBy.some((hit) => hit(f)));
+  const skipped = eligible.filter((f) => !androidOnly.includes(f));
+  const ios = selectFlows(map, changed.filter((f) => !eligible.includes(f)), flowNames, darkDefault);
+  const extra = selectFlows(map, androidOnly, flowNames, darkDefault);
+  const android = { light: union(ios.light, extra.light), dark: union(ios.dark, extra.dark), why: androidOnly.length ? [ios.light.length || ios.dark.length ? ios.why : '', extra.why + ' (unit-covered: Android only)'].filter(Boolean).join(', ') : ios.why };
+  return { android, ios, skipped, androidOnly };
+}
+
+/**
+ * Is something in `changed` (paths since that platform's last pass; null = no pass yet) a risk that only a real iPhone
+ * shows? map.ios = { paths: [globs], content: "regex" }: a changed file matching a glob, or whose current text matches
+ * the regex (safe-area, NativeTabs, Glass, fonts ...), or a changed .maestro flow. No map.ios = every change counts.
+ * Returns the reason (a file name or phrase) or null. Being wrong costs nothing but timing: iOS then runs at the next
+ * land/release instead of now, over everything changed since its last pass.
+ */
+export function iosRisk(map, changed, appDir) {
+  if (changed === null) return 'no earlier iOS pass';
+  if (!map?.ios) return changed.length ? 'no "ios" rule in flows-map.json' : null;
+  const hit = anyOf(map.ios.paths);
+  const re = map.ios.content ? new RegExp(map.ios.content) : null;
+  for (const f of changed) {
+    if (/^\.maestro\/[^/]+\.yaml$/.test(f) || hit(f)) return f;
+    if (re && appDir) { try { if (re.test(fs.readFileSync(path.join(appDir, f), 'utf8'))) return f + ' (iOS-specific code)'; } catch { /* deleted or binary */ } }
+  }
+  return null;
+}
+
+const PHRASES = {
+  en: {
+    skip: { ignored: 'skipped - only tests, docs or maps changed', nothing: 'skipped - nothing changed since the last pass', covered: (f) => 'skipped - pure logic covered by green unit tests (' + f + ')', deferredOnly: (n) => 'skipped - iOS (' + n + ' flows) waits for the land/release step, nothing for Android' },
+    android: (n, names) => 'Android ' + n + ' flow' + (n === 1 ? '' : 's') + ' (' + names + ')',
+    androidNone: 'Android nothing to run',
+    ios: { run: (n, why) => 'iOS ' + n + ' flow' + (n === 1 ? '' : 's') + ' in the background (' + why + ')', defer: 'iOS waits for the land/release step (no iOS-specific change)', none: 'iOS nothing to run' },
+  },
+  vi: {
+    skip: { ignored: 'bỏ qua - chỉ test/tài liệu/map đổi', nothing: 'bỏ qua - không có gì đổi từ lần đạt gần nhất', covered: (f) => 'bỏ qua - logic thuần đã có unit test xanh (' + f + ')', deferredOnly: (n) => 'bỏ qua - iOS (' + n + ' luồng) để tới bước đẩy/phát hành, Android không có gì cần chạy' },
+    android: (n, names) => 'Android ' + n + ' luồng (' + names + ')',
+    androidNone: 'Android không cần chạy',
+    ios: { run: (n, why) => 'iOS ' + n + ' luồng chạy nền (' + why + ')', defer: 'iOS để tới verify:land hoặc phát hành (không có thay đổi riêng iOS)', none: 'iOS không cần chạy' },
+  },
+};
+
+/**
+ * One line saying what was decided and why. d = { androidFlows: [names], ios: { mode: 'run'|'defer'|'none', flows: [names],
+ * why }, skipped: [files covered by unit tests], noChange: bool }. Also returns a short parseable code.
+ */
+export function describeDecision(lang, d) {
+  const t = PHRASES[lang] || PHRASES.en;
+  const nA = d.androidFlows.length;
+  const nI = d.ios.flows.length;
+  const code = 'android=' + nA + ' ios=' + (d.ios.mode === 'run' ? nI : d.ios.mode === 'defer' ? 'deferred:' + nI : 0);
+  let text;
+  if (!nA && d.ios.mode !== 'run') {
+    text = d.ios.mode === 'defer' ? t.skip.deferredOnly(nI) : d.skipped.length ? t.skip.covered(d.skipped.slice(0, 3).join(', ')) : d.noChange ? t.skip.nothing : t.skip.ignored;
+  } else {
+    text = (nA ? t.android(nA, d.androidFlows.join(', ')) : t.androidNone) + '; ' + (d.ios.mode === 'run' ? t.ios.run(nI, d.ios.why) : d.ios.mode === 'defer' ? t.ios.defer : t.ios.none);
+  }
+  return { text: 'app-qa: ' + text, code };
+}

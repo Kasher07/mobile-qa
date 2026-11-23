@@ -93,3 +93,21 @@ process polls with the right token. Not done: splitting one `--ios wait` run acr
 second native build, doubling its minutes for a modest time gain, and it cannot be tested without spending minutes).
 
 Self-check: `npm test` (the picker and config loader are pure/fake-API tests in `test/app-qa-pool.test.mjs`).
+
+### Is device QA worth running at all? (`--changed`)
+
+`--changed` compares the app files with the last passing run of each platform and looks the difference up in the app's
+`.maestro/flows-map.json` (`ignore`, `all`, `rules`, `dark`). It then decides, and prints one line saying what and why:
+`app-qa: Android 2 flows (01-read, 04-resume); iOS waits for the land/release step (no iOS-specific change)`
+(`--lang vi` for Vietnamese, plus a parseable `decision-code:` line; `--plan-only` prints it and stops, nothing packed or started).
+
+1. Only ignored files (tests, docs, maps) or nothing changed: **no run at all**.
+2. `--unit-covered a,b` (files a unit test that was green in the same verify run imports directly; the caller proves it):
+   a plain `.ts` module (no JSX, not in `all`) that no flow lists is skipped; one that a flow lists runs those flows on
+   **Android only** (free; the tests cover the logic, the flow the wiring). Screens, components, `all` files and anything
+   uncovered keep their flows on both platforms.
+3. `--ios-when risk` (with `--ios background`): iOS starts now only when something iOS-specific changed since iOS last
+   passed: a file matching `ios.paths` in the map, a file whose text matches `ios.content` (safe-area, NativeTabs, Glass,
+   fonts ...), a changed flow, or no earlier iOS pass. Otherwise iOS is deferred without moving its snapshot, so the next call
+   with `--ios-when always` (the default; a land step or a release) runs every iOS flow for everything changed since the
+   last iOS pass: several UI commits share one iOS run. `--ios wait` (store builds) is never deferred.

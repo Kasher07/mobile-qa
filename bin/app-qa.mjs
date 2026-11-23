@@ -11,6 +11,13 @@
 //              nothing changed that a flow covers = no run at all
 //   --flows    these flows (light), --dark these again in dark mode with the largest text
 //   (neither)  every flow + .maestro/dark-flows.txt (before a store build)
+//   --ios-when risk|always   with --changed and --ios background: "risk" starts iOS now only when something iOS-specific
+//              changed (flows-map.json "ios" rule); otherwise iOS waits for the next call that says "always" (a land step or a
+//              release), which runs every iOS flow for everything changed since iOS last passed. Default always.
+//   --unit-covered a,b   changed files (relative to the app) that a unit test green in this run imports directly: plain
+//              .ts logic is then skipped or run on Android only (see splitByCoverage in bin/app-qa-select.mjs)
+//   --lang vi|en   language of the one-line decision this tool prints
+//   --plan-only   print what would run (flows, lane decision line) and stop: nothing packed, started or written
 //   --ios      background (default): wait for Android only; iOS finishes in a detached process and the next call
 //              prints its result; wait: wait for both (store builds)
 // Speed: a JS-only change (same Expo fingerprint and media files as a build kept on this machine) reuses that build
@@ -26,7 +33,7 @@ import path from 'node:path';
 
 import { codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
 import { chooseIosLane, parseIosOn, writeClaim } from './app-qa-pool.mjs';
-import { changedSince, readLastPass, readPendingIos, selectFlows, snapshot, writeLastPass, writePendingIos } from './app-qa-select.mjs';
+import { changedSince, describeDecision, iosRisk, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writeLastPass, writePendingIos } from './app-qa-select.mjs';
 import { findShell, mediaHash, nativeFingerprint, shellKey, storeShell } from './app-qa-shell.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
@@ -36,7 +43,7 @@ const log = makeLog('app-qa');
 const FLOWS_RE = /^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$/;
 
 function parseArgs(argv) {
-  const o = { app: null, platforms: 'ios,android', out: null, appId: null, keep: false, iosRunner: 'macos-26', flows: null, dark: null, changed: false, full: false, iosOn: null, ios: 'background' };
+  const o = { app: null, platforms: 'ios,android', out: null, appId: null, keep: false, iosRunner: 'macos-26', flows: null, dark: null, changed: false, full: false, iosOn: null, ios: 'background', iosWhen: 'always', unitCovered: null, lang: 'en', planOnly: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--app') o.app = argv[++i];
@@ -51,6 +58,10 @@ function parseArgs(argv) {
     else if (a === '--full') o.full = true;
     else if (a === '--ios-on') o.iosOn = argv[++i];
     else if (a === '--ios') o.ios = argv[++i];
+    else if (a === '--ios-when') o.iosWhen = argv[++i];
+    else if (a === '--unit-covered') o.unitCovered = argv[++i];
+    else if (a === '--lang') o.lang = argv[++i];
+    else if (a === '--plan-only') o.planOnly = true;
     else throw new Error('unknown option ' + a);
   }
   if (!o.app) throw new Error('--app <expo project dir> is required');
@@ -58,6 +69,8 @@ function parseArgs(argv) {
   for (const k of ['flows', 'dark']) if (o[k] != null && o[k] !== 'none' && !FLOWS_RE.test(o[k])) throw new Error('--' + k + ' takes flow names without .yaml, comma-separated');
   parseIosOn(o.iosOn);
   if (!/^(background|wait)$/.test(o.ios)) throw new Error('--ios must be background or wait');
+  if (!/^(risk|always)$/.test(o.iosWhen)) throw new Error('--ios-when must be risk or always');
+  if (!/^(vi|en)$/.test(o.lang)) throw new Error('--lang must be vi or en');
   if (o.changed && o.flows) throw new Error('--changed and --flows exclude each other');
   return o;
 }
@@ -83,7 +96,7 @@ const lastIos = path.join(kitDir(), 'last-ios-' + appId + '.json');
 let previousIosFailed = false;
 let previous = null;
 try { previous = JSON.parse(fs.readFileSync(lastIos, 'utf8')); } catch { /* none yet, or unreadable */ }
-if (previous) {
+if (previous && !opts.planOnly) {
   const r = previous;
   if (!r.seen) {
     // A background iOS failure stops this call (exit 1) once, so a verify step or a commit notices it; the iOS
@@ -105,18 +118,40 @@ if (risky.length) throw new Error('refusing to send credential-like files: ' + r
 const current = snapshot(appDir, files);
 const toShards = (light, dark) => [...light.map((flow) => ({ flow, pass: 'light' })), ...dark.map((flow) => ({ flow, pass: 'dark' }))];
 const plan = {};
+const covered = opts.unitCovered ? new Set(opts.unitCovered.split(',').filter(Boolean)) : null;
+const decided = { skipped: [], noChange: true, deferred: [], iosWhy: '' };
 for (const p of opts.platforms.split(',')) {
   if (opts.flows) plan[p] = toShards(opts.flows.split(','), opts.dark && opts.dark !== 'none' ? opts.dark.split(',') : []);
   else if (opts.changed) {
     const pending = p === 'ios' ? readPendingIos(appId) : null;
-    const sel = selectFlows(flowMap, changedSince(pending || readLastPass(appId, p), current), flowNames, darkDefault);
+    const changes = changedSince(pending || readLastPass(appId, p), current);
+    const split = splitByCoverage(flowMap, changes, flowNames, darkDefault, covered);
+    const sel = { ...(p === 'ios' ? split.ios : split.android) };
     if (pending) sel.why += '; compared with the iOS run still in the background';
     if (opts.dark) sel.dark = opts.dark === 'none' ? [] : opts.dark.split(',');
     plan[p] = toShards(sel.light, sel.dark);
+    if (changes === null || changes.length) decided.noChange = false;
+    decided.skipped.push(...split.skipped);
+    if (p === 'ios' && plan.ios.length) {
+      const risk = iosRisk(flowMap, changes, appDir);
+      decided.iosWhy = opts.iosWhen === 'risk' && opts.ios === 'background' ? risk : 'land/release step';
+      if (opts.iosWhen === 'risk' && opts.ios === 'background' && !risk) { decided.deferred = plan.ios; plan.ios = []; }
+    }
     log(p + ': ' + (plan[p].length ? plan[p].map((s) => (s.pass === 'dark' ? 'dark ' : '') + s.flow).join(', ') : 'nothing to run') + ' (' + sel.why.slice(0, 300) + ')');
   } else plan[p] = toShards(flowNames, opts.dark === 'none' ? [] : opts.dark ? opts.dark.split(',') : darkDefault);
 }
 const platforms = Object.keys(plan).filter((p) => plan[p].length);
+if (opts.changed) {
+  const names = (shards) => [...new Set(shards.map((x) => x.flow))];
+  const d = describeDecision(opts.lang, {
+    androidFlows: names(plan.android || []),
+    ios: plan.ios?.length ? { mode: 'run', flows: names(plan.ios), why: decided.iosWhy } : decided.deferred.length ? { mode: 'defer', flows: names(decided.deferred) } : { mode: 'none', flows: [] },
+    skipped: [...new Set(decided.skipped)], noChange: decided.noChange,
+  });
+  log(d.text);
+  log('decision-code: ' + d.code);
+}
+if (opts.planOnly) { log('--plan-only: stopping before anything is packed or started'); process.exit(0); }
 if (!platforms.length) { log('no flow covers what changed: nothing to run (' + Math.round((Date.now() - started) / 100) / 10 + ' s)'); process.exit(previousIosFailed ? 1 : 0); }
 
 // The iOS lane (a Codemagic account or GitHub shards) is picked later, right before the build starts (after the wait for
