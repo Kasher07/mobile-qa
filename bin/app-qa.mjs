@@ -133,8 +133,8 @@ for (const p of opts.platforms.split(',')) {
     if (changes === null || changes.length) decided.noChange = false;
     decided.skipped.push(...split.skipped);
     if (p === 'ios' && plan.ios.length) {
-      const risk = iosRisk(flowMap, changes, appDir);
-      decided.iosWhy = opts.iosWhen === 'risk' && opts.ios === 'background' ? risk : 'land/release step';
+      const risk = iosRisk(flowMap, changes, appDir, opts.lang);
+      decided.iosWhy = opts.iosWhen === 'risk' && opts.ios === 'background' ? risk : opts.lang === 'vi' ? 'bước đẩy/phát hành' : 'land/release step';
       if (opts.iosWhen === 'risk' && opts.ios === 'background' && !risk) { decided.deferred = plan.ios; plan.ios = []; }
     }
     log(p + ': ' + (plan[p].length ? plan[p].map((s) => (s.pass === 'dark' ? 'dark ' : '') + s.flow).join(', ') : 'nothing to run') + ' (' + sel.why.slice(0, 300) + ')');

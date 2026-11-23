@@ -135,14 +135,17 @@ export function splitByCoverage(map, changed, flowNames, darkDefault = [], cover
  * Returns the reason (a file name or phrase) or null. Being wrong costs nothing but timing: iOS then runs at the next
  * land/release instead of now, over everything changed since its last pass.
  */
-export function iosRisk(map, changed, appDir) {
-  if (changed === null) return 'no earlier iOS pass';
-  if (!map?.ios) return changed.length ? 'no "ios" rule in flows-map.json' : null;
+export function iosRisk(map, changed, appDir, lang = 'en') {
+  const vi = lang === 'vi';
+  if (changed === null) return vi ? 'chưa có lần iOS nào đạt' : 'no earlier iOS pass';
+  if (!map?.ios) return changed.length ? (vi ? 'flows-map.json chưa có luật "ios"' : 'no "ios" rule in flows-map.json') : null;
   const hit = anyOf(map.ios.paths);
+  const ignored = anyOf(map.ignore);
   const re = map.ios.content ? new RegExp(map.ios.content) : null;
   for (const f of changed) {
     if (/^\.maestro\/[^/]+\.yaml$/.test(f) || hit(f)) return f;
-    if (re && appDir) { try { if (re.test(fs.readFileSync(path.join(appDir, f), 'utf8'))) return f + ' (iOS-specific code)'; } catch { /* deleted or binary */ } }
+    if (ignored(f)) continue; // docs, tests and the map itself may mention the patterns without being iOS code
+    if (re && appDir) { try { if (re.test(fs.readFileSync(path.join(appDir, f), 'utf8'))) return f + (vi ? ' (mã riêng iOS)' : ' (iOS-specific code)'); } catch { /* deleted or binary */ } }
   }
   return null;
 }

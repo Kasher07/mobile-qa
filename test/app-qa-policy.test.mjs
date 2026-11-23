@@ -103,3 +103,17 @@ test('describeDecision: one line per case, in Vietnamese and English, with a par
   assert.match(describeDecision('vi', { ...none, ios: { mode: 'defer', flows: ['a'] } }).text, /iOS \(1 luồng\) để tới bước đẩy/);
   assert.match(describeDecision('xx', none).text, /skipped/); // unknown language falls back to English
 });
+
+test('iosRisk: an ignored file (docs, tests, the map) that mentions the patterns is not a risk; Vietnamese reasons', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aq-risk2-'));
+  try {
+    fs.mkdirSync(path.join(dir, '.maestro'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.maestro/flows-map.json'), '"content": "NativeTabs|GlassView"');
+    fs.writeFileSync(path.join(dir, 'NOTES.md'), 'NativeTabs');
+    const map = { ...MAP, ignore: [...MAP.ignore, '.maestro/flows-map.json'] };
+    assert.equal(iosRisk(map, ['.maestro/flows-map.json', 'NOTES.md'], dir), null);
+    assert.equal(iosRisk(map, null, dir, 'vi'), 'chưa có lần iOS nào đạt');
+    fs.writeFileSync(path.join(dir, 'tabs.tsx'), 'NativeTabs');
+    assert.equal(iosRisk(map, ['tabs.tsx'], dir, 'vi'), 'tabs.tsx (mã riêng iOS)');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
