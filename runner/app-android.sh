@@ -20,7 +20,9 @@ run_flows() {
   grep -E "^\[(Passed|Failed)\]" "$dir/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
 }
 adb shell cmd uimode night no
-run_flows "$OUT/light" "$FLOWS/01-doc-danh-dau-ghi-chu.yaml" "$FLOWS/02-ban-dich.yaml" "$FLOWS/03-man-hinh.yaml"
+# Every flow the app ships (.maestro/*.yaml, in name order) runs in light mode.
+shopt -s nullglob; LIGHT_FLOWS=("$FLOWS"/*.yaml); shopt -u nullglob
+run_flows "$OUT/light" "${LIGHT_FLOWS[@]}"
 adb shell cmd uimode night yes
 adb shell settings put system font_scale 2.0
 adb shell am force-stop "$APP_ID"
