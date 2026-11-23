@@ -99,7 +99,7 @@ jobs:
         run: |
           APP=$(find "$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator" -maxdepth 1 -name "*.app" | head -1)
           [ -n "$APP" ] || { echo "no .app"; exit 1; }
-          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APP")" "$(basename "$APP")"
+          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APP")" "$(basename "$APP")" -C "$PWD/app" .maestro
           node runner/app-crypt.mjs seal "$RUNNER_TEMP/app.tgz" sealed/app-ios.enc
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -147,11 +147,11 @@ jobs:
             const rts = Object.keys(j).filter((k) => /iOS/.test(k)).sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
             for (const rt of rts.reverse()) { const d = j[rt].find((x) => /^iPhone \d+( Pro)?$/.test(x.name)) || j[rt].find((x) => /^iPhone/.test(x.name)); if (d) { console.log(d.udid); break; } }')
           xcrun simctl boot "$UDID" || true
-      - name: Fetch and decrypt the app source (flows)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
-        run: node runner/app-fetch.mjs
+          # A freshly booted simulator's trust daemon is cold: the app's first HTTPS handshake waited ~11 s in
+          # certificate verification and was cancelled (2026-11-23, -1200). One HTTPS page in Safari warms it,
+          # in the background while the app downloads.
+          nohup bash -c "xcrun simctl bootstatus $UDID -b > /dev/null; xcrun simctl openurl $UDID https://www.apple.com; sleep 8; \
+            xcrun simctl terminate $UDID com.apple.mobilesafari; touch $RUNNER_TEMP/warm" > /dev/null 2>&1 &
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: app-ios
@@ -162,6 +162,10 @@ jobs:
         run: |
           node runner/app-crypt.mjs open sealed/app-ios.enc "$RUNNER_TEMP/app.tgz"
           mkdir -p "$RUNNER_TEMP/ready" && tar -xzf "$RUNNER_TEMP/app.tgz" -C "$RUNNER_TEMP/ready"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/maestro-cache
+          key: maestro-${{ env.MAESTRO_VERSION }}-${{ runner.os }}
       - name: Install Maestro (pinned, sha256 checked)
         run: bash runner/app-maestro-install.sh
       - name: Run the flow on the iOS Simulator
@@ -227,7 +231,7 @@ jobs:
         run: |
           APK=$(ls app/android/app/build/outputs/apk/release/*.apk | head -1)
           [ -n "$APK" ] || { echo "no APK"; exit 1; }
-          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APK")" "$(basename "$APK")"
+          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APK")" "$(basename "$APK")" -C "$PWD/app" .maestro
           node runner/app-crypt.mjs seal "$RUNNER_TEMP/app.tgz" sealed/app-android.enc
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -270,11 +274,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Fetch and decrypt the app source (flows)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
-        run: node runner/app-fetch.mjs
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: app-android
@@ -285,6 +284,10 @@ jobs:
         run: |
           node runner/app-crypt.mjs open sealed/app-android.enc "$RUNNER_TEMP/app.tgz"
           mkdir -p "$RUNNER_TEMP/ready" && tar -xzf "$RUNNER_TEMP/app.tgz" -C "$RUNNER_TEMP/ready"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/maestro-cache
+          key: maestro-${{ env.MAESTRO_VERSION }}-${{ runner.os }}
       - name: Install Maestro (pinned, sha256 checked)
         run: bash runner/app-maestro-install.sh
       - name: Enable KVM

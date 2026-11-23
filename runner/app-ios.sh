@@ -8,7 +8,7 @@ PASS="${PASS:-light}"; [[ "$PASS" =~ ^(light|dark)$ ]] || { echo "bad PASS"; exi
 OUT="$PWD/out/ios-$PASS-$FLOW"; mkdir -p "$OUT"
 APP=$(find "$RUNNER_TEMP/ready" -maxdepth 1 -name "*.app" | head -1)
 [ -n "$APP" ] || { echo "no prepared .app"; exit 1; }
-FILE="$PWD/app/.maestro/$FLOW.yaml"; [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
+FILE="$RUNNER_TEMP/ready/.maestro/$FLOW.yaml"; [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
 du -sk "$APP" | awk '{print "app_kb=" $1}' > "$OUT/checks.txt"
 UDID=$(xcrun simctl list devices available -j | node -e '
   const j = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
@@ -25,12 +25,8 @@ else
   xcrun simctl ui "$UDID" appearance light
 fi
 xcrun simctl install "$UDID" "$APP"
-# A freshly booted simulator's trust daemon is cold: the app's first HTTPS handshake waited ~11 s in certificate
-# verification and was cancelled (2026-11-23, NSURLErrorDomain -1200), which a warm phone never does. One HTTPS page
-# in Safari warms it before the flow starts.
-xcrun simctl openurl "$UDID" https://www.apple.com > /dev/null 2>&1 || true
-sleep 8
-xcrun simctl terminate "$UDID" com.apple.mobilesafari > /dev/null 2>&1 || true
+# The workflow warmed the simulator's TLS trust in the background after boot; wait for it (at most 2 min).
+for _ in $(seq 1 60); do [ -f "$RUNNER_TEMP/warm" ] && break; sleep 2; done
 status=0
 ( cd "$OUT" && maestro --device "$UDID" test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact

@@ -8,7 +8,7 @@ PASS="${PASS:-light}"; [[ "$PASS" =~ ^(light|dark)$ ]] || { echo "bad PASS"; exi
 OUT="$PWD/out/android-$PASS-$FLOW"; mkdir -p "$OUT"
 APK=$(ls "$RUNNER_TEMP"/ready/*.apk | head -1)
 [ -n "$APK" ] || { echo "no prepared APK"; exit 1; }
-FILE="$PWD/app/.maestro/$FLOW.yaml"; [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
+FILE="$RUNNER_TEMP/ready/.maestro/$FLOW.yaml"; [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
 AAPT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
 { echo "apk_bytes=$(stat -c %s "$APK") (x86_64 only)"
   "$AAPT" dump permissions "$APK" | sed 's/^/manifest: /'
