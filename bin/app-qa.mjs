@@ -76,9 +76,15 @@ for (const f of [opts.flows, opts.dark].filter((x) => x && x !== 'none').join(',
 
 // ---- the previous background iOS result, once
 const lastIos = path.join(kitDir(), 'last-ios-' + appId + '.json');
-if (fs.existsSync(lastIos)) {
-  const r = JSON.parse(fs.readFileSync(lastIos, 'utf8'));
+let previousIosFailed = false;
+let previous = null;
+try { previous = JSON.parse(fs.readFileSync(lastIos, 'utf8')); } catch { /* none yet, or unreadable */ }
+if (previous) {
+  const r = previous;
   if (!r.seen) {
+    // A background iOS failure stops this call (exit 1) once, so a verify step or a commit notices it; the iOS
+    // snapshot did not move, so --changed runs those iOS flows again.
+    previousIosFailed = !r.ok;
     log('iOS of the previous call (' + r.at + '): ' + (r.ok ? 'passed' : 'FAILED') + ' - ' + r.outDir);
     for (const l of r.lines || []) log('  ' + l.replace(/^\[app-qa ios\] /, ''));
     fs.writeFileSync(lastIos, JSON.stringify({ ...r, seen: true }, null, 1));
@@ -86,8 +92,8 @@ if (fs.existsSync(lastIos)) {
 }
 
 // ---- what to pack, and which flows each platform needs
-const files = execFileSync('git', ['-C', appDir, 'ls-files', '-co', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 64 << 20 })
-  .split('\n').filter((f) => f && fs.existsSync(path.join(appDir, f)));
+const files = execFileSync('git', ['-C', appDir, 'ls-files', '-co', '--exclude-standard', '-z'], { encoding: 'utf8', maxBuffer: 64 << 20 })
+  .split('\0').filter((f) => f && fs.existsSync(path.join(appDir, f)));
 // Never ship credentials to a runner, even encrypted: build code there could read them.
 const SECRETISH = /(^|\/)(\.env(\..*)?|.*\.(keystore|jks|p8|p12|pem|key|mobileprovision)|credentials\.json|google-services\.json|GoogleService-Info\.plist|.*service-account.*\.json)$/i;
 const risky = files.filter((f) => SECRETISH.test(f));
@@ -105,13 +111,15 @@ for (const p of opts.platforms.split(',')) {
   } else plan[p] = toShards(flowNames, opts.dark === 'none' ? [] : opts.dark ? opts.dark.split(',') : darkDefault);
 }
 const platforms = Object.keys(plan).filter((p) => plan[p].length);
-if (!platforms.length) { log('no flow covers what changed: nothing to run (' + Math.round((Date.now() - started) / 100) / 10 + ' s)'); process.exit(0); }
+if (!platforms.length) { log('no flow covers what changed: nothing to run (' + Math.round((Date.now() - started) / 100) / 10 + ' s)'); process.exit(previousIosFailed ? 1 : 0); }
 
 const cmConf = platforms.includes('ios') && opts.iosOn !== 'github' ? codemagicConfig() : null;
 if (opts.iosOn === 'codemagic' && !cmConf) throw new Error('--ios-on codemagic needs the Codemagic token and app id in ' + kitDir());
 const ghPlatforms = platforms.filter((p) => !(p === 'ios' && cmConf));
 const ghShards = [...new Map(ghPlatforms.flatMap((p) => plan[p]).map((s) => [s.pass + s.flow, s])).values()];
 const iosBackground = !!cmConf && opts.ios === 'background';
+// A snapshot says "everything that changed passed": only a --changed or full run, with the default dark pass, earns it.
+const savesSnapshot = !opts.flows && !opts.dark;
 
 const token = execFileSync('gh', ['auth', 'token', '--user', ACCOUNT], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const env = { ...process.env, GH_TOKEN: token };
@@ -177,6 +185,7 @@ let runId = null;
 let dispatched = false;
 let cmBuildId = null;
 let handedOff = false;
+let ghDoneFile = null;
 const cm = cmConf ? codemagic(cmConf, log) : null;
 const findRun = () => JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '20', '--json', 'databaseId,displayTitle'])).find((x) => x.displayTitle === rid)?.databaseId ?? null;
 let cleaning = null;
@@ -199,6 +208,8 @@ function cleanup() {
     if (!handedOff) { try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); log('release deleted'); } catch { /* never created, or already gone */ } }
     try { setKey(randomBytes(32).toString('hex')); } catch (e) { log('WARNING: could not replace APP_QA_KEY: ' + String(e.stderr || e.message).slice(0, 150)); }
     fs.rmSync(work, { recursive: true, force: true });
+    // The background iOS process may delete the release now.
+    if (ghDoneFile) { try { fs.writeFileSync(ghDoneFile, ''); } catch { /* it waits, then gives up */ } }
   })();
   return cleaning;
 }
@@ -257,12 +268,16 @@ try {
       // The detached process owns the iOS half from here: results, kept build, release deletion, the iOS snapshot.
       const stateFile = path.join(kitDir(), 'bg-' + rid + '.json');
       fs.mkdirSync(kitDir(), { recursive: true });
-      fs.writeFileSync(stateFile, JSON.stringify({ buildId: cmBuildId, keyHex: key.toString('hex'), tag, repo: REPO, account: ACCOUNT, outDir: path.join(outDir, 'ios-background'),
-        appId, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: current }), { mode: 0o600 });
-      spawn(process.execPath, [path.join(import.meta.dirname, 'app-qa-ios-bg.mjs'), stateFile], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      ghDoneFile = path.join(kitDir(), 'gh-done-' + rid);
+      if (!ghPlatforms.length) fs.writeFileSync(ghDoneFile, '');
+      fs.writeFileSync(stateFile, JSON.stringify({ buildId: cmBuildId, keyHex: key.toString('hex'), tag, repo: REPO, account: ACCOUNT, outDir: path.join(kitDir(), 'ios-results', rid),
+        appId, shellKey: sk, reused: reuse.includes('ios'), shards: plan.ios, snapshot: savesSnapshot ? current : null, ghDoneFile }), { mode: 0o600 });
+      const child = spawn(process.execPath, [path.join(import.meta.dirname, 'app-qa-ios-bg.mjs'), stateFile], { detached: true, stdio: 'ignore', windowsHide: true });
+      await new Promise((ok, fail) => { child.once('spawn', ok); child.once('error', fail); });
+      child.unref();
       handedOff = true;
       try { gh(['release', 'edit', tag, '-R', REPO, '--title', tag + ' ios-background']); } catch { /* the lock then waits for it */ }
-      log('iOS continues in the background; its result: ' + path.join(outDir, 'ios-background') + ' (printed by the next app-qa call)');
+      log('iOS continues in the background; its result: ' + path.join(kitDir(), 'ios-results', rid) + ' (printed by the next app-qa call)');
     }
   }
   if (ghPlatforms.length) {
@@ -283,7 +298,7 @@ try {
   openArtifacts({ outDir, key, work, log, onApp: keepShell });
   for (const p of platforms.filter((x) => !(x === 'ios' && iosBackground))) {
     const ok = summarize({ outDir, platform: p, shards: plan[p], log });
-    if (ok) writeLastPass(appId, p, current);
+    if (ok && savesSnapshot) writeLastPass(appId, p, current);
     else code = 1;
   }
   log('results: ' + outDir + ' (' + Math.round((Date.now() - started) / 6000) / 10 + ' min)');
@@ -293,4 +308,5 @@ try {
 } finally {
   await cleanup();
 }
+if (previousIosFailed && code === 0) { log('exit 1: the background iOS run of the previous call failed (above)'); code = 1; }
 process.exit(code);

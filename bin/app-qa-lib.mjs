@@ -8,7 +8,7 @@ import path from 'node:path';
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const t0 = Date.now();
-export const makeLog = (prefix, sink) => (s) => { const line = '[' + prefix + ' +' + Math.round((Date.now() - t0) / 1000) + 's] ' + s; console.log(line); if (sink) fs.appendFileSync(sink, line + '\n'); };
+export const makeLog = (prefix, sink) => (s) => { const line = '[' + prefix + ' +' + Math.round((Date.now() - t0) / 1000) + 's] ' + s; console.log(line); if (sink) { try { fs.appendFileSync(sink, line + '\n'); } catch { /* folder gone */ } } };
 
 /** IV(12) | tag(16) | ciphertext, AES-256-GCM. */
 export function seal(key, buf) {

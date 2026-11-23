@@ -33,16 +33,16 @@ workflows:
             for (const rt of rts.reverse()) { const d = j[rt].find((x) => /^iPhone \d+( Pro)?$/.test(x.name)) || j[rt].find((x) => /^iPhone/.test(x.name)); if (d) { console.log(d.udid); break; } }')
           xcrun simctl boot "$UDID" || true
       - name: Install dependencies
-        script: cd app && npm ci --no-audit --no-fund --loglevel=error
+        script: cd app && env -u APP_QA_KEY npm ci --no-audit --no-fund --loglevel=error
       - name: Prepare the app (JS repack or native build)
         script: |
           set -euo pipefail
           if [[ ",${REUSE:-}," == *",ios,"* ]]; then
-            bash runner/app-js-ios.sh
+            env -u APP_QA_KEY bash runner/app-js-ios.sh
           else
-            ( cd app && npx expo prebuild --platform ios --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 )
-            ( cd app/ios && pod install > "$RUNNER_TEMP/pods.log" 2>&1 )
-            ( cd app/ios && WS=$(ls -d *.xcworkspace | head -1) && xcodebuild -workspace "$WS" -scheme "${WS%.xcworkspace}" \
+            ( cd app && env -u APP_QA_KEY npx expo prebuild --platform ios --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 )
+            ( cd app/ios && env -u APP_QA_KEY pod install > "$RUNNER_TEMP/pods.log" 2>&1 )
+            ( cd app/ios && WS=$(ls -d *.xcworkspace | head -1) && env -u APP_QA_KEY xcodebuild -workspace "$WS" -scheme "${WS%.xcworkspace}" \
                 -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
                 -derivedDataPath "$RUNNER_TEMP/dd" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
                 COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/xcodebuild.log" 2>&1 )
@@ -59,7 +59,7 @@ workflows:
           unzip -q "$RUNNER_TEMP/maestro.zip" -d "$RUNNER_TEMP"
       - name: Run the flows on one iOS Simulator
         ignore_failure: true
-        script: PATH="$RUNNER_TEMP/maestro/bin:$PATH" APP_READY="$RUNNER_TEMP/ready" bash runner/app-ios-seq.sh
+        script: PATH="$RUNNER_TEMP/maestro/bin:$PATH" APP_READY="$RUNNER_TEMP/ready" env -u APP_QA_KEY bash runner/app-ios-seq.sh
       - name: Seal results
         script: |
           mkdir -p out/build-ios && cp "$RUNNER_TEMP"/*.log out/build-ios/ 2>/dev/null || true

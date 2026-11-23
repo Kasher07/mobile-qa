@@ -305,14 +305,17 @@ jobs:
           path: ~/.npm
           key: npm-${{ runner.os }}-${{ github.run_id }}
           restore-keys: npm-${{ runner.os }}-
-      - name: Fetch the app and the kept build, swap in the new JS
+      - name: Fetch and decrypt the app and the kept build
         if: contains(inputs.reuse, 'android')
         env:
           GH_TOKEN: ${{ github.token }}
           APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
           SHELL_PLATFORM: android
+        run: node runner/app-fetch.mjs
+      # The app's own packages install and run without the key or the token in their environment.
+      - name: Swap the new JS into the kept build
+        if: contains(inputs.reuse, 'android')
         run: |
-          node runner/app-fetch.mjs
           ( cd app && npm ci --no-audit --no-fund --loglevel=error --prefer-offline )
           bash runner/app-js-android.sh
           APK=$(ls app/android/app/build/outputs/apk/release/*.apk | head -1)
