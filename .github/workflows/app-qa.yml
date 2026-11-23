@@ -183,8 +183,10 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
 
+  # A native build happens once here; for a JS-only change (reuse android) this job is skipped and every flow job
+  # swaps the JS into the kept build itself, in parallel (round F 2026-11-23: the extra job cost ~1.2 min + handover).
   android-app:
-    if: contains(inputs.platforms, 'android')
+    if: contains(inputs.platforms, 'android') && !contains(inputs.reuse, 'android')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -262,6 +264,7 @@ jobs:
 
   android-flow:
     needs: android-app
+    if: ${{ !cancelled() && contains(inputs.platforms, 'android') && (needs.android-app.result == 'success' || needs.android-app.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -281,15 +284,39 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: ${{ !contains(inputs.reuse, 'android') }}
         with:
           name: app-android
           path: sealed
       - name: Open the prepared app
+        if: ${{ !contains(inputs.reuse, 'android') }}
         env:
           APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
         run: |
           node runner/app-crypt.mjs open sealed/app-android.enc "$RUNNER_TEMP/app.tgz"
           mkdir -p "$RUNNER_TEMP/ready" && tar -xzf "$RUNNER_TEMP/app.tgz" -C "$RUNNER_TEMP/ready"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        if: contains(inputs.reuse, 'android')
+        with:
+          node-version: 26
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        if: contains(inputs.reuse, 'android')
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: npm-${{ runner.os }}-
+      - name: Fetch the app and the kept build, swap in the new JS
+        if: contains(inputs.reuse, 'android')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+          SHELL_PLATFORM: android
+        run: |
+          node runner/app-fetch.mjs
+          ( cd app && npm ci --no-audit --no-fund --loglevel=error --prefer-offline )
+          bash runner/app-js-android.sh
+          APK=$(ls app/android/app/build/outputs/apk/release/*.apk | head -1)
+          mkdir -p "$RUNNER_TEMP/ready" && cp "$APK" "$RUNNER_TEMP/ready/" && cp -r app/.maestro "$RUNNER_TEMP/ready/"
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/maestro-cache
@@ -301,29 +328,6 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      # A booted clean emulator (system image only, nothing of the app) saved once and restored by every flow job:
-      # resumes in seconds instead of a ~1 min cold boot (pattern from the android-emulator-runner docs).
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        id: avd
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-35-default-x86_64-pixel_7-c4-r4096
-      - name: Create the emulator snapshot (first run only)
-        if: steps.avd.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
-        with:
-          api-level: 35
-          target: default
-          arch: x86_64
-          profile: pixel_7
-          cores: 4
-          ram-size: 4096M
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          script: echo "emulator snapshot created"
       - name: Run the flow on the Android emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
