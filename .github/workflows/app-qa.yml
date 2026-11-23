@@ -30,6 +30,18 @@ on:
         default: macos-26
         type: choice
         options: [macos-26, macos-15]
+      flows:
+        description: Flows in light mode (names without .yaml, comma-separated; * = every flow)
+        default: '*'
+        type: string
+      flows_dark:
+        description: Flows again in dark mode with the largest text (empty = skip that pass)
+        default: ''
+        type: string
+      reuse:
+        description: Platforms whose earlier release build is reused (JS-only change; shell-<platform>.tgz.enc)
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -38,6 +50,9 @@ permissions:
 env:
   ASSET_TAG: ${{ inputs.asset_tag }}
   APP_ID: ${{ inputs.app_id }}
+  FLOWS_LIGHT: ${{ inputs.flows }}
+  FLOWS_DARK: ${{ inputs.flows_dark }}
+  REUSE: ${{ inputs.reuse }}
   MAESTRO_VERSION: cli-2.12.1
   MAESTRO_SHA256: 54dbb0716425626604973cbb374c585ca30272375d9ce15177a1152765ddd9d7
   MAESTRO_CLI_NO_ANALYTICS: '1'
@@ -63,17 +78,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+          SHELL_PLATFORM: ios
         run: node runner/app-fetch.mjs
       - name: Install dependencies
         working-directory: app
         run: npm ci --no-audit --no-fund --loglevel=error
+      # JS-only change: the earlier release build gets a fresh JS bundle instead of a native rebuild.
+      - name: Reuse the earlier build, rebuild only the JS
+        if: contains(inputs.reuse, 'ios')
+        run: bash runner/app-js-ios.sh
       # Build output goes to files that are sealed with the results: the public log shows only step outcomes.
       - name: Native project (expo prebuild + pods)
+        if: ${{ !contains(inputs.reuse, 'ios') }}
         working-directory: app
         run: |
           npx expo prebuild --platform ios --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 || { echo "prebuild failed"; exit 1; }
           cd ios && pod install > "$RUNNER_TEMP/pods.log" 2>&1 || { echo "pod install failed"; exit 1; }
       - name: Build release for the simulator
+        if: ${{ !contains(inputs.reuse, 'ios') }}
         working-directory: app/ios
         run: |
           WS=$(ls -d *.xcworkspace | head -1); SCHEME="${WS%.xcworkspace}"
@@ -124,14 +146,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+          SHELL_PLATFORM: android
         run: node runner/app-fetch.mjs
       - name: Install dependencies
         working-directory: app
         run: npm ci --no-audit --no-fund --loglevel=error
+      - name: Reuse the earlier build, rebuild only the JS
+        if: contains(inputs.reuse, 'android')
+        run: bash runner/app-js-android.sh
       - name: Native project (expo prebuild)
+        if: ${{ !contains(inputs.reuse, 'android') }}
         working-directory: app
         run: npx expo prebuild --platform android --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 || { echo "prebuild failed"; exit 1; }
       - name: Build release APK (x86_64 for the emulator)
+        if: ${{ !contains(inputs.reuse, 'android') }}
         working-directory: app/android
         run: |
           ./gradlew assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon --console=plain > "$RUNNER_TEMP/gradle.log" 2>&1
