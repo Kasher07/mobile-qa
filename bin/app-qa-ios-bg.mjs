@@ -25,12 +25,18 @@ const resultFile = path.join(kitDir(), 'last-ios-' + st.appId + '.json');
 let releaseGone = false;
 function deleteRelease() {
   if (releaseGone) return;
-  releaseGone = true;
   try {
-    const token = execFileSync('gh', ['auth', 'token', '--user', st.account], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-    execFileSync('gh', ['release', 'delete', st.tag, '-R', st.repo, '--cleanup-tag', '-y'], { env: { ...process.env, GH_TOKEN: token }, stdio: 'ignore' });
+    // Pipes, not 'ignore': a detached process has no console, and gh needs its streams (2026-11-23).
+    const run = (args, env) => execFileSync('gh', args, { env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const token = run(['auth', 'token', '--user', st.account]).trim();
+    run(['release', 'delete', st.tag, '-R', st.repo, '--cleanup-tag', '-y'], { ...process.env, GH_TOKEN: token });
+    releaseGone = true;
     log('release deleted');
-  } catch { log('release already gone, or the next app-qa call removes it'); }
+  } catch (e) {
+    const why = String(e.stderr || e.message).split('\n')[0].slice(0, 200);
+    if (/not found|404/i.test(why)) { releaseGone = true; return; }
+    log('could not delete the release yet (' + why + ')');
+  }
 }
 
 let ok = false;
