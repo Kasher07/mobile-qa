@@ -194,15 +194,30 @@ async function runCodemagic() {
       cmFinished = true;
       log('time ios (Codemagic): takes ' + Math.round((Date.now() - t0) / 6000) / 10 + ' min');
       for (const a of build.buildActions || []) if (a.startedAt && a.finishedAt) log('time ios | ' + a.name + ' | ' + Math.round((Date.parse(a.finishedAt) - Date.parse(a.startedAt)) / 1000) + ' s');
+      // Codemagic gives one file per artefact, or one zip when there are several.
+      const files = [];
+      const cmTmp = path.join(work, 'codemagic');
+      fs.mkdirSync(cmTmp, { recursive: true });
       for (const art of build.artefacts || []) {
-        const m = /^(app|build)-ios\.enc$/.exec(art.name) || /^(ios-.+)\.enc$/.exec(art.name);
-        if (!m) continue;
-        const folder = m[1] === 'app' || m[1] === 'build' ? m[1] + '-ios' : 'res-' + m[1];
         const r = await fetch(art.url, { headers: { 'x-auth-token': cmToken } });
         if (!r.ok) { log('could not download ' + art.name + ': HTTP ' + r.status); continue; }
-        fs.mkdirSync(path.join(outDir, folder), { recursive: true });
-        fs.writeFileSync(path.join(outDir, folder, art.name), Buffer.from(await r.arrayBuffer()));
+        const f = path.join(cmTmp, path.basename(art.name));
+        fs.writeFileSync(f, Buffer.from(await r.arrayBuffer()));
+        if (f.endsWith('.zip')) {
+          execFileSync(tarBin, ['-xf', path.basename(f)], { cwd: cmTmp, stdio: 'ignore' });
+          const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+          files.push(...walk(cmTmp).filter((x) => x.endsWith('.enc')));
+        } else files.push(f);
       }
+      for (const f of files) {
+        const name = path.basename(f);
+        const m = /^(app|build)-ios\.enc$/.exec(name) || /^(ios-.+)\.enc$/.exec(name);
+        if (!m) continue;
+        const folder = m[1] === 'app' || m[1] === 'build' ? m[1] + '-ios' : 'res-' + m[1];
+        fs.mkdirSync(path.join(outDir, folder), { recursive: true });
+        fs.copyFileSync(f, path.join(outDir, folder, name));
+      }
+      if (!files.length) log('Codemagic: no results came back');
       return build.status === 'finished' ? 0 : 1;
     }
     if (Date.now() > deadline) throw new Error('Codemagic build timed out');
@@ -249,7 +264,7 @@ try {
       // Where the time went, per job (the run itself is deleted afterwards).
       const t0 = Date.parse(v.jobs.map((j) => j.startedAt).filter(Boolean).sort()[0] || 0);
       const mins = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 6000) / 10;
-      for (const j of v.jobs) if (j.startedAt && j.completedAt) log('time ' + j.name + ': starts +' + mins(new Date(t0).toISOString(), j.startedAt) + ' min, takes ' + mins(j.startedAt, j.completedAt) + ' min');
+      for (const j of v.jobs) if (j.startedAt && j.completedAt && j.conclusion !== 'skipped') log('time ' + j.name + ': starts +' + mins(new Date(t0).toISOString(), j.startedAt) + ' min, takes ' + mins(j.startedAt, j.completedAt) + ' min');
       const steps = v.jobs.flatMap((j) => (j.steps || []).filter((x) => x.startedAt && x.completedAt && !x.startedAt.startsWith('0001'))
         .map((x) => j.name + ' | ' + x.name + ' | ' + Math.round((Date.parse(x.completedAt) - Date.parse(x.startedAt)) / 1000) + ' s'));
       fs.writeFileSync(path.join(outDir, 'timings.txt'), steps.join('\n') + '\n');

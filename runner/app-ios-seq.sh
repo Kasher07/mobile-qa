@@ -7,8 +7,8 @@ set -uo pipefail
 APP=$(find "$APP_READY" -maxdepth 1 -name "*.app" | head -1)
 [ -n "$APP" ] || { echo "no prepared .app"; exit 1; }
 FLOWS="$APP_READY/.maestro"
-mapfile -t LIGHT < <(node -e 'for (const s of JSON.parse(process.env.SHARDS)) if (s.pass === "light" && /^[A-Za-z0-9._-]+$/.test(s.flow)) console.log(s.flow)')
-mapfile -t DARK < <(node -e 'for (const s of JSON.parse(process.env.SHARDS)) if (s.pass === "dark" && /^[A-Za-z0-9._-]+$/.test(s.flow)) console.log(s.flow)')
+LIGHT=($(node -e 'for (const s of JSON.parse(process.env.SHARDS)) if (s.pass === "light" && /^[A-Za-z0-9._-]+$/.test(s.flow)) console.log(s.flow)')) # macOS bash 3.2 has no mapfile; flow names have no spaces
+DARK=($(node -e 'for (const s of JSON.parse(process.env.SHARDS)) if (s.pass === "dark" && /^[A-Za-z0-9._-]+$/.test(s.flow)) console.log(s.flow)'))
 UDID=$(xcrun simctl list devices available -j | node -e '
   const j = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
   const rts = Object.keys(j).filter((k) => /iOS/.test(k)).sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
@@ -32,6 +32,7 @@ run_pass() { # $1 = light|dark, $2.. = flow names; one Maestro session, results 
   grep -E "^\[(Passed|Failed)\]" "$dir/maestro.log" | sed -E 's/ \(.*//' || true
   node runner/app-split-junit.mjs "$dir" "$pass" "$PWD/out" "$@"
 }
+[ ${#LIGHT[@]} -eq 0 ] && [ ${#DARK[@]} -eq 0 ] && { echo "no flows to run"; exit 1; }
 [ ${#LIGHT[@]} -gt 0 ] && run_pass light "${LIGHT[@]}"
 DATA=$(xcrun simctl get_app_container "$UDID" "$APP_ID" data 2>/dev/null)
 { du -sk "$APP" | awk '{print "app_kb=" $1}'
