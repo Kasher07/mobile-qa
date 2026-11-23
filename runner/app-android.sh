@@ -22,18 +22,16 @@ if [ "$PASS" = dark ]; then
 else
   adb shell cmd uimode night no
 fi
-# A cold emulator's launcher can raise "Pixel Launcher isn't responding" over the app (2026-11-23, and 2026-11-23
-# app-qa round 1). That dialog belongs to the emulator, not the app: answer "Wait" (BACK) whenever it holds the focus.
-( while true; do
-    if adb shell dumpsys window 2>/dev/null | grep -qE "mCurrentFocus=.*Application Not Responding"; then
-      adb shell input keyevent KEYCODE_BACK; echo "system ANR dialog dismissed" >> "$OUT/checks.txt"
-    fi
-    sleep 2
-  done ) &
-ANR_WATCH=$!
+# The emulator's launcher (Pixel Launcher on google_apis, Quickstep on AOSP) froze while the app was being installed
+# and raised "... isn't responding" over the app in 4 of 6 runs (2026-11-23). The flows never need a home screen:
+# switch the launchers off (a dialog of a stopped app goes with it) and hide system error dialogs. No watcher runs
+# during the flow: a second UiAutomation client would fight Maestro's.
+for pkg in com.android.launcher3 com.google.android.apps.nexuslauncher; do
+  adb shell pm disable-user --user 0 "$pkg" > /dev/null 2>&1 && echo "launcher off: $pkg" >> "$OUT/checks.txt"
+done
+adb shell settings put global hide_error_dialogs 1 > /dev/null 2>&1 || true
 status=0
 ( cd "$OUT" && maestro test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
-kill "$ANR_WATCH" 2>/dev/null || true
 adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID" | tail -200 > "$OUT/logcat-errors.txt" || true
 exit $status
