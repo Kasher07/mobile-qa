@@ -44,6 +44,21 @@ const passFile = (appId, platform) => path.join(cacheDir(appId), 'last-pass-' + 
 export function readLastPass(appId, platform) {
   try { return JSON.parse(fs.readFileSync(passFile(appId, platform), 'utf8')).files; } catch { return null; }
 }
+// A background iOS run in flight counts as covering its content for 90 minutes: a second call with the same files
+// (a commit's land check, a re-run) does not queue a duplicate Codemagic build. Removed when that run ends.
+const pendingFile = (appId) => path.join(cacheDir(appId), 'pending-ios.json');
+export function readPendingIos(appId) {
+  try {
+    const p = JSON.parse(fs.readFileSync(pendingFile(appId), 'utf8'));
+    return Date.now() - Date.parse(p.at) < 90 * 60000 ? p.files : null;
+  } catch { return null; }
+}
+export function writePendingIos(appId, files) {
+  fs.mkdirSync(cacheDir(appId), { recursive: true });
+  fs.writeFileSync(pendingFile(appId), JSON.stringify({ at: new Date().toISOString(), files }));
+}
+export function clearPendingIos(appId) { fs.rmSync(pendingFile(appId), { force: true }); }
+
 export function writeLastPass(appId, platform, files) {
   fs.mkdirSync(cacheDir(appId), { recursive: true });
   fs.writeFileSync(passFile(appId, platform), JSON.stringify({ at: new Date().toISOString(), files }));

@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { codemagic, codemagicConfig, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
-import { changedSince, readLastPass, selectFlows, snapshot, writeLastPass } from './app-qa-select.mjs';
+import { changedSince, readLastPass, readPendingIos, selectFlows, snapshot, writeLastPass, writePendingIos } from './app-qa-select.mjs';
 import { findShell, mediaHash, nativeFingerprint, shellKey, storeShell } from './app-qa-shell.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
@@ -104,7 +104,9 @@ const plan = {};
 for (const p of opts.platforms.split(',')) {
   if (opts.flows) plan[p] = toShards(opts.flows.split(','), opts.dark && opts.dark !== 'none' ? opts.dark.split(',') : []);
   else if (opts.changed) {
-    const sel = selectFlows(flowMap, changedSince(readLastPass(appId, p), current), flowNames, darkDefault);
+    const pending = p === 'ios' ? readPendingIos(appId) : null;
+    const sel = selectFlows(flowMap, changedSince(pending || readLastPass(appId, p), current), flowNames, darkDefault);
+    if (pending) sel.why += '; compared with the iOS run still in the background';
     if (opts.dark) sel.dark = opts.dark === 'none' ? [] : opts.dark.split(',');
     plan[p] = toShards(sel.light, sel.dark);
     log(p + ': ' + (plan[p].length ? plan[p].map((s) => (s.pass === 'dark' ? 'dark ' : '') + s.flow).join(', ') : 'nothing to run') + ' (' + sel.why.slice(0, 300) + ')');
@@ -276,6 +278,7 @@ try {
       await new Promise((ok, fail) => { child.once('spawn', ok); child.once('error', fail); });
       child.unref();
       handedOff = true;
+      if (savesSnapshot) writePendingIos(appId, current);
       try { gh(['release', 'edit', tag, '-R', REPO, '--title', tag + ' ios-background']); } catch { /* the lock then waits for it */ }
       log('iOS continues in the background; its result: ' + path.join(kitDir(), 'ios-results', rid) + ' (printed by the next app-qa call)');
     }

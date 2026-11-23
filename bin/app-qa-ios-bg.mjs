@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { codemagic, codemagicConfig, kitDir, makeLog, openArtifacts, summarize } from './app-qa-lib.mjs';
-import { writeLastPass } from './app-qa-select.mjs';
+import { clearPendingIos, writeLastPass } from './app-qa-select.mjs';
 import { storeShell } from './app-qa-shell.mjs';
 
 const stateFile = process.argv[2];
@@ -57,6 +57,7 @@ try {
 } catch (e) {
   log('error: ' + e.message);
 } finally {
+  clearPendingIos(st.appId);
   try { lines = fs.readFileSync(logFile, 'utf8').split('\n').filter((l) => /ios\/(light|dark)|no results|error/.test(l)); } catch { /* none */ }
   fs.writeFileSync(resultFile, JSON.stringify({ at: new Date().toISOString(), ok, outDir: st.outDir, flows: st.shards, lines, seen: false }, null, 1));
   log('iOS ' + (ok ? 'passed' : 'FAILED') + ' (results: ' + st.outDir + ')');
