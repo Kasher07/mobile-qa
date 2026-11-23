@@ -59,6 +59,11 @@ const flowsDark = opts.dark === 'none' ? '' : opts.dark || (opts.flows ? '' : da
 for (const f of [flowsLight, flowsDark].join(',').split(',').filter((x) => x && x !== '*')) {
   if (!flowNames.includes(f)) throw new Error('no flow .maestro/' + f + '.yaml');
 }
+// One job per flow and pass on each platform, run in parallel (shards).
+const shards = [
+  ...(flowsLight === '*' ? flowNames.sort() : flowsLight.split(',')).map((flow) => ({ flow, pass: 'light' })),
+  ...flowsDark.split(',').filter(Boolean).map((flow) => ({ flow, pass: 'dark' })),
+];
 const started = Date.now();
 const token = execFileSync('gh', ['auth', 'token', '--user', ACCOUNT], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const env = { ...process.env, GH_TOKEN: token };
@@ -159,7 +164,7 @@ try {
   gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
   dispatched = true;
   gh(['workflow', 'run', WORKFLOW, '-R', REPO, '-f', 'request_id=' + rid, '-f', 'asset_tag=' + tag, '-f', 'platforms=' + opts.platforms, '-f', 'app_id=' + appId, '-f', 'ios_runner=' + opts.iosRunner,
-    '-f', 'flows=' + flowsLight, '-f', 'flows_dark=' + flowsDark, '-f', 'reuse=' + reuse.join(',')]);
+    '-f', 'shards=' + JSON.stringify(shards), '-f', 'reuse=' + reuse.join(',')]);
   for (let t = 0; !runId && t < 24; t++) {
     await sleep(5000);
     runId = findRun();
@@ -197,44 +202,56 @@ try {
     await sleep(30000);
   }
   try { gh(['run', 'download', String(runId), '-R', REPO, '-D', outDir]); } catch (e) { log('download failed: ' + String(e.stderr || e.message).slice(0, 200)); code = 2; }
-  // Artifacts are sealed with this run's key: open them here.
-  for (const p of opts.platforms.split(',')) {
-    const sealed = path.join(outDir, p, p + '.enc');
-    if (!fs.existsSync(sealed)) continue;
-    const blob = fs.readFileSync(sealed);
+  // Artifacts are sealed with this run's key: open them here. gh puts each artifact in a folder named after it.
+  const openSealed = (file) => {
+    const blob = fs.readFileSync(file);
     const d = createDecipheriv('aes-256-gcm', key, blob.subarray(0, 12), { authTagLength: 16 });
     d.setAuthTag(blob.subarray(12, 28));
-    const tgz = path.join(outDir, p, p + '.tgz');
-    fs.writeFileSync(tgz, Buffer.concat([d.update(blob.subarray(28)), d.final()]));
-    fs.rmSync(sealed);
-    // Maestro names folders after the flows (Vietnamese): Windows' bsdtar cannot write those names, Git's GNU tar can.
-    // Relative paths and cwd keep GNU tar from reading "D:" as a remote host.
+    return Buffer.concat([d.update(blob.subarray(28)), d.final()]);
+  };
+  for (const name of fs.existsSync(outDir) ? fs.readdirSync(outDir) : []) {
+    const dir = path.join(outDir, name);
+    const m = /^(app|build|res)-(.+)$/.exec(name);
+    if (!m || !fs.statSync(dir).isDirectory()) continue;
+    const sealed = fs.readdirSync(dir).find((f) => f.endsWith('.enc'));
+    if (!sealed) { fs.rmSync(dir, { recursive: true, force: true }); continue; }
     try {
-      execFileSync(unpackTar, ['-xzf', p + '.tgz'], { cwd: path.join(outDir, p), stdio: ['ignore', 'pipe', 'pipe'] });
-      fs.rmSync(tgz);
+      const plain = openSealed(path.join(dir, sealed));
+      if (m[1] === 'app') {
+        // A fresh native build is kept on this machine for the next JS-only run; a repacked one is not.
+        const platform = m[2];
+        const tmpShell = path.join(work, 'shell-' + platform + '.tgz');
+        fs.writeFileSync(tmpShell, plain);
+        const kept = sk && !reuse.includes(platform) ? storeShell(appId, platform, sk, tmpShell) : null;
+        if (kept) log(platform + ': build kept for JS-only runs (' + Math.round(fs.statSync(kept).size / 1e6) + ' MB)');
+      } else {
+        // Maestro names folders after the flows (Vietnamese): Windows' bsdtar cannot write those names, Git's GNU tar
+        // can. Relative paths and cwd keep GNU tar from reading "D:" as a remote host.
+        const target = path.join(outDir, m[2]);
+        fs.mkdirSync(target, { recursive: true });
+        fs.writeFileSync(path.join(target, 'r.tgz'), plain);
+        execFileSync(unpackTar, ['-xzf', 'r.tgz'], { cwd: target, stdio: ['ignore', 'pipe', 'pipe'] });
+        fs.rmSync(path.join(target, 'r.tgz'));
+      }
     } catch (e) {
-      log(p + ': could not unpack (' + String(e.stderr || e.message).split('\n')[0].slice(0, 160) + '); the archive is kept: ' + tgz);
+      log(name + ': could not open (' + String(e.stderr || e.message).split('\n')[0].slice(0, 160) + ')');
     }
-    // A fresh native build is kept on this machine for the next JS-only run.
-    const built = path.join(outDir, p, 'shell.tgz');
-    if (fs.existsSync(built)) {
-      const kept = sk ? storeShell(appId, p, sk, built) : null;
-      if (kept) log(p + ': build kept for JS-only runs (' + Math.round(fs.statSync(kept).size / 1e6) + ' MB)');
-      else fs.rmSync(built, { force: true });
-    }
+    fs.rmSync(dir, { recursive: true, force: true });
   }
   if (code !== 0) {
     try { fs.writeFileSync(path.join(outDir, 'failed.log'), gh(['run', 'view', String(runId), '-R', REPO, '--log-failed'])); log('failed-step log: ' + path.join(outDir, 'failed.log')); } catch { /* none */ }
   }
   for (const p of opts.platforms.split(',')) {
-    const ck = path.join(outDir, p, 'checks.txt');
-    if (fs.existsSync(ck)) log(p + ' checks:\n' + fs.readFileSync(ck, 'utf8').trim());
-    for (const pass of ['light', 'dark-large']) {
-      const j = path.join(outDir, p, pass, 'junit.xml');
-      if (!fs.existsSync(j)) { if (pass === 'light' || flowsDark) log(p + '/' + pass + ': no results'); continue; }
+    let checked = false;
+    for (const sh of shards) {
+      const dir = path.join(outDir, p + '-' + sh.pass + '-' + sh.flow);
+      const ck = path.join(dir, 'checks.txt');
+      if (!checked && sh.pass === 'light' && fs.existsSync(ck)) { log(p + ' checks:\n' + fs.readFileSync(ck, 'utf8').trim()); checked = true; }
+      const j = path.join(dir, 'junit.xml');
+      if (!fs.existsSync(j)) { log(p + '/' + sh.pass + ' ' + sh.flow + ': no results'); continue; }
       const x = fs.readFileSync(j, 'utf8');
       const cases = [...x.matchAll(/<testcase[^>]*name="([^"]+)"[^>]*?(\/>|>([\s\S]*?)<\/testcase>)/g)];
-      for (const m of cases) log(p + '/' + pass + ': ' + (/<failure/.test(m[3] || '') ? 'FAIL ' : 'ok   ') + m[1] + (/<failure/.test(m[3] || '') ? ' - ' + (m[3].match(/message="([^"]*)"/)?.[1] || '').slice(0, 300) : ''));
+      for (const c of cases) log(p + '/' + sh.pass + ': ' + (/<failure/.test(c[3] || '') ? 'FAIL ' : 'ok   ') + c[1] + (/<failure/.test(c[3] || '') ? ' - ' + (c[3].match(/message="([^"]*)"/)?.[1] || '').slice(0, 300) : ''));
     }
   }
   log('results: ' + outDir + ' (' + Math.round((Date.now() - started) / 6000) / 10 + ' min)');

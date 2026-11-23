@@ -1,11 +1,11 @@
 name: app-qa
 run-name: ${{ inputs.request_id }}
 
-# Native app QA for KIT: builds an Expo app (release, no Metro) for the iOS Simulator (macOS runner) and the Android
-# emulator (Linux runner, KVM), then runs the app's own Maestro flows in light mode and again in dark mode with the
-# largest system font. The app source arrives as an AES-256-GCM encrypted release asset; the key is the repo secret
-# APP_QA_KEY. bin/app-qa.mjs uploads both, dispatches, downloads the results and then deletes the run, the release and
-# the key. Inputs reach scripts only through env. Actions are pinned to commit SHAs.
+# Native app QA for KIT. Per platform, one job prepares the release app (a fresh build, or for a JS-only change the
+# earlier build with a new Hermes bundle), then one job per flow runs it on its own simulator/emulator in parallel
+# (shards). The app source and every artifact are AES-256-GCM encrypted with the repo secret APP_QA_KEY.
+# bin/app-qa.mjs uploads the source, dispatches, downloads the results and then deletes the run, the release and the
+# key. Inputs reach scripts only through env. Actions are pinned to commit SHAs.
 on:
   workflow_dispatch:
     inputs:
@@ -30,13 +30,9 @@ on:
         default: macos-26
         type: choice
         options: [macos-26, macos-15]
-      flows:
-        description: Flows in light mode (names without .yaml, comma-separated; * = every flow)
-        default: '*'
-        type: string
-      flows_dark:
-        description: Flows again in dark mode with the largest text (empty = skip that pass)
-        default: ''
+      shards:
+        description: 'JSON list of {"flow": name without .yaml, "pass": light|dark}, one job each per platform'
+        required: true
         type: string
       reuse:
         description: Platforms whose earlier release build is reused (JS-only change; shell-<platform>.tgz.enc)
@@ -46,12 +42,9 @@ on:
 permissions:
   contents: read
 
-
 env:
   ASSET_TAG: ${{ inputs.asset_tag }}
   APP_ID: ${{ inputs.app_id }}
-  FLOWS_LIGHT: ${{ inputs.flows }}
-  FLOWS_DARK: ${{ inputs.flows_dark }}
   REUSE: ${{ inputs.reuse }}
   MAESTRO_VERSION: cli-2.12.1
   MAESTRO_SHA256: 54dbb0716425626604973cbb374c585ca30272375d9ce15177a1152765ddd9d7
@@ -60,13 +53,10 @@ env:
   CI: '1'
 
 jobs:
-  ios:
+  ios-app:
     if: contains(inputs.platforms, 'ios')
     runs-on: ${{ inputs.ios_runner || 'macos-26' }}
-    timeout-minutes: 90
-    env:
-      # The XCTest driver needs more than Maestro's default start time on a busy hosted Mac (seen 2026-11-18).
-      MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -103,35 +93,102 @@ jobs:
             -destination 'generic/platform=iOS Simulator' -derivedDataPath "$RUNNER_TEMP/dd" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/xcodebuild.log" 2>&1
           rc=$?; grep -E "BUILD (SUCCEEDED|FAILED)" "$RUNNER_TEMP/xcodebuild.log" | tail -1; exit $rc
+      - name: Seal the app for the flow jobs
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          APP=$(find "$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator" -maxdepth 1 -name "*.app" | head -1)
+          [ -n "$APP" ] || { echo "no .app"; exit 1; }
+          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APP")" "$(basename "$APP")"
+          node runner/app-crypt.mjs seal "$RUNNER_TEMP/app.tgz" sealed/app-ios.enc
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-ios
+          path: sealed/app-ios.enc
+          retention-days: 1
+          compression-level: 0
+      - name: Seal build logs
+        if: always()
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          mkdir -p out/build-ios && cp "$RUNNER_TEMP"/*.log out/build-ios/ 2>/dev/null || true
+          node runner/app-seal.mjs out/build-ios
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-ios
+          path: sealed/build-ios.enc
+          retention-days: 1
+          if-no-files-found: warn
+
+  ios-flow:
+    needs: ios-app
+    runs-on: ${{ inputs.ios_runner || 'macos-26' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.shards) }}
+    name: ios ${{ matrix.pass }} ${{ matrix.flow }}
+    env:
+      # The XCTest driver needs more than Maestro's default start time on a busy hosted Mac (seen 2026-11-18).
+      MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+      FLOW: ${{ matrix.flow }}
+      PASS: ${{ matrix.pass }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Boot the simulator early
+        run: |
+          UDID=$(xcrun simctl list devices available -j | node -e '
+            const j = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
+            const rts = Object.keys(j).filter((k) => /iOS/.test(k)).sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+            for (const rt of rts.reverse()) { const d = j[rt].find((x) => /^iPhone \d+( Pro)?$/.test(x.name)) || j[rt].find((x) => /^iPhone/.test(x.name)); if (d) { console.log(d.udid); break; } }')
+          xcrun simctl boot "$UDID" || true
+      - name: Fetch and decrypt the app source (flows)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: node runner/app-fetch.mjs
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: app-ios
+          path: sealed
+      - name: Open the prepared app
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          node runner/app-crypt.mjs open sealed/app-ios.enc "$RUNNER_TEMP/app.tgz"
+          mkdir -p "$RUNNER_TEMP/ready" && tar -xzf "$RUNNER_TEMP/app.tgz" -C "$RUNNER_TEMP/ready"
       - name: Install Maestro (pinned, sha256 checked)
         run: bash runner/app-maestro-install.sh
-      - name: Run flows on the iOS Simulator
+      - name: Run the flow on the iOS Simulator
         run: bash runner/app-ios.sh
       - name: Seal results
         if: always()
         env:
           APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
-        run: |
-          mkdir -p out/ios && cp "$RUNNER_TEMP"/*.log out/ios/ 2>/dev/null || true
-          node runner/app-seal.mjs out/ios
+        run: node runner/app-seal.mjs "out/ios-$PASS-$FLOW"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ios
-          path: sealed/ios.enc
+          name: res-ios-${{ matrix.pass }}-${{ matrix.flow }}
+          path: sealed/ios-${{ matrix.pass }}-${{ matrix.flow }}.enc
           retention-days: 1
-          overwrite: true
           if-no-files-found: warn
 
-  android:
+  android-app:
     if: contains(inputs.platforms, 'android')
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - name: Free disk space (Gradle + emulator need ~25 GB)
+      - name: Free disk space (Gradle needs room)
+        if: ${{ !contains(inputs.reuse, 'android') }}
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL || true
           df -h /
@@ -164,6 +221,70 @@ jobs:
         run: |
           ./gradlew assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon --console=plain > "$RUNNER_TEMP/gradle.log" 2>&1
           rc=$?; grep -E "BUILD (SUCCESSFUL|FAILED)" "$RUNNER_TEMP/gradle.log" | tail -1; exit $rc
+      - name: Seal the app for the flow jobs
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          APK=$(ls app/android/app/build/outputs/apk/release/*.apk | head -1)
+          [ -n "$APK" ] || { echo "no APK"; exit 1; }
+          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APK")" "$(basename "$APK")"
+          node runner/app-crypt.mjs seal "$RUNNER_TEMP/app.tgz" sealed/app-android.enc
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: app-android
+          path: sealed/app-android.enc
+          retention-days: 1
+          compression-level: 0
+      - name: Seal build logs
+        if: always()
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          mkdir -p out/build-android && cp "$RUNNER_TEMP"/*.log out/build-android/ 2>/dev/null || true
+          node runner/app-seal.mjs out/build-android
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-android
+          path: sealed/build-android.enc
+          retention-days: 1
+          if-no-files-found: warn
+
+  android-flow:
+    needs: android-app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.shards) }}
+    name: android ${{ matrix.pass }} ${{ matrix.flow }}
+    env:
+      FLOW: ${{ matrix.flow }}
+      PASS: ${{ matrix.pass }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Fetch and decrypt the app source (flows)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: node runner/app-fetch.mjs
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: app-android
+          path: sealed
+      - name: Open the prepared app
+        env:
+          APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
+        run: |
+          node runner/app-crypt.mjs open sealed/app-android.enc "$RUNNER_TEMP/app.tgz"
+          mkdir -p "$RUNNER_TEMP/ready" && tar -xzf "$RUNNER_TEMP/app.tgz" -C "$RUNNER_TEMP/ready"
       - name: Install Maestro (pinned, sha256 checked)
         run: bash runner/app-maestro-install.sh
       - name: Enable KVM
@@ -171,7 +292,7 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - name: Run flows on the Android emulator
+      - name: Run the flow on the Android emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 35
@@ -186,14 +307,11 @@ jobs:
         if: always()
         env:
           APP_QA_KEY: ${{ secrets.APP_QA_KEY }}
-        run: |
-          mkdir -p out/android && cp "$RUNNER_TEMP"/*.log out/android/ 2>/dev/null || true
-          node runner/app-seal.mjs out/android
+        run: node runner/app-seal.mjs "out/android-$PASS-$FLOW"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: android
-          path: sealed/android.enc
+          name: res-android-${{ matrix.pass }}-${{ matrix.flow }}
+          path: sealed/android-${{ matrix.pass }}-${{ matrix.flow }}.enc
           retention-days: 1
-          overwrite: true
           if-no-files-found: warn
