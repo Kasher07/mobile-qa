@@ -203,6 +203,12 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 26
+      # ~/.npm holds only public registry tarballs (keyed by the OS: the app's lockfile is encrypted until fetched).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: npm-${{ runner.os }}-
       - name: Fetch and decrypt the app
         env:
           GH_TOKEN: ${{ github.token }}
@@ -211,7 +217,7 @@ jobs:
         run: node runner/app-fetch.mjs
       - name: Install dependencies
         working-directory: app
-        run: npm ci --no-audit --no-fund --loglevel=error
+        run: npm ci --no-audit --no-fund --loglevel=error --prefer-offline
       - name: Reuse the earlier build, rebuild only the JS
         if: contains(inputs.reuse, 'android')
         run: bash runner/app-js-android.sh
@@ -295,6 +301,29 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      # A booted clean emulator (system image only, nothing of the app) saved once and restored by every flow job:
+      # resumes in seconds instead of a ~1 min cold boot (pattern from the android-emulator-runner docs).
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: avd
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-35-default-x86_64-pixel_7-c4-r4096
+      - name: Create the emulator snapshot (first run only)
+        if: steps.avd.outputs.cache-hit != 'true'
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 35
+          target: default
+          arch: x86_64
+          profile: pixel_7
+          cores: 4
+          ram-size: 4096M
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: false
+          script: echo "emulator snapshot created"
       - name: Run the flow on the Android emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
