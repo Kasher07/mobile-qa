@@ -1,0 +1,68 @@
+# iOS side of app-qa on a Codemagic Mac mini M2 (free personal plan: 500 min/month, one build at a time). Started only
+# through the Codemagic API by bin/app-qa.mjs, with ASSET_TAG, APP_ID, APP_QA_KEY, REUSE and SHARDS as build
+# variables. Same recipe and encryption as .github/workflows/app-qa.yml, but every iOS flow runs on one simulator in
+# one Maestro session: a GitHub shard paid ~9 min of Mac setup, boot and driver start per flow (2026-11-23).
+workflows:
+  app-qa-ios:
+    name: app-qa iOS
+    instance_type: mac_mini_m2
+    max_build_duration: 40
+    environment:
+      xcode: latest
+      node: 22
+      vars:
+        QA_REPO: Kasher07/mobile-qa
+        MAESTRO_VERSION: cli-2.12.1
+        MAESTRO_SHA256: 54dbb0716425626604973cbb374c585ca30272375d9ce15177a1152765ddd9d7
+        MAESTRO_CLI_NO_ANALYTICS: '1'
+        MAESTRO_DRIVER_STARTUP_TIMEOUT: '300000'
+        EXPO_NO_TELEMETRY: '1'
+        CI: '1'
+    scripts:
+      - name: Fetch and decrypt the app
+        script: |
+          set -euo pipefail
+          echo "RUNNER_TEMP=/tmp/qa" >> "$CM_ENV"
+          mkdir -p /tmp/qa
+          RUNNER_TEMP=/tmp/qa SHELL_PLATFORM=ios node runner/app-fetch.mjs
+      - name: Boot the simulator early
+        script: |
+          UDID=$(xcrun simctl list devices available -j | node -e '
+            const j = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
+            const rts = Object.keys(j).filter((k) => /iOS/.test(k)).sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+            for (const rt of rts.reverse()) { const d = j[rt].find((x) => /^iPhone \d+( Pro)?$/.test(x.name)) || j[rt].find((x) => /^iPhone/.test(x.name)); if (d) { console.log(d.udid); break; } }')
+          xcrun simctl boot "$UDID" || true
+      - name: Install dependencies
+        script: cd app && npm ci --no-audit --no-fund --loglevel=error
+      - name: Prepare the app (JS repack or native build)
+        script: |
+          set -euo pipefail
+          if [[ ",${REUSE:-}," == *",ios,"* ]]; then
+            bash runner/app-js-ios.sh
+          else
+            ( cd app && npx expo prebuild --platform ios --no-install > "$RUNNER_TEMP/prebuild.log" 2>&1 )
+            ( cd app/ios && pod install > "$RUNNER_TEMP/pods.log" 2>&1 )
+            ( cd app/ios && WS=$(ls -d *.xcworkspace | head -1) && xcodebuild -workspace "$WS" -scheme "${WS%.xcworkspace}" \
+                -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+                -derivedDataPath "$RUNNER_TEMP/dd" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+                COMPILER_INDEX_STORE_ENABLE=NO build > "$RUNNER_TEMP/xcodebuild.log" 2>&1 )
+          fi
+          APP=$(find "$RUNNER_TEMP/dd/Build/Products/Release-iphonesimulator" -maxdepth 1 -name "*.app" | head -1)
+          tar -czf "$RUNNER_TEMP/app.tgz" -C "$(dirname "$APP")" "$(basename "$APP")" -C "$PWD/app" .maestro
+          node runner/app-crypt.mjs seal "$RUNNER_TEMP/app.tgz" sealed/app-ios.enc
+          mkdir -p "$RUNNER_TEMP/ready" && tar -xzf "$RUNNER_TEMP/app.tgz" -C "$RUNNER_TEMP/ready"
+      - name: Install Maestro (pinned, sha256 checked)
+        script: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/mobile-dev-inc/maestro/releases/download/$MAESTRO_VERSION/maestro.zip" -o "$RUNNER_TEMP/maestro.zip"
+          echo "$MAESTRO_SHA256  $RUNNER_TEMP/maestro.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/maestro.zip" -d "$RUNNER_TEMP"
+      - name: Run the flows on one iOS Simulator
+        ignore_failure: true
+        script: PATH="$RUNNER_TEMP/maestro/bin:$PATH" APP_READY="$RUNNER_TEMP/ready" bash runner/app-ios-seq.sh
+      - name: Seal results
+        script: |
+          mkdir -p out/build-ios && cp "$RUNNER_TEMP"/*.log out/build-ios/ 2>/dev/null || true
+          for d in out/*/; do node runner/app-seal.mjs "${d%/}"; done
+    artifacts:
+      - sealed/*.enc

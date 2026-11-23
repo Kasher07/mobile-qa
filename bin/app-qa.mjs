@@ -25,7 +25,7 @@ const log = (s) => console.log('[app-qa] ' + s);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function parseArgs(argv) {
-  const o = { app: null, platforms: 'ios,android', out: null, appId: null, keep: false, iosRunner: 'macos-26', flows: null, dark: null, full: false };
+  const o = { app: null, platforms: 'ios,android', out: null, appId: null, keep: false, iosRunner: 'macos-26', flows: null, dark: null, full: false, iosOn: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--app') o.app = argv[++i];
@@ -37,6 +37,7 @@ function parseArgs(argv) {
     else if (a === '--flows') o.flows = argv[++i];
     else if (a === '--dark') o.dark = argv[++i];
     else if (a === '--full') o.full = true;
+    else if (a === '--ios-on') o.iosOn = argv[++i];
     else throw new Error('unknown option ' + a);
   }
   if (!o.app) throw new Error('--app <expo project dir> is required');
@@ -65,6 +66,23 @@ const shards = [
   ...flowsDark.split(',').filter(Boolean).map((flow) => ({ flow, pass: 'dark' })),
 ];
 const started = Date.now();
+
+// ---- iOS on Codemagic (Mac mini M2, free 500 min/month, one build at a time): faster than GitHub's free Mac for a
+// sequential iOS session. Token: CODEMAGIC_TOKEN or %LOCALAPPDATA%/kit-app-qa/codemagic.token; app id in codemagic.json
+// there (created for the public repo). --ios-on github forces the GitHub shards.
+const cmDir = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), '.cache'), 'kit-app-qa');
+const cmToken = process.env.CODEMAGIC_TOKEN || (fs.existsSync(path.join(cmDir, 'codemagic.token')) ? fs.readFileSync(path.join(cmDir, 'codemagic.token'), 'utf8').trim() : '');
+const cmConf = fs.existsSync(path.join(cmDir, 'codemagic.json')) ? JSON.parse(fs.readFileSync(path.join(cmDir, 'codemagic.json'), 'utf8')) : null;
+const useCm = opts.platforms.includes('ios') && opts.iosOn !== 'github' && !!cmToken && !!cmConf?.appId;
+if (opts.iosOn === 'codemagic' && !useCm) throw new Error('--ios-on codemagic needs the Codemagic token and app id in ' + cmDir);
+const ghPlatforms = opts.platforms.split(',').filter((p) => !(p === 'ios' && useCm)).join(',');
+const cmApi = async (method, url, body) => {
+  const r = await fetch('https://api.codemagic.io' + url, { method, headers: { 'x-auth-token': cmToken, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  if (!r.ok) throw new Error('Codemagic ' + method + ' ' + url + ': HTTP ' + r.status + ' ' + (await r.text()).slice(0, 200));
+  return r.json();
+};
+let cmBuildId = null;
+let cmFinished = false;
 const token = execFileSync('gh', ['auth', 'token', '--user', ACCOUNT], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const env = { ...process.env, GH_TOKEN: token };
 const gh = (args, o = {}) => execFileSync('gh', args, { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20, ...o });
@@ -137,6 +155,7 @@ const findRun = () => JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, 
 let cleaning = null;
 function cleanup() {
   cleaning ??= (async () => {
+    if (cmBuildId && !cmFinished) { try { await cmApi('POST', '/builds/' + cmBuildId + '/cancel'); log('Codemagic build cancelled'); } catch { /* finished or gone */ } }
     if (!runId && dispatched) { try { runId = findRun(); } catch { /* below */ } }
     if (runId && !opts.keep) {
       try {
@@ -157,13 +176,50 @@ function cleanup() {
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, () => { log('interrupted, cleaning up'); cleanup().finally(() => process.exit(2)); });
 
+async function runCodemagic() {
+  const b = await cmApi('POST', '/builds', { appId: cmConf.appId, workflowId: cmConf.workflowId || 'app-qa-ios', branch: 'main',
+    environment: { variables: { ASSET_TAG: tag, APP_ID: appId, APP_QA_KEY: key.toString('hex'), REUSE: reuse.join(','), SHARDS: JSON.stringify(shards) } } });
+  cmBuildId = b.buildId;
+  log('ios on Codemagic M2: https://codemagic.io/app/' + cmConf.appId + '/build/' + cmBuildId);
+  let last = '';
+  const t0 = Date.now();
+  const deadline = Date.now() + 60 * 60000;
+  for (;;) {
+    let build;
+    try { build = (await cmApi('GET', '/builds/' + cmBuildId)).build; } catch (e) { log(String(e.message).slice(0, 160)); await sleep(20000); continue; }
+    const step = (build.buildActions || []).find((a) => a.status === 'building')?.name;
+    const line = 'ios (Codemagic): ' + build.status + (step ? ' (' + step + ')' : '');
+    if (line !== last) { log(line); last = line; }
+    if (['finished', 'failed', 'canceled', 'timeout', 'skipped'].includes(build.status)) {
+      cmFinished = true;
+      log('time ios (Codemagic): takes ' + Math.round((Date.now() - t0) / 6000) / 10 + ' min');
+      for (const a of build.buildActions || []) if (a.startedAt && a.finishedAt) log('time ios | ' + a.name + ' | ' + Math.round((Date.parse(a.finishedAt) - Date.parse(a.startedAt)) / 1000) + ' s');
+      for (const art of build.artefacts || []) {
+        const m = /^(app|build)-ios\.enc$/.exec(art.name) || /^(ios-.+)\.enc$/.exec(art.name);
+        if (!m) continue;
+        const folder = m[1] === 'app' || m[1] === 'build' ? m[1] + '-ios' : 'res-' + m[1];
+        const r = await fetch(art.url, { headers: { 'x-auth-token': cmToken } });
+        if (!r.ok) { log('could not download ' + art.name + ': HTTP ' + r.status); continue; }
+        fs.mkdirSync(path.join(outDir, folder), { recursive: true });
+        fs.writeFileSync(path.join(outDir, folder, art.name), Buffer.from(await r.arrayBuffer()));
+      }
+      return build.status === 'finished' ? 0 : 1;
+    }
+    if (Date.now() > deadline) throw new Error('Codemagic build timed out');
+    await sleep(20000);
+  }
+}
+
 let code = 2;
 try {
   sweepAndLock();
   setKey(key.toString('hex'));
   gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
+  const cmDone = useCm ? runCodemagic().catch((e) => { log('Codemagic: ' + e.message); return 2; }) : null;
+  if (!ghPlatforms) code = 0;
+  if (ghPlatforms) {
   dispatched = true;
-  gh(['workflow', 'run', WORKFLOW, '-R', REPO, '-f', 'request_id=' + rid, '-f', 'asset_tag=' + tag, '-f', 'platforms=' + opts.platforms, '-f', 'app_id=' + appId, '-f', 'ios_runner=' + opts.iosRunner,
+  gh(['workflow', 'run', WORKFLOW, '-R', REPO, '-f', 'request_id=' + rid, '-f', 'asset_tag=' + tag, '-f', 'platforms=' + ghPlatforms, '-f', 'app_id=' + appId, '-f', 'ios_runner=' + opts.iosRunner,
     '-f', 'shards=' + JSON.stringify(shards), '-f', 'reuse=' + reuse.join(',')]);
   for (let t = 0; !runId && t < 24; t++) {
     await sleep(5000);
@@ -209,6 +265,8 @@ try {
     await sleep(30000);
   }
   try { gh(['run', 'download', String(runId), '-R', REPO, '-D', outDir]); } catch (e) { log('download failed: ' + String(e.stderr || e.message).slice(0, 200)); code = 2; }
+  }
+  if (cmDone) code = Math.max(code, await cmDone);
   // Artifacts are sealed with this run's key: open them here. gh puts each artifact in a folder named after it.
   const openSealed = (file) => {
     const blob = fs.readFileSync(file);
@@ -255,9 +313,10 @@ try {
       const ck = path.join(dir, 'checks.txt');
       if (!checked && sh.pass === 'light' && fs.existsSync(ck)) { log(p + ' checks:\n' + fs.readFileSync(ck, 'utf8').trim()); checked = true; }
       const j = path.join(dir, 'junit.xml');
-      if (!fs.existsSync(j)) { log(p + '/' + sh.pass + ' ' + sh.flow + ': no results'); continue; }
+      if (!fs.existsSync(j)) { log(p + '/' + sh.pass + ' ' + sh.flow + ': no results'); code = Math.max(code, 1); continue; }
       const x = fs.readFileSync(j, 'utf8');
       const cases = [...x.matchAll(/<testcase[^>]*name="([^"]+)"[^>]*?(\/>|>([\s\S]*?)<\/testcase>)/g)];
+      if (cases.some((c) => /<failure/.test(c[3] || ''))) code = Math.max(code, 1);
       for (const c of cases) log(p + '/' + sh.pass + ': ' + (/<failure/.test(c[3] || '') ? 'FAIL ' : 'ok   ') + c[1] + (/<failure/.test(c[3] || '') ? ' - ' + (c[3].match(/message="([^"]*)"/)?.[1] || '').slice(0, 300) : ''));
     }
   }

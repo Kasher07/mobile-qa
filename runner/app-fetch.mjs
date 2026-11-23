@@ -12,8 +12,12 @@ if (!/^app-qa-[A-Za-z0-9-]{4,80}$/.test(tag)) throw new Error('bad ASSET_TAG');
 if (!/^[0-9a-f]{64}$/.test(keyHex)) throw new Error('APP_QA_KEY missing or malformed');
 const tmp = process.env.RUNNER_TEMP || '.';
 
+const repo = process.env.GITHUB_REPOSITORY || process.env.QA_REPO || '';
+if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo)) throw new Error('bad repository');
 function fetchDecrypted(asset) {
-  execFileSync('gh', ['release', 'download', tag, '-R', process.env.GITHUB_REPOSITORY, '-p', asset, '-D', tmp, '--clobber'], { stdio: 'inherit' });
+  // GitHub runners use gh; elsewhere (Codemagic) the release of the public repo is fetched over HTTPS.
+  if (process.env.GH_TOKEN) execFileSync('gh', ['release', 'download', tag, '-R', repo, '-p', asset, '-D', tmp, '--clobber'], { stdio: 'inherit' });
+  else execFileSync('curl', ['-fsSL', '--retry', '3', '-o', tmp + '/' + asset, 'https://github.com/' + repo + '/releases/download/' + tag + '/' + asset], { stdio: 'inherit' });
   const blob = fs.readFileSync(tmp + '/' + asset);
   if (blob.length < 29) throw new Error(asset + ' is truncated');
   const d = createDecipheriv('aes-256-gcm', Buffer.from(keyHex, 'hex'), blob.subarray(0, 12), { authTagLength: 16 });
