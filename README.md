@@ -22,7 +22,8 @@ kit-qa exec <site> -- node bin/mobile-qa.mjs --private --steps flows.json     # 
 **Flows run on Android only unless you ask for iOS**: with `--steps` the default platform is Android; `--platforms ios,android` (or `ios`) must be
 stated explicitly, and the summary says "iOS was not asked" otherwise (plain URL mode keeps its ios,android default). iOS is slow on the hosted
 Macs, its guard is only a page script and it failed 3 of 3 flows in the first real pilot. Several `--steps` files can be given in one call (their
-flows are merged; the caps below apply to the total).
+flows are merged; the caps below apply to the total). **The `allowWrites` / `allowPost` of a file apply to that file's flows only**; the `--allow-writes` /
+`--allow-post` flags are call-wide (printed as such) and apply to every flow; the 5-path cap counts the union.
 
 A flow file holds up to 6 flows (name, `start` URL or, with `--private`, a path on the site, up to 60 steps, `examples/flows.json` is a
 working one). A step is an object with one action key; a screenshot of the whole device screen (browser bars and the on-screen keyboard
@@ -43,7 +44,9 @@ when it is up) is taken after every step and on a failure.
 
 Selectors are plain CSS only (no `text=`, `xpath=`, `>>`, `:has-text`: they would not mean the same on Safari); selectors and texts are data
 handed to Playwright's locator or WebDriver's find-element, never evaluated as code. Limits: 30 s per step (the step itself; its screenshot has its own cap), 4 min per flow, 60 steps,
-6 flows, the file at most 20 kB (bytes). If Chrome closes its tab or refuses a new target while a flow starts ("Target.createTarget: Not supported", seen in the first pilot; cause not proven, a launch right after the previous Chrome context closed is the suspect), the flow is retried ONCE on a fresh browser and the summary carries a "RETRIED ONCE" note: never silent. A step that times out closes its page and is waited for, so it cannot act on the next flow;
+6 flows, the file at most 20 kB (bytes). If Chrome closes its tab or refuses a new target while a flow starts ("Target.createTarget: Not supported", seen in the first pilot; cause not proven, a launch right after the previous Chrome context closed is the suspect), the flow is retried ONCE on a fresh browser and the summary carries a "RETRIED ONCE" note with the first attempt's blocked/allowed counts next to the second's: never silent.
+**A flow that allows any POST (`allowWrites` or `allowPost`) is never retried**: loading its page again could send a POST twice; it fails with the launch error and says so.
+A failed flow still lists the allowed POSTs it made and the requests it blocked up to the failure A step that times out closes its page and is waited for, so it cannot act on the next flow;
 a run that returns fewer flow results than asked is an issue (exit 1). A failed step or `expect` stops its flow, is an issue (exit 1) and keeps its screenshot; the layout probe
 (overflow, tap targets) also runs on each flow's end state. Output: `<out>/<run>/<platform>/flows/<name>/summary.md` (each step's result,
 time, how it was done, screenshot) plus the screenshots next to it.
@@ -77,8 +80,10 @@ error state and nothing behind them can be reached. `"allowPost": ["/api/rpc"]` 
 requests through to those paths only: **same origin as the flow's start page, exact path (no wildcards; a query does not matter), POST only (PUT, PATCH and
 DELETE stay blocked), at most 5 paths**. Every allowed request is counted and listed by path in the flow summary, the list is printed at the start of the
 run, and it is refused when the session is write-protected (a minted session, `KITQA_NO_WRITES`), exactly like `allowWrites`. In public mode the paths
-travel in the public input and go through the secret-looking check. On iOS the page-script guard applies the same list (requests the page makes while it
-loads are not seen there, so they are neither blocked nor counted). **This is for RPC-style reads only: a path whose POST can change data must never be
+travel in the public input and go through the secret-looking check. On iOS the page-script guard applies the same list, resolving URLs against `document.baseURI` as the browser does (requests the page makes while it
+loads are not seen there, so they are neither blocked nor counted; **iOS counts are a lower bound**: counts are read while a step settles, a document that is replaced
+between two reads takes its last requests with it). Only fetch/XHR-type requests on a listed path pass, on both platforms: a form POST, a beacon or a navigation to
+a listed path stays blocked. `/`, dot segments and percent-encoded dots or slashes are refused as paths. **This is for RPC-style reads only: a path whose POST can change data must never be
 listed**, and a path that carries both reads and writes (one endpoint, the action in the body) cannot be listed at all, because the match is by path. The
 caller reads the repo's handler first and says in the report which handler each path is. Fixture: `examples/read-post.json` (content loaded by POST
 passes, another POST on the page stays blocked) against `examples/read-post-blocked.json` (the same page without the list shows its error).

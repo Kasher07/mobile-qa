@@ -392,10 +392,10 @@ if (FLOWS && FLOWS.noWrites) {
         await sleep(2000);
         if (PRIV) await waitSettled(() => exec('return (' + settleProbe.toString() + ')();'), sleep);
       };
-      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: FLOWS.allowWrites, allowPost: FLOWS.allowPost, afterStart };
+      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: flow.allowWrites, allowPost: flow.allowPost, afterStart };
       r = await runFlowIos(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
     } catch (e) {
-      r = { name: flow.name, start: flow.startShown, status: 'failed', error: String((e && e.message) || e).split('\n')[0].slice(0, 300), steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 };
+      r = { name: flow.name, start: flow.startShown, status: 'failed', error: String((e && e.message) || e).split('\n')[0].slice(0, 300), steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: flow.allowWrites || null, allowPost: flow.allowPost || [], postsAllowed: [], ms: 0 };
     }
     results.flows.push(r);
     saveResults(OUT, results);

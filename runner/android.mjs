@@ -22,6 +22,7 @@ const FLOWS = loadRunnerFlows({ publicJson: PRIV ? '' : process.env.FLOWS, priva
 const blocked = [];
 const allowedPosts = []; // paths of the POSTs that the allowPost list let through (flows only)
 let flowAllow = null; // { origin, paths } of the flow that is running
+let flowOpen = false; // the running flow's file said allowWrites: the guard lets everything through for it
 const MAX_SEG = maxSegments();
 const results = { platform: 'android', device: null, browser: null, mode: 'playwright-android', notes: [], pages: [] };
 
@@ -63,7 +64,7 @@ let guardError = null;
 // request to ANY origin, public runs included, and closes every WebSocket.
 async function launch(kind = 'pages') {
   const flowKind = kind === 'flow';
-  const guarded = flowKind ? !FLOWS.allowWrites : !!PRIV;
+  const guarded = flowKind ? true : !!PRIV; // flows: the guard is always installed, a flow that allows writes just opens it while it runs (flowOpen)
   const ctx = await device.launchBrowser(PRIV || flowKind ? { serviceWorkers: 'block', args: ['--disable-features=Translate,TranslateUI'] } : undefined);
   if (!PRIV && !guarded) return ctx;
   try {
@@ -74,8 +75,10 @@ async function launch(kind = 'pages') {
     }
     await ctx.route('**/*', (route) => {
       const req = route.request();
-      // Read-style POSTs the caller listed (exact path, this flow's own origin, POST only): let through and counted.
-      if (flowKind && flowAllow && postAllowed({ method: req.method(), url: req.url() }, flowAllow)) {
+      if (flowKind && flowOpen) return route.continue(); // this flow's file said allowWrites
+      // Read-style POSTs the caller listed (exact path, this flow's own origin, POST only, fetch/XHR requests only: a form
+      // navigation or a beacon to a listed path stays blocked, like on iOS): let through and counted.
+      if (flowKind && flowAllow && ['fetch', 'xhr'].includes(req.resourceType()) && postAllowed({ method: req.method(), url: req.url() }, flowAllow)) {
         allowedPosts.push(new URL(req.url()).pathname);
         return route.continue();
       }
@@ -95,6 +98,10 @@ async function launch(kind = 'pages') {
   }
   try {
     const closeWs = (ws) => {
+      if (flowKind && flowOpen) {
+        ws.connectToServer();
+        return;
+      }
       blocked.push('WEBSOCKET');
       ws.close().catch(() => {});
     };
@@ -287,7 +294,8 @@ if (FLOWS) {
     }
   };
   await startFlowContext();
-  const failedFlow = (flow, msg) => ({ name: flow.name, start: flow.startShown, status: 'failed', error: msg, steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 });
+  // A failed flow still reports every POST it allowed and every request it blocked up to the failure (marks = counts before it started).
+  const failedFlow = (flow, msg, m0) => ({ name: flow.name, start: flow.startShown, status: 'failed', error: msg, steps: [], blocked: m0 ? blocked.slice(m0.blocked) : [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: flow.allowWrites || null, allowPost: flow.allowPost || [], postsAllowed: m0 ? allowedPosts.slice(m0.allowed) : [], ms: 0 });
   const runOne = async (flow) => {
     if (Date.now() - STARTED > JOB_BUDGET_MS) throw new Error('not run: the job time budget was used up');
     if (flowLaunchError) throw new Error(flowLaunchError);
@@ -297,12 +305,13 @@ if (FLOWS) {
     prev.close({ runBeforeUnload: false }).catch(() => {});
     page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
     const marks = { blocked: blocked.length, allowed: allowedPosts.length }; // requests of the page load count for this flow too
-    flowAllow = (FLOWS.allowPost || []).length ? { origin: new URL(flow.start).origin, paths: FLOWS.allowPost } : null;
+    flowOpen = !!flow.allowWrites;
+    flowAllow = (flow.allowPost || []).length ? { origin: new URL(flow.start).origin, paths: flow.allowPost } : null;
     await gotoOnce(flow.start);
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(1200);
     if (PRIV) await waitSettled(() => page.evaluate(settleProbe), (ms) => page.waitForTimeout(ms));
-    const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: FLOWS.allowWrites, allowPost: FLOWS.allowPost, allowedPosts, marks, guardActive: !guardError, cal: null };
+    const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: flow.allowWrites, allowPost: flow.allowPost, allowedPosts, marks, guardActive: !guardError, cal: null };
     return runFlowAndroid(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
   };
   // Chrome on the emulator sometimes closes its tab or refuses new targets while a flow starts: ONE explicit retry on a fresh
@@ -311,21 +320,27 @@ if (FLOWS) {
   for (const [fi, flow] of FLOWS.flows.entries()) {
     console.log('[flow ' + (fi + 1) + '/' + FLOWS.flows.length + ']' + (PRIV ? '' : ' ' + flow.name));
     let r;
+    const m0 = { blocked: blocked.length, allowed: allowedPosts.length };
     try {
       r = await runOne(flow);
     } catch (e) {
       const first = String((e && e.message) || e).split('\n')[0].slice(0, 200);
-      if (!BROWSER_GONE.test(first) || Date.now() - STARTED > JOB_BUDGET_MS) r = failedFlow(flow, first.slice(0, 300));
-      else {
+      const opensPost = !!flow.allowWrites || (flow.allowPost || []).length > 0;
+      if (!BROWSER_GONE.test(first) || Date.now() - STARTED > JOB_BUDGET_MS) r = failedFlow(flow, first.slice(0, 300), m0);
+      else if (opensPost) {
+        // A retry loads the start page again: a POST the page makes on load could be sent twice. Never retried.
+        r = failedFlow(flow, first.slice(0, 200) + ' (NOT retried: this flow allows POST requests, and loading the page again could send one twice)', m0);
+      } else {
         console.log('    retrying the flow once on a fresh browser');
+        const firstCounts = { blocked: blocked.slice(m0.blocked), allowed: allowedPosts.slice(m0.allowed) };
         await withTimeout(context.close(), 20000, 'close').catch(() => {});
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((res) => setTimeout(res, 2000));
         await startFlowContext();
         try {
           r = await runOne(flow);
-          r.notes = [...(r.notes || []), 'RETRIED ONCE on a fresh browser after: ' + first];
+          r.notes = [...(r.notes || []), 'RETRIED ONCE on a fresh browser after: ' + first + '. First attempt: ' + firstCounts.blocked.length + ' request(s) blocked' + (firstCounts.blocked.length ? ' (' + firstCounts.blocked.slice(0, 4).join(', ') + ')' : '') + ', ' + firstCounts.allowed.length + ' allowed POST(s); the counts above are the second attempt'];
         } catch (e2) {
-          r = failedFlow(flow, 'failed twice. first: ' + first + ' | retry: ' + String((e2 && e2.message) || e2).split('\n')[0].slice(0, 120));
+          r = failedFlow(flow, 'failed twice. first: ' + first + ' | retry: ' + String((e2 && e2.message) || e2).split('\n')[0].slice(0, 120), m0);
         }
       }
     }

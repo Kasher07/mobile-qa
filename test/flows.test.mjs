@@ -441,6 +441,7 @@ test('allowPost matcher: exact path, own origin, POST only', () => {
 test('iOS guard with an allow-list: the listed POST passes and is counted, others stay blocked', async () => {
   const { g, sent } = pageLike();
   g.location = { href: 'https://app.example.com/page' };
+  g.document.baseURI = 'https://app.example.com/page';
   g.URL = URL;
   const allow = { origin: 'https://app.example.com', paths: ['/api/rpc'] };
   const run = (key = KEY) => JSON.parse(JSON.stringify(vm.runInNewContext('(function(){' + guardSource(key, allow) + '})()', g)));
@@ -469,12 +470,16 @@ test('several --steps files: flows are merged, the caps apply to the total, allo
   const c = w('c.json', { flows: [one('c1'), one('c2'), one('c3')] });
   const r = readFlows([a, b], { allowPost: ['/p3', '/p1'] });
   assert.deepEqual(r.flows.map((x) => x.name), ['a1', 'a2', 'a3', 'b1', 'b2']);
-  assert.deepEqual(r.allowPost, ['/p1', '/p2', '/p3']);
+  assert.deepEqual([...r.allowPost].sort(), ['/p1', '/p2', '/p3'], 'the union over the call');
+  assert.deepEqual(r.flows.find((x) => x.name === 'a1').allowPost.sort(), ['/p1', '/p3'], 'file a: its own list plus the call-wide flag');
+  assert.deepEqual(r.flows.find((x) => x.name === 'b1').allowPost.sort(), ['/p1', '/p2', '/p3'], 'file b: its own list plus the call-wide flag');
   assert.throws(() => readFlows([a, b, c]), /max 6 flows/, 'the cap counts the total');
   assert.throws(() => readFlows([a, a]), /duplicate flow name/);
   assert.throws(() => readFlows([a, b], { allowPost: ['/q1', '/q2', '/q3', '/q4'] }), /at most 5/);
   assert.equal(readFlows([a]).flows.length, 3);
-  assert.equal(mergeStepDocs([{ flows: [], allowWrites: 'x' }, { flows: [], allowWrites: 'y' }]).allowWrites, 'x; y');
+  const m = mergeStepDocs([{ flows: [{ name: 'a' }], allowWrites: 'x' }, { flows: [{ name: 'b' }], allowWrites: 'y' }]);
+  assert.equal(m.allowWrites, undefined, 'no call-wide allowWrites came out of two files');
+  assert.deepEqual(m.flows.map((fl) => fl.allowWrites), ['x', 'y']);
   fs.rmSync(f, { recursive: true, force: true });
 });
 
@@ -507,4 +512,61 @@ test('summaries list the allowed POSTs by path', () => {
   const md = renderFlowSummary('android', flow({ allowPost: ['/api/rpc'], postsAllowed: ['/api/rpc', '/api/rpc'] }));
   assert.match(md, /POST ALLOWED \(RPC-style reads\) on: \/api\/rpc; made: 2 request\(s\) to \/api\/rpc/);
   assert.ok(flowVerdict(flow({ allowPost: ['/api/rpc'], postsAllowed: [] })).notes.some((n) => /POST allowed on \/api\/rpc: 0 requests/.test(n)));
+});
+
+test('settings stay PER FILE: one file with allowWrites does not open the flows of another file', () => {
+  const f = fs.mkdtempSync(path.join(os.tmpdir(), 'mqp-'));
+  const w = (n, d) => { const p = path.join(f, n); fs.writeFileSync(p, JSON.stringify(d)); return p; };
+  const one = (name) => ({ name, start: 'https://a.com/x', steps: [{ key: 'Tab' }] });
+  const a = w('a.json', { allowWrites: 'fixture writes', flows: [one('a1')] });
+  const b = w('b.json', { flows: [one('b1')] });
+  const c = w('c.json', { allowPost: ['/rpc/read'], flows: [one('c1')] });
+  const r = readFlows([a, b, c]);
+  const by = (n) => r.flows.find((x) => x.name === n);
+  assert.equal(by('a1').allowWrites, 'fixture writes');
+  assert.equal(by('b1').allowWrites, null, 'b stays guarded');
+  assert.deepEqual(by('b1').allowPost, []);
+  assert.deepEqual(by('c1').allowPost, ['/rpc/read']);
+  assert.equal(by('c1').allowWrites, null);
+  assert.equal(r.allowWrites, null, 'nothing call-wide');
+  const wire = JSON.parse(r.wireJson);
+  assert.equal(wire.allowWrites, undefined);
+  assert.equal(wire.flows.find((x) => x.name === 'a1').allowWrites, 'fixture writes');
+  assert.equal(wire.flows.find((x) => x.name === 'b1').allowWrites, undefined);
+  // the runner's re-parse keeps the same per-flow picture
+  assert.equal(loadRunnerFlows({ publicJson: r.wireJson }).flows.find((x) => x.name === 'b1').allowWrites, null);
+  // the call-wide flag applies to every flow and is printed as call-wide
+  const cw = readFlows([b, c], { allowPost: ['/other'] });
+  assert.deepEqual(cw.flows.map((x) => x.allowPost.slice().sort()), [['/other'], ['/other', '/rpc/read']]);
+  // allowWrites of a file next to a call-wide allow-post is the same nonsense as inside one file
+  assert.throws(() => readFlows([a], { allowPost: ['/p'] }), /make no sense/);
+  // the cap is on the union
+  const d = w('d.json', { allowPost: ['/1', '/2', '/3'], flows: [one('d1')] });
+  const e = w('e.json', { allowPost: ['/4', '/5', '/6'], flows: [one('e1')] });
+  assert.throws(() => readFlows([d, e]), /at most 5 paths in all/);
+  // a write-protected session refuses a per-flow setting as well
+  assert.throws(() => parseFlows({ flows: [{ ...one('x'), allowWrites: 'sneak' }], noWrites: true }, {}), /write-protected/);
+  fs.rmSync(f, { recursive: true, force: true });
+});
+
+test('allowPost refuses "/", dot segments and percent-encoded dots or slashes', () => {
+  for (const p of ['/', '/a/./b', '/a/../b', '/.', '/..', '/a/%2e%2e/b', '/a/%2E/b', '/a%2fb', '/a%5Cb']) assert.throws(() => parseAllowPost([p]), /allowPost/, p);
+  assert.deepEqual(parseAllowPost(['/a.b/c-d_e', '/rpc/read.json']), ['/a.b/c-d_e', '/rpc/read.json']);
+});
+
+test('iOS guard resolves URLs like the browser: against document.baseURI (a <base href> redirects a relative URL)', async () => {
+  const { g, sent } = pageLike();
+  g.location = { href: 'https://app.example.com/page' };
+  g.document.baseURI = 'https://other.example/'; // <base href="https://other.example/">
+  g.URL = URL;
+  const allow = { origin: 'https://app.example.com', paths: ['/rpc/read'] };
+  vm.runInNewContext('(function(){' + guardSource(KEY, allow) + '})()', g);
+  await assert.rejects(g.window.fetch('/rpc/read', { method: 'POST' }), /POST blocked/, 'the browser would send it to other.example');
+  const x = new g.XMLHttpRequest();
+  x.open('POST', '/rpc/read'); x.send();
+  assert.deepEqual(sent, []);
+  assert.equal(await g.window.fetch('https://app.example.com/rpc/read', { method: 'POST' }), 'sent', 'an absolute same-origin URL is still fine');
+  assert.equal(await g.window.fetch({ url: 'https://app.example.com/rpc/read', method: 'POST' }), 'sent', 'a Request object counts by its own url');
+  await assert.rejects(g.window.fetch({ url: 'https://other.example/rpc/read', method: 'POST' }), /POST blocked/);
+  assert.deepEqual([...g.window[KEY].allowed], ['/rpc/read', '/rpc/read']);
 });

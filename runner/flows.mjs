@@ -184,6 +184,7 @@ export function parseAllowPost(v, { textGuard } = {}) {
   if (v.length > LIMITS.allowPostMax) fail('allowPost', 'at most ' + LIMITS.allowPostMax + ' paths');
   const out = [];
   for (const p of v) {
+    if (typeof p === 'string' && (p === '/' || p.split('/').some((seg) => seg === '.' || seg === '..') || /%2e|%2f|%5c/i.test(p))) fail('allowPost', 'refused "' + p.slice(0, 40) + '": "/" alone, dot segments and percent-encoded dots or slashes are not allowed (the path is matched exactly)');
     if (typeof p !== 'string' || !/^\/[A-Za-z0-9._~!$&'()+,;=:@%\/-]{0,198}$/.test(p) || p.startsWith('//') || /\.\.|[?#*]/.test(p)) fail('allowPost', 'a path starts with one /, has no query, #, * or .. and no spaces: "' + String(p).slice(0, 40) + '"');
     if (textGuard) {
       const why = textGuard(p);
@@ -219,7 +220,7 @@ export function parseFlows(doc, { checkStart, textGuard, noWrites = false } = {}
   if (doc.flows.length > LIMITS.flows) fail('steps file', 'max ' + LIMITS.flows + ' flows per file');
   if (protectedRun && doc.allowPost !== undefined) fail('allowPost', 'refused: this session is write-protected, flows cannot open a POST path (a POST can change data)');
   if (doc.allowPost !== undefined && doc.allowWrites !== undefined) fail('allowPost', 'allowPost and allowWrites together make no sense: allowWrites turns the whole guard off');
-  const allowPost = parseAllowPost(doc.allowPost, { textGuard });
+  const docPost = parseAllowPost(doc.allowPost, { textGuard });
   let allowWrites = null;
   if (doc.allowWrites !== undefined) {
     if (typeof doc.allowWrites !== 'string' || !doc.allowWrites.trim()) fail('allowWrites', 'needs a non-empty reason');
@@ -227,10 +228,21 @@ export function parseFlows(doc, { checkStart, textGuard, noWrites = false } = {}
   }
   const seen = new Set();
   const wire = [];
+  const allPosts = [...docPost];
   const flows = doc.flows.map((f, i) => {
     const where = 'flow ' + (i + 1);
     if (!isObj(f)) fail(where, 'must be an object');
-    onlyKeys(f, ['name', 'start', 'steps'], where);
+    onlyKeys(f, ['name', 'start', 'steps', 'allowWrites', 'allowPost'], where);
+    // Settings of one steps file belong to ITS flows only (mergeStepDocs copies them onto each flow): a flow's own value, else the call-wide one.
+    if (protectedRun && (f.allowWrites !== undefined || f.allowPost !== undefined)) fail(where, 'refused: this session is write-protected, flows cannot opt out of the no-writes guard or open a POST path');
+    let fWrites = allowWrites;
+    if (f.allowWrites !== undefined) {
+      if (typeof f.allowWrites !== 'string' || !f.allowWrites.trim()) fail(where, 'allowWrites needs a non-empty reason');
+      fWrites = checkText(f.allowWrites.trim(), where + '.allowWrites', { textGuard });
+    }
+    const fPost = [...new Set([...docPost, ...parseAllowPost(f.allowPost, { textGuard })])];
+    if (fWrites && fPost.length) fail(where, 'allowPost and allowWrites together make no sense: allowWrites turns the whole guard off');
+    allPosts.push(...fPost);
     if (!NAME_RE.test(f.name || '')) fail(where, 'name must be 1-40 letters, digits, - or _');
     if (seen.has(f.name)) fail(where, 'duplicate flow name "' + f.name + '"');
     if (textGuard && textGuard(f.name)) fail(where, 'the flow name ' + textGuard(f.name) + ' (names are printed in the public log)');
@@ -240,11 +252,13 @@ export function parseFlows(doc, { checkStart, textGuard, noWrites = false } = {}
     if (!Array.isArray(f.steps) || !f.steps.length) fail(where, '"steps" must be a non-empty array');
     if (f.steps.length > LIMITS.steps) fail(where, 'max ' + LIMITS.steps + ' steps per flow');
     const steps = f.steps.map((s, j) => parseStep(s, where + ' step ' + (j + 1), { textGuard }));
-    wire.push({ name: f.name, start, steps: f.steps });
-    return { name: f.name, start, steps };
+    wire.push({ name: f.name, start, steps: f.steps, ...(f.allowWrites !== undefined ? { allowWrites: f.allowWrites } : {}), ...(f.allowPost !== undefined ? { allowPost: f.allowPost } : {}) });
+    return { name: f.name, start, steps, allowWrites: fWrites, allowPost: fPost };
   });
   // "wire" is what travels (authoring form, so the runner validates it again with the same rules); "flows" is the parsed form.
-  const wireJson = JSON.stringify({ flows: wire, ...(allowWrites ? { allowWrites } : {}), ...(allowPost.length ? { allowPost } : {}), ...(protectedRun ? { noWrites: true } : {}) });
+  const allowPost = [...new Set(allPosts)];
+  if (allowPost.length > LIMITS.allowPostMax) fail('allowPost', 'at most ' + LIMITS.allowPostMax + ' paths in all (the union over the call)');
+  const wireJson = JSON.stringify({ flows: wire, ...(allowWrites ? { allowWrites } : {}), ...(docPost.length ? { allowPost: docPost } : {}), ...(protectedRun ? { noWrites: true } : {}) });
   if (Buffer.byteLength(wireJson) > LIMITS.jsonBytes) fail('steps file', 'too large to send (max ' + LIMITS.jsonBytes + ' bytes)');
   return { allowWrites, allowPost, noWrites: protectedRun, flows, wireJson };
 }
@@ -308,7 +322,7 @@ function guardBody(KEY, ALLOW) {
   var permit = function (m, url) {
     if (m !== 'POST' || !ALLOW || !ALLOW.paths.length) return false;
     try {
-      var u = new URL(String(url), location.href);
+      var u = new URL(String(url), document.baseURI); // exactly as the browser resolves a relative URL (a <base href> counts)
       if (u.origin !== ALLOW.origin || ALLOW.paths.indexOf(u.pathname) < 0) return false;
       if (allowed.length < 200) allowed.push(u.pathname);
       return true;
@@ -463,24 +477,31 @@ export function readStepDocs(files, { maxBytes = 80000 } = {}) {
     }
   });
 }
+// The settings of one file (allowWrites, allowPost) are copied onto THAT file's flows only; the command-line flags (--allow-writes,
+// --allow-post) are call-wide and stay at the top of the merged document. The 5-path cap is checked on the union by parseFlows.
 export function mergeStepDocs(docs, { allowWrites = null, allowPost = [] } = {}) {
   for (const d of docs) if (!isObj(d)) fail('steps file', 'must be an object {"flows": [...]}');
   if (docs.length === 1 && allowWrites === null && !allowPost.length) return docs[0];
   const merged = { flows: [] };
-  const reasons = [];
-  const posts = [];
   for (const d of docs) {
-    if (Array.isArray(d.flows)) merged.flows.push(...d.flows);
-    else merged.flows = d.flows; // not an array: parseFlows reports it
-    if (d.allowWrites !== undefined) reasons.push(d.allowWrites);
     if (d.noWrites === true) merged.noWrites = true;
-    if (Array.isArray(d.allowPost)) posts.push(...d.allowPost);
-    else if (d.allowPost !== undefined) posts.push(d.allowPost);
+    if (!Array.isArray(d.flows)) {
+      merged.flows = d.flows; // parseFlows reports it
+      continue;
+    }
+    for (const fl of d.flows) {
+      if (!isObj(fl)) {
+        merged.flows.push(fl);
+        continue;
+      }
+      const own = { ...fl };
+      if (d.allowWrites !== undefined && own.allowWrites === undefined) own.allowWrites = d.allowWrites;
+      if (d.allowPost !== undefined) own.allowPost = [].concat(d.allowPost, own.allowPost === undefined ? [] : own.allowPost);
+      merged.flows.push(own);
+    }
   }
-  if (allowWrites !== null) reasons.push(allowWrites);
-  if (reasons.length) merged.allowWrites = reasons.every((r) => typeof r === 'string') ? [...new Set(reasons)].join('; ') : reasons[0];
-  const all = [...posts, ...allowPost];
-  if (all.length) merged.allowPost = [...new Set(all)];
+  if (allowWrites !== null) merged.allowWrites = allowWrites;
+  if (allowPost.length) merged.allowPost = allowPost;
   return merged;
 }
 

@@ -97,6 +97,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   const settle = async (ms) => {
     const end = Date.now() + ms;
     do {
+      await readBlocked().catch(() => {}); // read the old document's counts before a navigation can replace it
       await ensureGuard().catch(() => {});
       await rawSleep(60);
     } while (Date.now() < end);
@@ -184,12 +185,19 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
         // A WebDriver Back has hung for the whole step cap on the hosted Macs: give it 12 s, then ask the page itself and say so.
         const dir = s.do === 'back' ? 'back' : 'forward';
         let via = 'WebDriver history ' + dir;
+        const where = () => exec('return [location.href, history.length].join(" ");').catch(() => null);
+        const before = await where();
         try {
           await wd('POST', '/session/' + sid + '/' + dir, {}, 0, 12000);
         } catch (e) {
-          await exec('history.' + dir + '(); return true;');
-          via = 'script history.' + dir + '() (WebDriver ' + dir + ' did not answer in 12 s: ' + String(e.message).split('\n')[0].slice(0, 50) + ')';
-          res.notes.push(s.do + ': WebDriver did not answer, history.' + dir + '() was called by script');
+          const after = await where();
+          if (after !== null && after !== before) {
+            via = 'WebDriver history ' + dir + ' (it did navigate; the answer came late: ' + String(e.message).split('\n')[0].slice(0, 40) + ')';
+          } else {
+            await exec('history.' + dir + '(); return true;');
+            via = 'script history.' + dir + '() (WebDriver ' + dir + ' did not answer in 12 s and the page had not moved: ' + String(e.message).split('\n')[0].slice(0, 50) + ')';
+            res.notes.push(s.do + ': WebDriver did not answer, history.' + dir + '() was called by script');
+          }
         }
         await settle(1200);
         return { via };
