@@ -246,11 +246,11 @@ export const fileSafe = (s) => String(s).replace(/[^A-Za-z0-9_-]+/g, '_').slice(
 
 // ---- iOS write guard: runs in the page through WebDriver "Execute Script" (safaridriver has no run-at-document-start hook).
 // Blocks, for every origin: fetch and XHR whose method is not exactly GET/HEAD/OPTIONS (an XHR whose method it never saw counts as
-// a write), sendBeacon, form submissions whose method is not GET, and WebSockets. Records what it blocked in a per-run, random,
+// a write), sendBeacon, form submissions whose method is not GET, and WebSockets. Records what it blocked in a per-flow, random,
 // non-enumerable property (window[KEY]) that the page does not know; idempotent per document. It is a JavaScript guard: see the
 // README for everything it does not cover.
 function guardBody(KEY) {
-  if (window[KEY]) return { ok: true, already: true };
+  if (Object.prototype.hasOwnProperty.call(window, KEY)) return { ok: true, already: true }; // own property only, never through the prototype chain
   var blocked = [];
   var rec = function (what) { if (blocked.length < 50) blocked.push(String(what).slice(0, 60)); };
   var readOnly = function (m) { return m === 'GET' || m === 'HEAD' || m === 'OPTIONS'; };
@@ -294,7 +294,7 @@ function guardBody(KEY) {
   return { ok: true, already: false };
 }
 export const guardSource = (key) => 'return (' + guardBody.toString() + ')(' + JSON.stringify(key) + ');';
-export const guardCheck = (key) => 'return !!window[' + JSON.stringify(key) + '];';
+export const guardCheck = (key) => 'return Object.prototype.hasOwnProperty.call(window, ' + JSON.stringify(key) + ');';
 export const guardRead = (key) => 'var g = window[' + JSON.stringify(key) + ']; return g ? g.blocked.slice() : null;';
 export const newGuardKey = () => '__mq' + randomBytes(9).toString('hex');
 
@@ -329,9 +329,10 @@ export const clean = (s, max = 300) =>
     .slice(0, max);
 
 // The number of flow results must match what was asked, unless the runner said why not (iOS under KITQA_NO_WRITES).
-export function flowCountIssue(res, requested) {
+// Only iOS, and only when this client asked for a write-protected run, may return fewer (flowsSkipped says why).
+export function flowCountIssue(res, requested, { noWrites = false } = {}) {
   const got = Array.isArray(res.flows) ? res.flows.length : 0;
-  if (res.flowsSkipped) return null;
+  if (res.flowsSkipped && res.platform === 'ios' && noWrites === true) return null;
   return got < requested ? 'only ' + got + ' of ' + requested + ' flow result(s) came back' : null;
 }
 

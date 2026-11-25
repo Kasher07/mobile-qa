@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { reportFlows, flowCountIssue, clean } from '../runner/flows.mjs';
-import { privateFlows, buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict, gitBashPaths, rawArtifactLeaks } from '../runner/private.mjs';
+import { privateFlows, isMintedState, buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict, gitBashPaths, rawArtifactLeaks } from '../runner/private.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -150,6 +150,7 @@ export async function runPrivate(opts, deps) {
   const { verdict, starvedAction, iosPools, InputError } = deps;
   let built;
   let flowsRequested = 0;
+  let flowsNoWrites = false;
   try {
     let flowsWire = null;
     if (opts.steps) {
@@ -162,8 +163,14 @@ export async function runPrivate(opts, deps) {
         throw new Error('cannot use the steps file: ' + String(e.message).slice(0, 100));
       }
       if (opts.allowWrites !== null && doc && typeof doc === 'object') doc.allowWrites = String(opts.allowWrites);
-      flowsWire = JSON.parse(privateFlows(process.env.KITQA_BASE, doc).wireJson); // the steps travel inside the sealed job
+      let minted = false;
+      try {
+        minted = isMintedState(JSON.parse(fs.readFileSync(process.env.KITQA_STORAGE_STATE, 'utf8')));
+      } catch { /* buildJob reports an unreadable session file */ }
+      const pf = privateFlows(process.env.KITQA_BASE, doc, { minted }); // the steps travel inside the sealed job
+      flowsWire = JSON.parse(pf.wireJson);
       flowsRequested = flowsWire.flows.length;
+      flowsNoWrites = pf.noWrites;
     }
     built = buildJob(process.env, process.platform === 'win32' ? gitBashPaths(opts.urls) : opts.urls, undefined, flowsWire);
   } catch (e) {
@@ -431,7 +438,7 @@ export async function runPrivate(opts, deps) {
         lines.push(...fr.lines);
       }
       if (flowsRequested) {
-        const ci = flowCountIssue(res, flowsRequested);
+        const ci = flowCountIssue(res, flowsRequested, { noWrites: flowsNoWrites });
         if (ci) {
           issues++;
           lines.push('- flows :: ISSUES: ' + ci);

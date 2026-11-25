@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseFlows, parseStep, FlowError, LIMITS, xpathLiteral, textXPath, swipePoints, stepLabel, flowVerdict, renderFlowSummary, reportFlows, guardSource, newGuardKey, flowCountIssue, clean, loadRunnerFlows } from '../runner/flows.mjs';
 import { textGuard, readFlows, parseArgs } from '../bin/mobile-qa.mjs';
-import { buildJob, validateJob, privateFlows, allowedLine, checkPrivateTarget } from '../runner/private.mjs';
+import { buildJob, validateJob, privateFlows, isMintedState, allowedLine, checkPrivateTarget } from '../runner/private.mjs';
 
 const doc = (steps, extra = {}) => ({ flows: [{ name: 'f', start: 'https://a.com/x', steps }], ...extra });
 const ok = (steps) => parseFlows(doc(steps), {});
@@ -350,7 +350,10 @@ test('flow count: fewer results than asked is an issue unless the runner said wh
   assert.equal(flowCountIssue({ flows: [{}, {}] }, 2), null);
   assert.match(flowCountIssue({ flows: [{}] }, 2), /only 1 of 2/);
   assert.match(flowCountIssue({}, 1), /only 0 of 1/);
-  assert.equal(flowCountIssue({ flows: [], flowsSkipped: 'iOS write-protected' }, 3), null);
+  const skipped = { platform: 'ios', flows: [], flowsSkipped: 'iOS write-protected' };
+  assert.equal(flowCountIssue(skipped, 3, { noWrites: true }), null, 'iOS under a write-protected run');
+  assert.match(flowCountIssue(skipped, 3), /only 0 of 3/, 'the client did not ask for noWrites: a skip is an issue');
+  assert.match(flowCountIssue({ ...skipped, platform: 'android' }, 3, { noWrites: true }), /only 0 of 3/, 'Android may never skip');
 });
 
 test('summaries sanitise page-controlled text and print the allowWrites reason', () => {
@@ -359,4 +362,30 @@ test('summaries sanitise page-controlled text and print the allowWrites reason',
   const md = renderFlowSummary('ios', flow({ blocked: ['fetch POST‮'], allowWrites: 'fixture reason', guard: { active: false } }));
   assert.match(md, /WRITES ALLOWED: fixture reason/);
   assert.ok(!/‮/.test(md));
+});
+
+test('a MINTED session (storage state kind) is write-protected even when the env variable is dropped', () => {
+  delete process.env.KITQA_NO_WRITES;
+  const mintedState = { ...state2, kitqa: { kind: 'minted', site: 'x' } };
+  assert.equal(isMintedState(mintedState), true);
+  assert.equal(isMintedState(state2), false);
+  const pf = privateFlows('https://app.example.com', { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }] }, { minted: true });
+  assert.equal(pf.noWrites, true);
+  assert.equal(JSON.parse(pf.wireJson).noWrites, true);
+  assert.throws(() => privateFlows('https://app.example.com', { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }], allowWrites: 'x' }, { minted: true }), /write-protected/);
+  const env2 = { KITQA_BASE: 'https://app.example.com', KITQA_STORAGE_STATE: 'x' };
+  assert.doesNotThrow(() => buildJob(env2, [], () => mintedState, JSON.parse(pf.wireJson)));
+  const unprotected = JSON.parse(privateFlows('https://app.example.com', { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }] }).wireJson);
+  assert.throws(() => buildJob(env2, [], () => mintedState, unprotected), /write-protected/, 'steps without noWrites cannot ride a minted session');
+  assert.doesNotThrow(() => buildJob(env2, [], () => state2, unprotected), 'an ordinary qa-agent session is unchanged');
+});
+
+test('guard presence is an OWN property: one planted on the prototype chain does not fake a guarded document', () => {
+  const { g, sent } = pageLike();
+  const proto = { [KEY]: { blocked: [] } }; // a page that guesses the key and puts it on the prototype of window
+  Object.setPrototypeOf(g, proto);
+  assert.deepEqual(runGuard(g), { ok: true, already: false }, 'the guard installs anyway');
+  assert.equal(Object.prototype.hasOwnProperty.call(g, KEY), true);
+  assert.deepEqual(runGuard(g), { ok: true, already: true });
+  void sent;
 });

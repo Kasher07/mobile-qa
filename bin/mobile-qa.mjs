@@ -575,7 +575,7 @@ async function main() {
       lines.push(...fr.lines);
     }
     if (flows) {
-      const ci = flowCountIssue(res, flows.flows.length);
+      const ci = flowCountIssue(res, flows.flows.length, { noWrites: flows.noWrites });
       if (ci) {
         issues++;
         lines.push('- flows :: ISSUES: ' + ci);

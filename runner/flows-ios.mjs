@@ -4,7 +4,7 @@
 // says in plain words. Back and Forward are WebDriver history commands. Pinch and multi-finger gestures are not available.
 // safaridriver has no run-at-document-start hook, so the write guard (flows.mjs guardBody) is injected as soon as WebDriver gives
 // control back after a load, re-checked every 60 ms while a step settles, and checked again right after every step (a step that
-// navigates, such as a tap on a link, Back or Enter, hands the next document to the same code). The marker is a random per-run
+// navigates, such as a tap on a link, Back or Enter, hands the next document to the same code). The marker is a random per-flow
 // property name. Requests a page sends while its document loads are not covered, and the README lists the other holes.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,7 +17,11 @@ const ref = (id) => ({ [ELEMENT_KEY]: id });
 const idOf = (e) => e[ELEMENT_KEY] || Object.values(e)[0];
 
 export async function runFlowIos(env, flow, { log = () => {}, showLabels = true } = {}) {
-  const { wd, sid, exec, sleep } = env;
+  const { wd, sid, exec } = env;
+  const rawSleep = env.sleep;
+  // Every wait in a flow step (timers, polling for an element, settling after an action) goes through settle(): the guard is looked
+  // for every 60 ms, so a document that appears while any step waits is guarded at once.
+  const sleep = (ms) => settle(ms);
   const GKEY = newGuardKey(); // random per flow: a page cannot know which property says "guarded"
   const dir = path.join(env.outDir, 'flows', flow.name);
   fs.mkdirSync(dir, { recursive: true });
@@ -84,12 +88,12 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
       seen = 0;
     }
   };
-  // While a step settles: look for a new document every 150 ms and guard it at once (errors are raised by the check after the step).
+  // While a step settles: look for a new document every 60 ms and guard it at once (errors are raised by the check after the step).
   const settle = async (ms) => {
     const end = Date.now() + ms;
     do {
       await ensureGuard().catch(() => {});
-      await sleep(60);
+      await rawSleep(60);
     } while (Date.now() < end);
   };
   const readBlocked = async () => {

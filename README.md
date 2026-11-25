@@ -66,8 +66,8 @@ time, how it was done, screenshot) plus the screenshots next to it.
   blocked form submission leaves Chrome's blank error page (the request never left), so a flow that submits a form on Android
   continues on that page; a page's own background POSTs just fail. The count and the paths of blocked requests are in the summary.
 - iOS (no request interception): a **JavaScript guard, not a block**. It is injected through WebDriver right after each document loads,
-  re-checked every 60 ms while a step settles and again right after every step (so a document reached by a tap on a link, Back or
-  Enter is guarded before the screenshot and the next step), under a random per-run property name the page does not know. It stops
+  re-checked every 60 ms while ANY step waits (timers, polling, settling) and again right after every step (so a document reached by a tap on a link, Back or
+  Enter is guarded before the screenshot and the next step), under a random per-flow property name the page does not know. It stops
   fetch/XHR whose method is not exactly GET/HEAD/OPTIONS (an XHR whose method it never saw counts as a write), `sendBeacon`, form
   submissions whose method is not GET, and WebSockets. **Holes, plainly:** requests made while a document loads (before the guard
   goes in); functions the page captured before the guard (its own references to fetch, XHR or sendBeacon, ofetch/ky-style instances);

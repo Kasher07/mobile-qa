@@ -113,10 +113,14 @@ export function cookiesFor(state, host, now = Date.now()) {
   return out;
 }
 
+export const isMintedState = (state) => !!(state && state.kitqa && state.kitqa.kind === 'minted');
+
 // A flow's start is a path on the site, checked with the same rules as the plain paths.
-export function privateFlows(baseRaw, doc) {
+// minted: the kit-qa storage state says kitqa.kind === 'minted' (a session minted for one check): that alone makes the run write-protected,
+// so dropping the KITQA_NO_WRITES variable changes nothing.
+export function privateFlows(baseRaw, doc, { minted = false } = {}) {
   return parseFlows(doc, {
-    noWrites: process.env.KITQA_NO_WRITES === '1', // kit-qa --mint sets it; the flag then travels inside the sealed steps too
+    noWrites: minted === true || process.env.KITQA_NO_WRITES === '1', // kit-qa --mint sets it; the flag then travels inside the sealed steps too
     checkStart: (s, where) => {
       try {
         const t = checkPrivateTarget(baseRaw, [s]);
@@ -140,6 +144,7 @@ export function buildJob(env, rawPaths, readState = (f) => JSON.parse(fs.readFil
     throw new PrivateInputError('cannot read the kit-qa session file');
   }
   const cookies = cookiesFor(state, t.host);
+  if (flowsWire && isMintedState(state) && flowsWire.noWrites !== true) throw new PrivateInputError('a minted session needs write-protected steps (internal mismatch)');
   if (!cookies.length) throw new PrivateInputError('no usable session cookie for this site (run kit-qa login <site>)');
   return { origin: t.origin, host: t.host, job: { v: 1, base: t.origin, paths: t.paths, cookies, ...(flowsWire ? { flows: flowsWire } : {}) } };
 }
