@@ -289,8 +289,8 @@ export async function runFlowAndroid(env, flow, { log = () => {}, startedAt = Da
   const dir = path.join(env.outDir, 'flows', flow.name);
   fs.mkdirSync(dir, { recursive: true });
   const res = { name: flow.name, start: flow.startShown || flow.start, steps: [], blocked: [], notes: [], probe: null, shots: [], guard: { active: !!env.guardActive, how: env.allowWrites ? 'off (writes allowed)' : 'context route: every non-GET/HEAD/OPTIONS request to any origin is aborted' + ((env.allowPost || []).length ? ' except POST to the listed paths of this origin' : '') + '; service workers blocked; WebSockets closed' }, allowWrites: env.allowWrites || null, ms: 0 };
-  const blockedBefore = env.blocked.length;
-  const allowedBefore = (env.allowedPosts || []).length;
+  const blockedBefore = env.marks ? env.marks.blocked : env.blocked.length;
+  const allowedBefore = env.marks ? env.marks.allowed : (env.allowedPosts || []).length;
   res.allowPost = env.allowPost || [];
   const t0 = Date.now();
   const snap = async (stem) => {

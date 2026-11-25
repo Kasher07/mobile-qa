@@ -296,12 +296,13 @@ if (FLOWS) {
     page = await withTimeout(context.newPage(), 30000, 'new tab');
     prev.close({ runBeforeUnload: false }).catch(() => {});
     page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
+    const marks = { blocked: blocked.length, allowed: allowedPosts.length }; // requests of the page load count for this flow too
     flowAllow = (FLOWS.allowPost || []).length ? { origin: new URL(flow.start).origin, paths: FLOWS.allowPost } : null;
     await gotoOnce(flow.start);
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await page.waitForTimeout(1200);
     if (PRIV) await waitSettled(() => page.evaluate(settleProbe), (ms) => page.waitForTimeout(ms));
-    const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: FLOWS.allowWrites, allowPost: FLOWS.allowPost, allowedPosts, guardActive: !guardError, cal: null };
+    const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: FLOWS.allowWrites, allowPost: FLOWS.allowPost, allowedPosts, marks, guardActive: !guardError, cal: null };
     return runFlowAndroid(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
   };
   // Chrome on the emulator sometimes closes its tab or refuses new targets while a flow starts: ONE explicit retry on a fresh
