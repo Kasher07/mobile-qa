@@ -71,7 +71,8 @@ const toScreen = (c, x, y) => ({ x: Math.round(c.ox + x * c.dpr), y: Math.round(
 
 // The visible part of the element, and whether something else sits over its centre.
 async function aim(l) {
-  await l.scrollIntoViewIfNeeded({ timeout: 5000 });
+  await l.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
+  await l.page().waitForTimeout(250);
   return l.evaluate((el) => {
     const vv = window.visualViewport;
     const top0 = vv ? vv.offsetTop : 0;

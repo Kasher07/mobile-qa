@@ -12,6 +12,61 @@ targets, viewport meta, HTTP status) and, on Android, JS errors, console errors 
 node bin/mobile-qa.mjs https://example.com https://example.com/pricing [--platforms ios,android] [--out DIR]
 ```
 
+## Flows: scripted steps (tap, type, Back, swipe, expect, screenshots)
+
+```bash
+node bin/mobile-qa.mjs --steps examples/flows.json [--platforms ios,android] [--allow-writes "<reason>"]
+kit-qa exec <site> -- node bin/mobile-qa.mjs --private --steps flows.json     # signed-in pages: start is a path, steps travel sealed
+```
+
+A flow file holds up to 6 flows (name, `start` URL or, with `--private`, a path on the site, up to 60 steps, `examples/flows.json` is a
+working one). A step is an object with one action key; a screenshot of the whole device screen (browser bars and the on-screen keyboard
+when it is up) is taken after every step and on a failure.
+
+| step | meaning |
+|------|---------|
+| `{"tap": "#go"}` / `{"tap": {"text": "Save"}}` | CSS selector, or the deepest element whose visible text contains the text |
+| `{"type": {"selector": "#q", "text": "hello", "clear": true}}` | focus the field, type |
+| `{"key": "Enter"}` | Enter, Tab, Backspace, Escape |
+| `{"back": true}` / `{"forward": true}` | browser history |
+| `{"scroll": {"to": "#x"}}` / `{"scroll": {"by": 600}}` | into view / pixels |
+| `{"swipe": {"on": ".carousel", "direction": "left"}}` / `{"swipe": {"from": [0.8, 0.5], "to": [0.2, 0.5]}}` | direction = the way the content moves; from/to are fractions of the screen |
+| `{"wait": {"selector": "#x", "state": "visible"}}` (or `"gone"`, `"text"`, `"timeout"` ms) / `{"wait": {"ms": 500}}` | wait (max 20 s / 10 s) |
+| `{"expect": {"selector": "#x", "visible": true}}` | also `"count": 3` and `"inViewport": true` (not hidden under the keyboard); polls up to 2 s; a miss fails the flow |
+| `{"shot": "name"}` | an extra named screenshot |
+
+Selectors are plain CSS only (no `text=`, `xpath=`, `>>`, `:has-text`: they would not mean the same on Safari); selectors and texts are data
+handed to Playwright's locator or WebDriver's find-element, never evaluated as code. Limits: 30 s per step, 4 min per flow, 60 steps,
+6 flows, the file at most 20 kB. A failed step or `expect` stops its flow, is an issue (exit 1) and keeps its screenshot; the layout probe
+(overflow, tap targets) also runs on each flow's end state. Output: `<out>/<run>/<platform>/flows/<name>/summary.md` (each step's result,
+time, how it was done, screenshot) plus the screenshots next to it.
+
+**What each platform really does.**
+- **Android** (Chrome on the emulator): tap and swipe are real touches injected below the browser with `adb shell input` (the soft
+  keyboard shows, the toolbar reacts); because adb works in screen pixels, a transparent overlay measures the page-to-screen offset before
+  a touch and eats that one tap. Typing sends DevTools key events after a real tap has focused the field (the keyboard app itself is not
+  typed into). Back is the hardware Back key (with the keyboard up the first Back only closes the keyboard, as on a phone). Forward has
+  no key on Android: DevTools history. Scroll is a script scroll. If `adb input` fails the step falls back to a DevTools touch, then to a
+  click, and the summary says which one was used.
+- **iOS** (Safari on the Simulator, WebDriver): tap is a **WebDriver element click** (a synthesized click, not a finger), typing is click +
+  sendKeys, keys are WebDriver key actions, Back/Forward are WebDriver history. Swipe uses W3C pointer actions of type `touch`; when this
+  Safari refuses them the step falls back to a script scroll and says so in the summary ("not a finger swipe"). The on-screen keyboard
+  appears only if Safari raises it for the synthesized focus. Pinch and multi-finger gestures are not available on either platform.
+
+**Writes: default NO WRITES.** A flow can press real buttons, so unless the file (or `--allow-writes "<reason>"`) says otherwise:
+- Android: one context-level route, installed before any page loads, aborts every non-GET/HEAD/OPTIONS request to ANY origin (public
+  runs included), service workers are blocked and every WebSocket is closed. If it cannot be installed the flow does not run.
+- iOS (no request interception): a JavaScript guard is injected through WebDriver and checked before every step; it blocks fetch/XHR
+  with a method other than GET/HEAD/OPTIONS, `sendBeacon`, form submissions whose method is not GET, and WebSockets, for every origin.
+  safaridriver has no run-at-document-start hook, so the guard goes in as soon as each new document has loaded: **requests a page sends
+  while it loads, from iframes or from service workers are not covered**. The flow summary counts the documents guarded; a document
+  where the guard cannot be installed fails the flow before any step acts on it, and a flow without an active guard is an issue.
+- `--allow-writes "<reason>"` (or `"allowWrites"` in the file) turns the guard off for the flow run and prints the reason in every
+  summary; use it only on a repo's own test paths. The plain page loads of the same call keep their usual behaviour.
+
+Public mode: the steps are a public workflow input, so text that looks like a secret or personal data (the same checks as URLs: tokens,
+JWTs, long random strings, e-mail addresses) is refused, and so is a start URL that `checkUrl` refuses. Private mode: the steps travel inside the sealed job and the log prints step numbers only.
+
 ## Private pages (kit-qa qa-agent sites)
 
 ```bash
@@ -35,8 +90,11 @@ What is and is not blocked. Android: service workers are blocked; one context-le
 loads, fail closed: if it cannot be installed nothing is loaded) aborts same-origin non-GET/HEAD/OPTIONS requests from
 every tab, and same-origin WebSockets are closed (when the context supports it; the run notes say if not);
 confirm/prompt/alert dialogs are dismissed, only beforeunload is accepted. Writes to other origins are not blocked.
-**iOS: writes are not blocked** (Safari offers no request interception); the run only loads and scrolls, but the page's
-own code can still send requests with the QA session. Do not call this "read-only" beyond the list above.
+**iOS: writes are not blocked in plain page loads** (Safari offers no request interception): the page's own code can still send
+requests with the QA session. Do not call this "read-only" beyond the list above. Flows (see above) add a page-script guard on iOS.
+
+Token-gated sites are entered here too: kit-qa's `exec <site> --mint` hands this tool a session of the same shape (one host-only
+cookie, 2 h lifetime, minted per call); nothing in this repo is specific to them, and a real `?token=` URL is still refused.
 
 What stays public while a run exists: the run name (`pq-<minute>-<hex>`), the workflow inputs (ciphertext of
 the job, its length, platforms), the step names and timings, and the artifact sizes. Nothing else is meant to appear:

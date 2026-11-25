@@ -90,6 +90,25 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     }
   };
 
+  // A WebDriver click is only trusted once the page saw a click on the element: armed before, read after.
+  const TAP_ARM = 'var el=arguments[0]; el.scrollIntoView({block:"center",inline:"nearest"}); var st={hit:null}; window.__mqTap=st; var h=function(e){ if(!st.hit){ var t=e.target; st.hit={x:Math.round(e.clientX),y:Math.round(e.clientY),on:(t===el||el.contains(t)),what:(t.tagName||"").toLowerCase()+(t.id?"#"+t.id:"")}; } }; st.off=function(){document.removeEventListener("click",h,true);}; document.addEventListener("click",h,true); var r=el.getBoundingClientRect(); st.c={x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}; return true;';
+  const TAP_READ = 'var st=window.__mqTap; if(!st) return null; st.off(); return {hit:st.hit,c:st.c};';
+  const CLICK_VIA = 'WebDriver element click (synthesized click, not a finger)';
+  async function clickChecked(id) {
+    await exec(TAP_ARM, [ref(id)]);
+    await wd('POST', '/session/' + sid + '/element/' + id + '/click', {});
+    await sleep(600);
+    const r = await exec(TAP_READ).catch(() => null); // null: the page navigated away, which a click on a link does
+    if (r && !r.hit) {
+      await exec('arguments[0].click(); return true;', [ref(id)]);
+      return 'script click (WebDriver click sent the page no click event: NOT a finger)';
+    }
+    if (r && r.hit && !r.hit.on) throw new Error('the WebDriver click landed on ' + r.hit.what + ' at (' + r.hit.x + ',' + r.hit.y + ') instead of the element (centre ' + r.c.x + ',' + r.c.y + ')');
+    return CLICK_VIA;
+  }
+  const valueOf = (id) => exec('var el=arguments[0]; return el.value===undefined?null:String(el.value);', [ref(id)]);
+  const SCROLL_STATE = 'var el=arguments[0]||document.documentElement; var s=[window.scrollX,window.scrollY]; for(var n=el;n&&n!==document.documentElement;n=n.parentElement){s.push(n.scrollLeft,n.scrollTop);} return s.join(",");';
+
   const viewport = () => exec('return {w: window.innerWidth, h: window.innerHeight};');
   const rectOf = (id) =>
     exec(
@@ -101,18 +120,27 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     switch (s.do) {
       case 'tap': {
         const id = await firstVisible(s.target);
-        await wd('POST', '/session/' + sid + '/element/' + id + '/click', {});
-        await sleep(700);
-        return { via: 'WebDriver element click (synthesized click, not a finger)' };
+        return { via: await clickChecked(id) };
       }
       case 'type': {
         const id = await firstVisible(s.target);
-        await wd('POST', '/session/' + sid + '/element/' + id + '/click', {});
-        await sleep(500);
-        if (s.clear) await wd('POST', '/session/' + sid + '/element/' + id + '/clear', {});
-        await wd('POST', '/session/' + sid + '/element/' + id + '/value', { text: s.text });
+        let via = await clickChecked(id);
         await sleep(400);
-        return { via: 'WebDriver click + sendKeys (synthesized; the on-screen keyboard shows only if Safari raises it)' };
+        if (s.clear) await wd('POST', '/session/' + sid + '/element/' + id + '/clear', {});
+        const base = s.clear ? '' : await valueOf(id);
+        const want = base === null ? null : base + s.text;
+        // Typing is verified (Safari's sendKeys has ignored text in this simulator): sendKeys, then key actions, then script.
+        await wd('POST', '/session/' + sid + '/element/' + id + '/value', { text: s.text }).catch(() => {});
+        await sleep(400);
+        if (want === null || (await valueOf(id)) === want) return { via: via + '; WebDriver sendKeys (synthesized; the on-screen keyboard shows only if Safari raises it)' };
+        await exec('arguments[0].value = arguments[1]; return true;', [ref(id), base]);
+        await wd('POST', '/session/' + sid + '/actions', { actions: [{ type: 'key', id: 'kb', actions: [...s.text].flatMap((ch) => [{ type: 'keyDown', value: ch }, { type: 'keyUp', value: ch }]) }] }).catch(() => {});
+        await wd('DELETE', '/session/' + sid + '/actions').catch(() => {});
+        await sleep(400);
+        if ((await valueOf(id)) === want) return { via: via + '; WebDriver key actions (sendKeys put no text in the field)' };
+        await exec('var el=arguments[0]; el.focus(); el.value=arguments[1]; el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); return true;', [ref(id), want]);
+        res.notes.push('type: sendKeys and key actions put no text in the field; the text was set by script (input/change events), NOT typed');
+        return { via: via + '; script value + input events (sendKeys and key actions typed nothing: NOT typed)' };
       }
       case 'key': {
         try {
@@ -159,6 +187,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
           from = { x: Math.round(s.from[0] * vp.w), y: Math.round(s.from[1] * vp.h) };
           to = { x: Math.round(s.to[0] * vp.w), y: Math.round(s.to[1] * vp.h) };
         }
+        const before = await exec(SCROLL_STATE, [id ? ref(id) : null]).catch(() => '');
         try {
           await wd('POST', '/session/' + sid + '/actions', {
             actions: [{ type: 'pointer', id: 'finger', parameters: { pointerType: 'touch' }, actions: [
@@ -171,6 +200,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
           });
           await wd('DELETE', '/session/' + sid + '/actions').catch(() => {});
           await sleep(900);
+          if ((await exec(SCROLL_STATE, [id ? ref(id) : null]).catch(() => '')) === before) throw new Error('accepted but nothing scrolled');
           return { via: 'W3C touch pointer actions (WebDriver synthesized touch, not the simulator glass)' };
         } catch (e) {
           // This Safari did not take touch pointer actions: scroll the element (or the page) by script instead, and say so.
@@ -178,8 +208,8 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
           const dy = to.y - from.y;
           await exec('var el = arguments[0] ? arguments[0] : (document.scrollingElement || document.documentElement); el.scrollBy({left: -arguments[1], top: -arguments[2], behavior: "instant"}); return true;', [id ? ref(id) : null, dx, dy]);
           await sleep(700);
-          res.notes.push('swipe: touch pointer actions were refused by Safari (' + String(e.message).split('\n')[0].slice(0, 80) + '); done as a script scroll, NOT a finger swipe');
-          return { via: 'script scroll fallback (touch actions refused: not a finger swipe)' };
+          res.notes.push('swipe: touch pointer actions had no effect or were refused (' + String(e.message).split('\n')[0].slice(0, 80) + '); done as a script scroll, NOT a finger swipe');
+          return { via: 'script scroll fallback (touch actions had no effect: NOT a finger swipe)' };
         }
       }
       case 'wait': {
