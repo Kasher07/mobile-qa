@@ -71,7 +71,16 @@ const toScreen = (c, x, y) => ({ x: Math.round(c.ox + x * c.dpr), y: Math.round(
 
 // The visible part of the element, and whether something else sits over its centre.
 async function aim(l) {
-  await l.evaluate((el) => el.scrollIntoView({ block: 'center', inline: 'nearest' }));
+  // Centre it in the part of the screen the user can see: with the keyboard up Chrome shrinks the visual viewport only.
+  await l.evaluate((el) => {
+    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+    const vv = window.visualViewport;
+    if (vv) {
+      const r = el.getBoundingClientRect();
+      const d = r.top + r.height / 2 - (vv.offsetTop + vv.height / 2);
+      if (Math.abs(d) > 2) window.scrollBy(0, d);
+    }
+  });
   await l.page().waitForTimeout(250);
   return l.evaluate((el) => {
     const vv = window.visualViewport;

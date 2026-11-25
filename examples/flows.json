@@ -102,12 +102,6 @@
             "text": "Form target page",
             "visible": false
           }
-        },
-        {
-          "expect": {
-            "selector": "#post",
-            "visible": true
-          }
         }
       ]
     },

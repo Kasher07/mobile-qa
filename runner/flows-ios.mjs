@@ -197,7 +197,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
               { type: 'pointerMove', duration: 450, x: to.x, y: to.y, origin: 'viewport' },
               { type: 'pointerUp', button: 0 },
             ] }],
-          });
+          }, 0, 12000); // a busy page can leave safaridriver hanging here: give up after 12 s and use the script scroll
           await wd('DELETE', '/session/' + sid + '/actions').catch(() => {});
           await sleep(900);
           if ((await exec(SCROLL_STATE, [id ? ref(id) : null]).catch(() => '')) === before) throw new Error('accepted but nothing scrolled');

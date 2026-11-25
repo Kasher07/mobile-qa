@@ -48,10 +48,14 @@ time, how it was done, screenshot) plus the screenshots next to it.
   typed into). Back is the hardware Back key (with the keyboard up the first Back only closes the keyboard, as on a phone). Forward has
   no key on Android: DevTools history. Scroll is a script scroll. If `adb input` fails the step falls back to a DevTools touch, then to a
   click, and the summary says which one was used.
-- **iOS** (Safari on the Simulator, WebDriver): tap is a **WebDriver element click** (a synthesized click, not a finger), typing is click +
-  sendKeys, keys are WebDriver key actions, Back/Forward are WebDriver history. Swipe uses W3C pointer actions of type `touch`; when this
-  Safari refuses them the step falls back to a script scroll and says so in the summary ("not a finger swipe"). The on-screen keyboard
-  appears only if Safari raises it for the synthesized focus. Pinch and multi-finger gestures are not available on either platform.
+- **iOS** (Safari on the Simulator, WebDriver): tap is a **WebDriver element click** (a synthesized click, not a finger); the page must
+  see a click on the element, else the step falls back to a script click (or fails if the click landed elsewhere) and says so. Typing
+  is click + sendKeys, verified against the field's value; when Safari ignores the text (measured on iOS 26.2: it does) the step retries
+  with key actions and finally sets the value by script with input/change events, flagged "NOT typed" in the summary. Keys are WebDriver
+  key actions, Back/Forward are WebDriver history. Swipe uses W3C pointer actions of type `touch`, but the step checks that something
+  scrolled; measured on iOS 26.2 the actions are accepted and do nothing, so the swipe is done as a script scroll and the summary says
+  "NOT a finger swipe". The on-screen keyboard did not appear for synthesized focus. So on iOS the flow proves the page's logic, not
+  finger or keyboard behaviour. Pinch and multi-finger gestures are not available on either platform.
 
 **Writes: default NO WRITES.** A flow can press real buttons, so unless the file (or `--allow-writes "<reason>"`) says otherwise:
 - Android: one context-level route, installed before any page loads, aborts every non-GET/HEAD/OPTIONS request to ANY origin (public
