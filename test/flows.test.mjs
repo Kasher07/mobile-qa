@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseFlows, parseStep, FlowError, LIMITS, xpathLiteral, textXPath, swipePoints, stepLabel, flowVerdict, renderFlowSummary, reportFlows, GUARD_SOURCE, loadRunnerFlows } from '../runner/flows.mjs';
+import { parseFlows, parseStep, FlowError, LIMITS, xpathLiteral, textXPath, swipePoints, stepLabel, flowVerdict, renderFlowSummary, reportFlows, guardSource, newGuardKey, flowCountIssue, clean, loadRunnerFlows } from '../runner/flows.mjs';
 import { textGuard, readFlows, parseArgs } from '../bin/mobile-qa.mjs';
 import { buildJob, validateJob, privateFlows, allowedLine, checkPrivateTarget } from '../runner/private.mjs';
 
@@ -165,6 +165,7 @@ function pageLike() {
     HTMLFormElement: function () {},
     XMLHttpRequest: function () {},
     WebSocket: function () { sent.push(['ws']); },
+    WeakMap,
   };
   g.HTMLFormElement.prototype.submit = function () { sent.push(['form.submit', this.method]); };
   g.XMLHttpRequest.prototype.open = function (m) { this.m = m; };
@@ -173,7 +174,8 @@ function pageLike() {
   g.window = g;
   return { g, sent, listeners };
 }
-const runGuard = (g) => JSON.parse(JSON.stringify(vm.runInNewContext('(function(){' + GUARD_SOURCE + '})()', g)));
+const KEY = newGuardKey();
+const runGuard = (g, key = KEY) => JSON.parse(JSON.stringify(vm.runInNewContext('(function(){' + guardSource(key) + '})()', g)));
 
 test('iOS guard: blocks fetch/XHR writes, beacon, form posts and WebSockets; reads pass; idempotent', async () => {
   const { g, sent, listeners } = pageLike();
@@ -200,8 +202,9 @@ test('iOS guard: blocks fetch/XHR writes, beacon, form posts and WebSockets; rea
   submit({ target: { method: 'get' }, submitter: { formMethod: 'post' }, preventDefault: () => prevented++, stopImmediatePropagation() {} });
   assert.equal(prevented, 2, 'post forms and formmethod=post are stopped, a GET form is not');
   assert.deepEqual(sent.map((s) => s.join(' ')), ['fetch GET', 'fetch get', 'xhr GET', 'form.submit get'], 'nothing but reads reached the network layer');
-  assert.ok(g.window.__mqGuard.blocked.length >= 8);
-  assert.equal(Object.keys(g.window).includes('__mqGuard'), false, 'the marker is not enumerable');
+  assert.equal(Object.keys(g.window).includes(KEY), false, 'the marker is not enumerable');
+  assert.ok(g.window[KEY].blocked.length >= 8);
+  assert.equal(g.window.__mqGuard, undefined, 'no fixed, guessable marker name');
 });
 
 // ---- private mode carries the flows inside the sealed job
@@ -242,4 +245,118 @@ test('runner loads flows: public needs http(s), private needs paths on the base'
   assert.equal(p.flows[0].startShown, '/p#x');
   assert.throws(() => loadRunnerFlows({ privateDoc: { flows: [{ name: 'a', start: '//evil.example/', steps: [{ key: 'Tab' }] }] }, base: 'https://app.example.com' }), /path on the site/);
   void checkPrivateTarget; void parseStep;
+});
+
+test('guard keys are random per flow and a page that sets a fixed name does not look guarded', () => {
+  assert.notEqual(newGuardKey(), newGuardKey());
+  assert.match(newGuardKey(), /^__mq[0-9a-f]{18}$/);
+  const { g } = pageLike();
+  g.__mqGuard = { blocked: [] }; // what a hostile page could plant
+  assert.deepEqual(runGuard(g), { ok: true, already: false }, 'the guard still installs');
+  const { g: g2 } = pageLike();
+  runGuard(g2, 'keyA');
+  assert.deepEqual(runGuard(g2, 'keyB'), { ok: true, already: false }, 'another key is another guard');
+});
+
+test('iOS guard: an XHR opened as POST BEFORE the guard and sent after it is blocked (unknown method = write)', () => {
+  const { g, sent } = pageLike();
+  const x = new g.XMLHttpRequest();
+  x.open('POST', '/a'); // pre-guard open: the guard never saw the method
+  runGuard(g);
+  x.send();
+  const y = new g.XMLHttpRequest();
+  y.open('PATCH', '/a'); y.send();
+  const z = new g.XMLHttpRequest();
+  z.send();
+  assert.deepEqual(sent, [], 'nothing reached the network layer');
+  assert.ok(g.window[KEY].blocked.some((b) => /xhr/.test(b)));
+});
+
+const wdoc = (steps, extra = {}) => ({ flows: [{ name: 'f', start: 'https://a.com/x', steps }], ...extra });
+const pub = (d) => parseFlows(d, { textGuard });
+const JWT = 'eyJhbGciOiJIUzI1NiJ9.abcdefghijklmnop';
+
+test('public input: every string that travels or is printed is checked (note, selector, names), a note is a string', () => {
+  assert.throws(() => pub(wdoc([{ tap: '#a', note: JWT }])), /note.*secret|secret/);
+  assert.throws(() => pub(wdoc([{ tap: '#a', note: 'me@example.com' }])), /personal/);
+  assert.throws(() => pub(wdoc([{ tap: '#a', note: { x: JWT } }])), /note must be a string/);
+  assert.throws(() => pub(wdoc([{ tap: '#a', note: 5 }])), /note must be a string/);
+  assert.throws(() => pub(wdoc([{ tap: '[data-x="' + 'a8f9c2d7e6b5a4f3c2d1e0f9' + '"]' }])), /secret/);
+  assert.throws(() => pub(wdoc([{ wait: { selector: 'a8f9c2d7e6b5a4f3c2d1e0f9', timeout: 1000 } }])), /secret/);
+  assert.throws(() => pub(wdoc([{ shot: 'a8f9c2d7e6b5a4f3c2d1e0f9' }])), /shot name/);
+  assert.throws(() => pub({ flows: [{ name: 'a8f9c2d7e6b5a4f3c2d1e0f9', start: 'https://a.com/', steps: [{ key: 'Tab' }] }] }), /flow name/);
+  assert.throws(() => pub(wdoc([{ type: { selector: '#a', text: JWT } }])), /secret/);
+  assert.doesNotThrow(() => pub(wdoc([{ tap: '#a', note: 'open the menu' }, { shot: 'menu-open' }, { tap: { text: 'Save' } }])));
+  assert.doesNotThrow(() => parseFlows(wdoc([{ tap: '#a', note: JWT }]), {}), 'private mode (sealed) does not apply the public heuristic');
+  // a heuristic: a token typed in short pieces passes (documented in the README)
+  assert.doesNotThrow(() => pub(wdoc([{ type: { selector: '#a', text: 'eyJhbGci' } }, { type: { selector: '#a', text: 'OiJIUzI1' } }])));
+});
+
+test('selectors starting with a quote or ".." are refused (Playwright would read them as text or XPath)', () => {
+  for (const s of ['"Save"', "'Save'", '\`x\`', '..', '../div', '  ..//x']) bad([{ tap: s }], /plain CSS/);
+  assert.doesNotThrow(() => ok([{ tap: 'a.b > c' }, { tap: '[data-x="y"]' }]));
+});
+
+test('the size limit counts bytes, not characters', () => {
+  const steps = Array.from({ length: 60 }, () => ({ tap: { text: 'ệ'.repeat(120) } }));
+  const chars = JSON.stringify({ flows: [{ name: 'f', start: 'https://a.com/', steps }] }).length;
+  assert.ok(chars < LIMITS.jsonBytes && Buffer.byteLength(JSON.stringify({ flows: [{ name: 'f', start: 'https://a.com/', steps }] })) > LIMITS.jsonBytes);
+  assert.throws(() => parseFlows({ flows: [{ name: 'f', start: 'https://a.com/', steps }] }, {}), /too large/);
+});
+
+test('KITQA_NO_WRITES: a write-protected session refuses allowWrites everywhere, client and sealed job', () => {
+  const nw = (d) => parseFlows(d, { textGuard, noWrites: true });
+  assert.throws(() => nw(wdoc([{ key: 'Tab' }], { allowWrites: 'why not' })), /write-protected/);
+  const r = nw(wdoc([{ key: 'Tab' }]));
+  assert.equal(r.noWrites, true);
+  assert.equal(JSON.parse(r.wireJson).noWrites, true, 'the flag travels with the steps');
+  // the runner side (and the sealed job) re-parse the wire form: allowWrites next to noWrites is refused there too
+  assert.throws(() => parseFlows({ ...JSON.parse(r.wireJson), allowWrites: 'sneaky' }, {}), /write-protected/);
+  assert.throws(() => loadRunnerFlows({ publicJson: JSON.stringify({ ...JSON.parse(r.wireJson), allowWrites: 'sneaky' }) }), /write-protected/);
+  assert.equal(loadRunnerFlows({ publicJson: r.wireJson }).noWrites, true);
+  assert.equal(parseFlows(wdoc([{ key: 'Tab' }]), {}).noWrites, false);
+});
+
+test('KITQA_NO_WRITES through the real client entry points (env var set)', () => {
+  const f = fs.mkdtempSync(path.join(os.tmpdir(), 'mqn-'));
+  const p = path.join(f, 'x.json');
+  fs.writeFileSync(p, JSON.stringify(wdoc([{ tap: '#a' }])));
+  const q = path.join(f, 'y.json');
+  fs.writeFileSync(q, JSON.stringify(wdoc([{ tap: '#a' }], { allowWrites: 'x' })));
+  process.env.KITQA_NO_WRITES = '1';
+  try {
+    assert.equal(readFlows(p).noWrites, true);
+    assert.throws(() => readFlows(q), /write-protected/);
+    assert.throws(() => readFlows(p, { allowWrites: 'cli reason' }), /write-protected/, '--allow-writes on the command line');
+    const pf = privateFlows('https://app.example.com', wdoc([{ tap: '#a' }]).flows ? { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }] } : null);
+    assert.equal(JSON.parse(pf.wireJson).noWrites, true);
+    assert.throws(() => privateFlows('https://app.example.com', { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }], allowWrites: 'x' }), /write-protected/);
+    // the sealed job: allowWrites smuggled in next to noWrites is refused by validateJob (what the runner calls)
+    const wire = JSON.parse(pf.wireJson);
+    const job = buildJob({ KITQA_BASE: 'https://app.example.com', KITQA_STORAGE_STATE: 'x' }, [], () => state2, wire).job;
+    assert.doesNotThrow(() => validateJob(JSON.parse(JSON.stringify(job))));
+    const bad2 = JSON.parse(JSON.stringify(job));
+    bad2.flows.allowWrites = 'smuggled';
+    assert.throws(() => validateJob(bad2), /write-protected/);
+  } finally {
+    delete process.env.KITQA_NO_WRITES;
+  }
+  assert.equal(readFlows(q).allowWrites, 'x', 'without the variable the opt-out still works');
+  fs.rmSync(f, { recursive: true, force: true });
+});
+const state2 = { cookies: [{ name: 's', value: 'v'.repeat(20), domain: 'app.example.com', path: '/', expires: Math.floor(Date.now() / 1000) + 7200, httpOnly: true, secure: true, sameSite: 'Lax' }] };
+
+test('flow count: fewer results than asked is an issue unless the runner said why', () => {
+  assert.equal(flowCountIssue({ flows: [{}, {}] }, 2), null);
+  assert.match(flowCountIssue({ flows: [{}] }, 2), /only 1 of 2/);
+  assert.match(flowCountIssue({}, 1), /only 0 of 1/);
+  assert.equal(flowCountIssue({ flows: [], flowsSkipped: 'iOS write-protected' }, 3), null);
+});
+
+test('summaries sanitise page-controlled text and print the allowWrites reason', () => {
+  assert.equal(clean('a‮b\u0007c​d'), 'a b c d'.replace(/ /g, '').replace('abcd', 'abcd').length ? clean('a‮b\u0007c​d') : '');
+  assert.ok(!/[‮\u0007​]/.test(clean('a‮b\u0007c​d')));
+  const md = renderFlowSummary('ios', flow({ blocked: ['fetch POST‮'], allowWrites: 'fixture reason', guard: { active: false } }));
+  assert.match(md, /WRITES ALLOWED: fixture reason/);
+  assert.ok(!/‮/.test(md));
 });

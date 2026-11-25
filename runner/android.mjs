@@ -94,7 +94,10 @@ async function launch(kind = 'pages') {
     if (flowKind) await ctx.routeWebSocket(() => true, closeWs);
     else await ctx.routeWebSocket((u) => sameHost(u.href, PRIV.base), closeWs);
   } catch (e) {
-    results.notes.push('websocket blocking is not available on this context: ' + String(e.message).split('\n')[0].slice(0, 120));
+    const msg = 'websocket blocking is not available on this context: ' + String(e.message).split('\n')[0].slice(0, 120);
+    results.notes.push(msg);
+    // Flows fail closed, like the HTTP route: without the WebSocket guard no flow runs.
+    if (flowKind) guardError = msg;
   }
   return ctx;
 }
@@ -266,13 +269,19 @@ cur = null;
 if (FLOWS) {
   results.flows = [];
   await withTimeout(context.close(), 20000, 'close').catch(() => {});
-  context = await launch('flow');
+  let flowLaunchError = null;
+  try {
+    context = await launch('flow');
+  } catch (e) {
+    flowLaunchError = 'the flow browser could not be started: ' + String((e && e.message) || e).split('\n')[0].slice(0, 160);
+  }
   const failedFlow = (flow, msg) => ({ name: flow.name, start: flow.startShown, status: 'failed', error: msg, steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 });
   for (const [fi, flow] of FLOWS.flows.entries()) {
     console.log('[flow ' + (fi + 1) + '/' + FLOWS.flows.length + ']' + (PRIV ? '' : ' ' + flow.name));
     let r;
     try {
       if (Date.now() - STARTED > JOB_BUDGET_MS) throw new Error('not run: the job time budget was used up');
+      if (flowLaunchError) throw new Error(flowLaunchError);
       if (guardError) throw new Error('the flow did not run: ' + guardError); // fail closed
       const prev = page;
       page = await withTimeout(context.newPage(), 30000, 'new tab');

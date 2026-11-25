@@ -293,8 +293,9 @@ export async function runFlowAndroid(env, flow, { log = () => {}, startedAt = Da
     }
     const st = Date.now();
     log('  step ' + i + '/' + flow.steps.length + (showLabels ? ' ' + label : ''));
+    const work = doStep(env, s);
     try {
-      const out = await withTimeout(doStep(env, s), LIMITS.stepMs, 'step');
+      const out = await withTimeout(work, LIMITS.stepMs, 'step');
       rec.via = out.via;
       if (out.kb !== undefined) rec.kb = out.kb;
       rec.ok = true;
@@ -302,8 +303,16 @@ export async function runFlowAndroid(env, flow, { log = () => {}, startedAt = Da
     } catch (e) {
       rec.error = String((e && e.message) || e).split('\n')[0].slice(0, 300);
       failed = true;
+      if (/did not finish/.test(rec.error)) {
+        // The timed-out step is still running: close its page (its pending commands then fail) and wait for it to end, so it
+        // cannot keep typing or tapping into the next flow.
+        await env.page.close({ runBeforeUnload: false }).catch(() => {});
+        await Promise.race([work.catch(() => {}), new Promise((r) => setTimeout(r, 10000))]);
+        env.dead = true;
+      }
     }
     rec.ms = Date.now() - st;
+    if (env.dead) { rec.shot = undefined; log('    step ' + i + '/' + flow.steps.length + ' failed in ' + Math.round(rec.ms / 1000) + ' s'); continue; }
     try {
       rec.shot = await withTimeout(snap(String(i).padStart(2, '0') + '-' + (rec.ok ? (s.do === 'shot' ? 'shot-' + s.name : s.do) : 'FAILED-' + s.do)), 35000, 'screenshot');
     } catch (e) {
@@ -313,6 +322,7 @@ export async function runFlowAndroid(env, flow, { log = () => {}, startedAt = Da
     log('    step ' + i + '/' + flow.steps.length + ' ' + (rec.ok ? 'ok' : 'failed') + ' in ' + Math.round(rec.ms / 1000) + ' s');
   }
   try {
+    if (env.dead) throw new Error('the page was closed after a step timed out');
     res.probe = await withTimeout(env.page.evaluate(probe), 15000, 'probe');
   } catch (e) {
     res.notes.push('end-state probe failed: ' + String(e.message).split('\n')[0].slice(0, 100));

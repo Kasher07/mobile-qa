@@ -71,9 +71,10 @@ let dev = candidates[0];
 
 function shot(file) {
   const p = path.join(OUT, file);
-  run('xcrun', ['simctl', 'io', dev.udid, 'screenshot', '--type=jpeg', p]);
+  // execFileSync blocks the event loop: a hung simctl must end by itself, never hold the job.
+  run('xcrun', ['simctl', 'io', dev.udid, 'screenshot', '--type=jpeg', p], { timeout: 30000, killSignal: 'SIGKILL' });
   try {
-    run('sips', ['-Z', '1600', '-s', 'formatOptions', '72', p]);
+    run('sips', ['-Z', '1600', '-s', 'formatOptions', '72', p], { timeout: 20000, killSignal: 'SIGKILL' });
   } catch {}
   return file;
 }
@@ -350,7 +351,12 @@ for (const [i, url] of urls.entries()) {
   saveResults(OUT, results);
 }
 // Flows (scripted steps) run last, in the same Safari session, each starting with a fresh load of its start page.
-if (FLOWS) {
+if (FLOWS && FLOWS.noWrites) {
+  // Write-protected session (KITQA_NO_WRITES=1): iOS cannot block requests, only a page-script guard with known holes, so no flow runs here.
+  results.flows = [];
+  results.flowsSkipped = 'flows were not run on iOS: this session is write-protected (KITQA_NO_WRITES=1) and Safari offers no request-level blocking; iOS did the plain page load-and-scroll screenshots only';
+  note('flows not run on iOS (write-protected session)');
+} else if (FLOWS) {
   results.flows = [];
   for (const [fi, flow] of FLOWS.flows.entries()) {
     console.log('[flow ' + (fi + 1) + '/' + FLOWS.flows.length + ']' + (PRIV ? '' : ' ' + flow.name));
@@ -360,9 +366,12 @@ if (FLOWS) {
       if (!hasWd) throw new Error('no WebDriver session: flows need WebDriver');
       if (PRIV && cookieError) throw new Error(cookieError);
       await wd('POST', '/session/' + sid + '/url', { url: flow.start });
-      await sleep(2000);
-      if (PRIV) await waitSettled(() => exec('return (' + settleProbe.toString() + ')();'), sleep);
-      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: FLOWS.allowWrites };
+      // The guard goes in first thing; the 2 s wait and the settle check run after it.
+      const afterStart = async () => {
+        await sleep(2000);
+        if (PRIV) await waitSettled(() => exec('return (' + settleProbe.toString() + ')();'), sleep);
+      };
+      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: FLOWS.allowWrites, afterStart };
       r = await runFlowIos(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
     } catch (e) {
       r = { name: flow.name, start: flow.startShown, status: 'failed', error: String((e && e.message) || e).split('\n')[0].slice(0, 300), steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 };

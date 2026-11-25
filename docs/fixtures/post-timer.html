@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Timer page</title></head>
+<body style="font-family:-apple-system,system-ui,sans-serif;padding:16px">
+<h1>Timer page</h1>
+<p id="timer-result">waiting for the timer</p>
+<script>
+setTimeout(function () {
+  var out = document.getElementById('timer-result');
+  fetch('post-target.html', { method: 'POST', body: 't=1' })
+    .then(function (r) { out.textContent = 'timer POST answered ' + r.status; })
+    .catch(function (e) { out.textContent = 'timer POST failed: ' + (e && e.name); });
+}, 1000);
+</script>
+</body></html>

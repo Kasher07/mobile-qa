@@ -116,6 +116,7 @@ export function cookiesFor(state, host, now = Date.now()) {
 // A flow's start is a path on the site, checked with the same rules as the plain paths.
 export function privateFlows(baseRaw, doc) {
   return parseFlows(doc, {
+    noWrites: process.env.KITQA_NO_WRITES === '1', // kit-qa --mint sets it; the flag then travels inside the sealed steps too
     checkStart: (s, where) => {
       try {
         const t = checkPrivateTarget(baseRaw, [s]);

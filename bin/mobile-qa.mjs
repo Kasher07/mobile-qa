@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPrivate } from './private-qa.mjs';
-import { parseFlows, reportFlows, FlowError, LIMITS as FLOW_LIMITS } from '../runner/flows.mjs';
+import { parseFlows, reportFlows, flowCountIssue, clean, FlowError, LIMITS as FLOW_LIMITS } from '../runner/flows.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -152,6 +152,7 @@ export function readFlows(file, { allowWrites = null } = {}) {
   try {
     return parseFlows(doc, {
       textGuard,
+      noWrites: process.env.KITQA_NO_WRITES === '1', // set by kit-qa --mint: a write-protected session never opts out of the guard
       checkStart: (s, where) => {
         const c = checkUrl(s);
         if (c.why) throw new FlowError(where + ': refused start URL: ' + c.why);
@@ -567,10 +568,18 @@ async function main() {
       lines.push('- ' + p.url + ' :: ' + (bad.length ? 'ISSUES: ' + bad.join(' | ') : 'ok') + (notes.length ? ' (' + notes.join(', ') + ')' : ''));
       for (const s of p.shots || []) lines.push('  - ' + path.join(dir, s));
     }
+    if (res.flowsSkipped) lines.push('note: ' + clean(res.flowsSkipped, 300), '');
     if (Array.isArray(res.flows) && res.flows.length) {
       const fr = reportFlows(res, dir, {});
       issues += fr.issues;
       lines.push(...fr.lines);
+    }
+    if (flows) {
+      const ci = flowCountIssue(res, flows.flows.length);
+      if (ci) {
+        issues++;
+        lines.push('- flows :: ISSUES: ' + ci);
+      }
     }
     lines.push('');
   }

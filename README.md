@@ -36,8 +36,9 @@ when it is up) is taken after every step and on a failure.
 | `{"shot": "name"}` | an extra named screenshot |
 
 Selectors are plain CSS only (no `text=`, `xpath=`, `>>`, `:has-text`: they would not mean the same on Safari); selectors and texts are data
-handed to Playwright's locator or WebDriver's find-element, never evaluated as code. Limits: 30 s per step, 4 min per flow, 60 steps,
-6 flows, the file at most 20 kB. A failed step or `expect` stops its flow, is an issue (exit 1) and keeps its screenshot; the layout probe
+handed to Playwright's locator or WebDriver's find-element, never evaluated as code. Limits: 30 s per step (the step itself; its screenshot has its own cap), 4 min per flow, 60 steps,
+6 flows, the file at most 20 kB (bytes). A step that times out closes its page and is waited for, so it cannot act on the next flow;
+a run that returns fewer flow results than asked is an issue (exit 1). A failed step or `expect` stops its flow, is an issue (exit 1) and keeps its screenshot; the layout probe
 (overflow, tap targets) also runs on each flow's end state. Output: `<out>/<run>/<platform>/flows/<name>/summary.md` (each step's result,
 time, how it was done, screenshot) plus the screenshots next to it.
 
@@ -56,22 +57,36 @@ time, how it was done, screenshot) plus the screenshots next to it.
   scrolled; measured on iOS 26.2 the actions are accepted and do nothing, so the swipe is done as a script scroll and the summary says
   "NOT a finger swipe". The on-screen keyboard did not appear for synthesized focus. So on iOS the flow proves the page's logic, not
   finger or keyboard behaviour. Pinch and multi-finger gestures are not available on either platform.
+  **Known limit:** on a heavy live page (measured on a charting dashboard) the iOS swipe can hang safaridriver; the step then fails at its
+  cap, the flow stops and no further WebDriver call is made.
 
 **Writes: default NO WRITES.** A flow can press real buttons, so unless the file (or `--allow-writes "<reason>"`) says otherwise:
 - Android: one context-level route, installed before any page loads, aborts every non-GET/HEAD/OPTIONS request to ANY origin (public
   runs included), service workers are blocked and every WebSocket is closed. If it cannot be installed the flow does not run. A
   blocked form submission leaves Chrome's blank error page (the request never left), so a flow that submits a form on Android
   continues on that page; a page's own background POSTs just fail. The count and the paths of blocked requests are in the summary.
-- iOS (no request interception): a JavaScript guard is injected through WebDriver and checked before every step; it blocks fetch/XHR
-  with a method other than GET/HEAD/OPTIONS, `sendBeacon`, form submissions whose method is not GET, and WebSockets, for every origin.
-  safaridriver has no run-at-document-start hook, so the guard goes in as soon as each new document has loaded: **requests a page sends
-  while it loads, from iframes or from service workers are not covered**. The flow summary counts the documents guarded; a document
-  where the guard cannot be installed fails the flow before any step acts on it, and a flow without an active guard is an issue.
+- iOS (no request interception): a **JavaScript guard, not a block**. It is injected through WebDriver right after each document loads,
+  re-checked every 150 ms while a step settles and again right after every step (so a document reached by a tap on a link, Back or
+  Enter is guarded before the screenshot and the next step), under a random per-run property name the page does not know. It stops
+  fetch/XHR whose method is not exactly GET/HEAD/OPTIONS (an XHR whose method it never saw counts as a write), `sendBeacon`, form
+  submissions whose method is not GET, and WebSockets. **Holes, plainly:** requests made while a document loads (before the guard
+  goes in); functions the page captured before the guard (its own references to fetch, XHR or sendBeacon, ofetch/ky-style instances);
+  popups and `target=_blank` windows; dedicated workers; `<a ping>`; WebRTC and WebTransport; a clean `fetch` or
+  `HTMLFormElement.prototype.submit` taken from an iframe; a capture-phase listener that hides a submit from the guard; a page that
+  finds the random marker through `getOwnPropertyNames`. **iOS flows are for pages whose buttons are safe to press; the iOS guard is never
+  "no writes".** The flow summary counts the documents guarded; a document where the guard cannot be installed fails the flow before
+  or right after the step that reached it, and a flow without an active guard is an issue.
 - `--allow-writes "<reason>"` (or `"allowWrites"` in the file) turns the guard off for the flow run and prints the reason in every
   summary; use it only on a repo's own test paths. The plain page loads of the same call keep their usual behaviour.
+- **Write-protected sessions: `KITQA_NO_WRITES=1`** (kit-qa sets it for the minted sessions of paid or admin-capable sites). The client
+  then refuses `--allow-writes` and `"allowWrites"` in the file, the flag travels inside the steps (sealed in private mode) so the
+  runner refuses too, and **flows run on Android only**: iOS does the plain load-and-scroll screenshots and its summary says that
+  flows were not run there and why.
 
-Public mode: the steps are a public workflow input, so text that looks like a secret or personal data (the same checks as URLs: tokens,
-JWTs, long random strings, e-mail addresses) is refused, and so is a start URL that `checkUrl` refuses. Private mode: the steps travel inside the sealed job and the log prints step numbers only.
+Public mode: the steps are a public workflow input, so every string that travels or is printed (typed and matched texts, notes,
+selectors, flow and shot names, the allow-writes reason) must not look like a secret or personal data (the same checks as URLs: tokens, JWTs,
+long random strings, e-mail addresses), and a start URL that `checkUrl` refuses is refused. **That check is a heuristic**: a token typed in
+short pieces passes, so never put a real secret in a public steps file. Private mode: the steps travel inside the sealed job and the log prints step numbers only.
 
 ## Private pages (kit-qa qa-agent sites)
 

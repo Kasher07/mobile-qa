@@ -2,12 +2,14 @@
 // and key actions are WebDriver commands that Safari turns into events (a synthesized click, not a touch on the glass); swipe uses
 // W3C pointer actions of type touch when this Safari accepts them and otherwise falls back to a script scroll, which the step result
 // says in plain words. Back and Forward are WebDriver history commands. Pinch and multi-finger gestures are not available.
-// safaridriver has no run-at-document-start hook, so the write guard (flows.mjs GUARD_SOURCE) is injected as soon as each new
-// document has loaded and checked before every step: requests the page itself sends while it loads are not covered.
+// safaridriver has no run-at-document-start hook, so the write guard (flows.mjs guardBody) is injected as soon as WebDriver gives
+// control back after a load, re-checked every 150 ms while a step settles, and checked again right after every step (a step that
+// navigates, such as a tap on a link, Back or Enter, hands the next document to the same code). The marker is a random per-run
+// property name. Requests a page sends while its document loads are not covered, and the README lists the other holes.
 import fs from 'node:fs';
 import path from 'node:path';
 import { probe, withTimeout } from './lib.mjs';
-import { LIMITS, textXPath, stepLabel, swipePoints, fileSafe, GUARD_SOURCE, GUARD_CHECK, GUARD_READ } from './flows.mjs';
+import { LIMITS, textXPath, stepLabel, swipePoints, fileSafe, guardSource, guardCheck, guardRead, newGuardKey } from './flows.mjs';
 
 const ELEMENT_KEY = 'element-6066-11e4-a52e-4f735466cecf';
 const KEYS = { Enter: '', Tab: '', Backspace: '', Escape: '' };
@@ -16,6 +18,7 @@ const idOf = (e) => e[ELEMENT_KEY] || Object.values(e)[0];
 
 export async function runFlowIos(env, flow, { log = () => {}, showLabels = true } = {}) {
   const { wd, sid, exec, sleep } = env;
+  const GKEY = newGuardKey(); // random per flow: a page cannot know which property says "guarded"
   const dir = path.join(env.outDir, 'flows', flow.name);
   fs.mkdirSync(dir, { recursive: true });
   const res = {
@@ -26,7 +29,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     notes: [],
     probe: null,
     shots: [],
-    guard: { active: false, how: env.allowWrites ? 'off (writes allowed)' : 'JavaScript guard injected after each document loads (fetch/XHR writes, sendBeacon, non-GET forms, WebSockets); safaridriver cannot inject at document start', documents: 0, late: 0, failed: 0 },
+    guard: { active: false, how: env.allowWrites ? 'off (writes allowed)' : 'JavaScript guard injected right after each document loads and re-checked after every step (fetch/XHR writes, sendBeacon, non-GET forms, WebSockets); it is NOT a request-level block, see the README for what it misses', documents: 0, late: 0, failed: 0 },
     allowWrites: env.allowWrites || null,
     ms: 0,
   };
@@ -63,15 +66,15 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     if (env.allowWrites) return;
     let has = false;
     try {
-      has = await exec(GUARD_CHECK);
+      has = await exec(guardCheck(GKEY));
     } catch (e) {
       res.guard.failed++;
       throw new Error('write guard could not be checked: ' + String(e.message).slice(0, 80));
     }
     if (has) { res.guard.active = true; return; }
     try {
-      const r = await exec(GUARD_SOURCE);
-      if (!r || !r.ok || !(await exec(GUARD_CHECK))) throw new Error('guard did not take');
+      const r = await exec(guardSource(GKEY));
+      if (!r || !r.ok || !(await exec(guardCheck(GKEY)))) throw new Error('guard did not take');
     } catch (e) {
       res.guard.failed++;
       throw new Error('write guard could not be installed: ' + String(e.message).slice(0, 80));
@@ -81,9 +84,17 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     res.guard.active = true;
     seen = 0;
   };
+  // While a step settles: look for a new document every 150 ms and guard it at once (errors are raised by the check after the step).
+  const settle = async (ms) => {
+    const end = Date.now() + ms;
+    do {
+      await ensureGuard().catch(() => {});
+      await sleep(150);
+    } while (Date.now() < end);
+  };
   const readBlocked = async () => {
     if (env.allowWrites) return;
-    const b = await exec(GUARD_READ).catch(() => null);
+    const b = await exec(guardRead(GKEY)).catch(() => null);
     if (Array.isArray(b) && b.length > seen) {
       res.blocked.push(...b.slice(seen));
       seen = b.length;
@@ -97,7 +108,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   async function clickChecked(id) {
     await exec(TAP_ARM, [ref(id)]);
     await wd('POST', '/session/' + sid + '/element/' + id + '/click', {});
-    await sleep(600);
+    await settle(600);
     const r = await exec(TAP_READ).catch(() => null); // null: the page navigated away, which a click on a link does
     if (r && !r.hit) {
       await exec('arguments[0].click(); return true;', [ref(id)]);
@@ -146,7 +157,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
         try {
           await wd('POST', '/session/' + sid + '/actions', { actions: [{ type: 'key', id: 'kb', actions: [{ type: 'keyDown', value: KEYS[s.key] }, { type: 'keyUp', value: KEYS[s.key] }] }] });
           await wd('DELETE', '/session/' + sid + '/actions').catch(() => {});
-          await sleep(500);
+          await settle(700);
           return { via: 'WebDriver key action' };
         } catch (e) {
           const a = await wd('GET', '/session/' + sid + '/element/active');
@@ -157,11 +168,11 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
       }
       case 'back':
         await wd('POST', '/session/' + sid + '/back', {});
-        await sleep(1200);
+        await settle(1200);
         return { via: 'WebDriver history back' };
       case 'forward':
         await wd('POST', '/session/' + sid + '/forward', {});
-        await sleep(1200);
+        await settle(1200);
         return { via: 'WebDriver history forward' };
       case 'scroll':
         if (s.target) await exec('arguments[0].scrollIntoView({block:"center",inline:"nearest"}); return true;', [ref(await firstVisible(s.target))]);
@@ -252,6 +263,8 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   let stuck = false;
   const quick = (p) => withTimeout(p, 10000, 'webdriver');
   try {
+    await withTimeout(ensureGuard(), 20000, 'write guard check'); // first thing after the load, before any wait
+    if (env.afterStart) await env.afterStart();
     await withTimeout(ensureGuard(), 20000, 'write guard check');
   } catch (e) {
     res.error = 'the flow did not run: ' + e.message;
@@ -273,6 +286,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
       await withTimeout(ensureGuard(), 20000, 'write guard check');
       const out = await withTimeout(doStep(s), LIMITS.stepMs, 'step');
       rec.via = out.via;
+      await withTimeout(ensureGuard(), 20000, 'write guard check'); // a document the step navigated to is guarded before the screenshot and the next step
       rec.ok = true;
       await quick(readBlocked());
     } catch (e) {

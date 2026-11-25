@@ -6,7 +6,7 @@
 export const LIMITS = {
   flows: 6,
   steps: 60,
-  stepMs: 30000, // one step, screenshot included
+  stepMs: 30000, // the step itself (its screenshot has a separate 35 s cap)
   flowMs: 240000, // one flow
   waitMsMax: 10000, // {"wait":{"ms":N}}
   waitTimeoutMax: 20000, // default 10000
@@ -17,6 +17,7 @@ export const LIMITS = {
   jsonBytes: 20000, // a workflow dispatch carries 65535 bytes in all
 };
 
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -27,7 +28,7 @@ const KEYS = ['Enter', 'Tab', 'Backspace', 'Escape'];
 const DIRECTIONS = ['up', 'down', 'left', 'right'];
 const ACTIONS = ['tap', 'type', 'key', 'back', 'forward', 'scroll', 'swipe', 'wait', 'expect', 'shot'];
 // Playwright-only selector engines and pseudo-classes: they would not mean the same on Safari, so a flow may only use plain CSS.
-const ENGINE_RE = /^\s*(xpath|text|css|id|data-testid|data-test|data-test-id|role|internal:[a-z-]+|js|nth|>>)\b|^\s*\/\/|>>|internal:/i;
+const ENGINE_RE = /^\s*(xpath|text|css|id|data-testid|data-test|data-test-id|role|internal:[a-z-]+|js|nth|>>)\b|^\s*\/\/|>>|internal:|^\s*["'`]|^\s*\.\./i;
 const PSEUDO_RE = /:(has-text|text|text-is|text-matches|visible|nth-match|right-of|left-of|above|below|near|light|is-visible)\b/i;
 // eslint-disable-next-line no-control-regex
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
@@ -37,11 +38,15 @@ const fail = (where, msg) => {
 };
 const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
 
-export function checkSelector(sel, where) {
+export function checkSelector(sel, where, { textGuard } = {}) {
   if (typeof sel !== 'string' || !sel.trim()) fail(where, 'selector must be a non-empty string');
   if (sel.length > LIMITS.selectorMax) fail(where, 'selector longer than ' + LIMITS.selectorMax + ' characters');
   if (CONTROL_RE.test(sel)) fail(where, 'selector has control characters');
   if (ENGINE_RE.test(sel) || PSEUDO_RE.test(sel)) fail(where, 'only plain CSS selectors are allowed (no text=, xpath=, >>, :has-text ...): use {"text": "..."} for visible text');
+  if (textGuard) {
+    const why = textGuard(sel);
+    if (why) fail(where, why);
+  }
   return sel.trim();
 }
 export function checkText(t, where, { textGuard } = {}) {
@@ -57,10 +62,10 @@ export function checkText(t, where, { textGuard } = {}) {
 
 // A target is a CSS string, {"selector": css} or {"text": visible text}.
 export function parseTarget(v, where, opts) {
-  if (typeof v === 'string') return { css: checkSelector(v, where) };
+  if (typeof v === 'string') return { css: checkSelector(v, where, opts) };
   if (isObj(v)) {
     const keys = Object.keys(v);
-    if (keys.length === 1 && keys[0] === 'selector') return { css: checkSelector(v.selector, where) };
+    if (keys.length === 1 && keys[0] === 'selector') return { css: checkSelector(v.selector, where, opts) };
     if (keys.length === 1 && keys[0] === 'text') return { text: checkText(v.text, where, opts).replace(/\s+/g, ' ').trim() };
   }
   return fail(where, 'target must be a CSS string, {"selector": "..."} or {"text": "..."}');
@@ -81,12 +86,13 @@ const frac = (p, where) => {
 export function parseStep(raw, where, opts = {}) {
   if (!isObj(raw)) fail(where, 'a step is an object like {"tap": "#go"}');
   const keys = Object.keys(raw).filter((k) => k !== 'note');
-  if (raw.note !== undefined) checkText(String(raw.note), where + '.note');
+  if (raw.note !== undefined && typeof raw.note !== 'string') fail(where + '.note', 'a note must be a string');
+  if (raw.note !== undefined) checkText(raw.note, where + '.note', opts);
   if (keys.length !== 1) fail(where, 'a step has exactly one action key (' + ACTIONS.join(', ') + ')');
   const act = keys[0];
   const v = raw[act];
   const w = where + '.' + act;
-  const note = raw.note === undefined ? undefined : String(raw.note).slice(0, 80);
+  const note = raw.note === undefined ? undefined : raw.note.slice(0, 80);
   const out = (o) => (note ? { ...o, note } : o);
   switch (act) {
     case 'tap':
@@ -94,7 +100,7 @@ export function parseStep(raw, where, opts = {}) {
     case 'type': {
       if (!isObj(v)) fail(w, 'use {"selector": "...", "text": "..."}');
       onlyKeys(v, ['selector', 'text', 'clear'], w);
-      return out({ do: 'type', target: { css: checkSelector(v.selector, w + '.selector') }, text: checkText(v.text, w + '.text', opts), clear: v.clear === true });
+      return out({ do: 'type', target: { css: checkSelector(v.selector, w + '.selector', opts) }, text: checkText(v.text, w + '.text', opts), clear: v.clear === true });
     }
     case 'key':
       if (!KEYS.includes(v)) fail(w, 'key must be one of ' + KEYS.join(', '));
@@ -148,6 +154,7 @@ export function parseStep(raw, where, opts = {}) {
     }
     case 'shot': {
       if (typeof v !== 'string' || !/^[A-Za-z0-9_-]{1,40}$/.test(v)) fail(w, 'a shot name is 1-40 letters, digits, - or _');
+      if (opts.textGuard && opts.textGuard(v)) fail(w, 'a shot name ' + opts.textGuard(v));
       return out({ do: 'shot', name: v });
     }
     default:
@@ -156,10 +163,13 @@ export function parseStep(raw, where, opts = {}) {
 }
 
 // doc: { flows: [{ name, start, steps }], allowWrites?: "reason" }. mode public: start is a URL checked by checkStart (the
-// caller's public-URL rules); mode private: start is a path on the site. Returns { allowWrites, flows, wireJson }.
-export function parseFlows(doc, { checkStart, textGuard } = {}) {
+// caller's public-URL rules); mode private: start is a path on the site. Returns { allowWrites, noWrites, flows, wireJson }.
+export function parseFlows(doc, { checkStart, textGuard, noWrites = false } = {}) {
   if (!isObj(doc)) fail('steps file', 'must be an object {"flows": [...]}');
-  onlyKeys(doc, ['flows', 'allowWrites'], 'steps file');
+  onlyKeys(doc, ['flows', 'allowWrites', 'noWrites'], 'steps file');
+  // A write-protected session (kit-qa --mint sets KITQA_NO_WRITES=1; the flag then travels in the steps) never opts out of the guard.
+  const protectedRun = noWrites === true || doc.noWrites === true;
+  if (protectedRun && doc.allowWrites !== undefined) fail('allowWrites', 'refused: this session is write-protected (KITQA_NO_WRITES=1), flows cannot opt out of the no-writes guard');
   if (!Array.isArray(doc.flows) || !doc.flows.length) fail('steps file', '"flows" must be a non-empty array');
   if (doc.flows.length > LIMITS.flows) fail('steps file', 'max ' + LIMITS.flows + ' flows per file');
   let allowWrites = null;
@@ -175,6 +185,7 @@ export function parseFlows(doc, { checkStart, textGuard } = {}) {
     onlyKeys(f, ['name', 'start', 'steps'], where);
     if (!NAME_RE.test(f.name || '')) fail(where, 'name must be 1-40 letters, digits, - or _');
     if (seen.has(f.name)) fail(where, 'duplicate flow name "' + f.name + '"');
+    if (textGuard && textGuard(f.name)) fail(where, 'the flow name ' + textGuard(f.name) + ' (names are printed in the public log)');
     seen.add(f.name);
     if (typeof f.start !== 'string' || !f.start) fail(where, 'start is required (a URL in public mode, a path in private mode)');
     const start = checkStart ? checkStart(f.start, where) : f.start;
@@ -185,9 +196,9 @@ export function parseFlows(doc, { checkStart, textGuard } = {}) {
     return { name: f.name, start, steps };
   });
   // "wire" is what travels (authoring form, so the runner validates it again with the same rules); "flows" is the parsed form.
-  const wireJson = JSON.stringify({ flows: wire, ...(allowWrites ? { allowWrites } : {}) });
-  if (wireJson.length > LIMITS.jsonBytes) fail('steps file', 'too large to send (max ' + LIMITS.jsonBytes + ' bytes)');
-  return { allowWrites, flows, wireJson };
+  const wireJson = JSON.stringify({ flows: wire, ...(allowWrites ? { allowWrites } : {}), ...(protectedRun ? { noWrites: true } : {}) });
+  if (Buffer.byteLength(wireJson) > LIMITS.jsonBytes) fail('steps file', 'too large to send (max ' + LIMITS.jsonBytes + ' bytes)');
+  return { allowWrites, noWrites: protectedRun, flows, wireJson };
 }
 
 // ---- targets, shared by both drivers
@@ -234,14 +245,16 @@ export function swipePoints(direction, rect) {
 export const fileSafe = (s) => String(s).replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 60);
 
 // ---- iOS write guard: runs in the page through WebDriver "Execute Script" (safaridriver has no run-at-document-start hook).
-// Blocks, for every origin: fetch and XHR with a method other than GET/HEAD/OPTIONS, sendBeacon, form submissions whose method is
-// not GET, and WebSockets. Records what it blocked in window.__mqGuard.blocked. Idempotent per document.
-export const GUARD_SOURCE = String.raw`
-  if (window.__mqGuard) return { ok: true, already: true };
+// Blocks, for every origin: fetch and XHR whose method is not exactly GET/HEAD/OPTIONS (an XHR whose method it never saw counts as
+// a write), sendBeacon, form submissions whose method is not GET, and WebSockets. Records what it blocked in a per-run, random,
+// non-enumerable property (window[KEY]) that the page does not know; idempotent per document. It is a JavaScript guard: see the
+// README for everything it does not cover.
+function guardBody(KEY) {
+  if (window[KEY]) return { ok: true, already: true };
   var blocked = [];
   var rec = function (what) { if (blocked.length < 50) blocked.push(String(what).slice(0, 60)); };
-  var readOnly = function (m) { return /^(GET|HEAD|OPTIONS)$/i.test(String(m || 'GET')); };
-  Object.defineProperty(window, '__mqGuard', { value: { blocked: blocked }, enumerable: false });
+  var readOnly = function (m) { return m === 'GET' || m === 'HEAD' || m === 'OPTIONS'; };
+  Object.defineProperty(window, KEY, { value: { blocked: blocked }, enumerable: false });
   var realFetch = window.fetch;
   if (realFetch) {
     window.fetch = function (input, init) {
@@ -252,12 +265,14 @@ export const GUARD_SOURCE = String.raw`
   }
   var XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
   if (XP) {
+    var methods = new WeakMap();
     var realOpen = XP.open;
     var realSend = XP.send;
-    XP.open = function (m) { this.__mqMethod = String(m).toUpperCase(); return realOpen.apply(this, arguments); };
+    XP.open = function (m) { methods.set(this, String(m).toUpperCase()); return realOpen.apply(this, arguments); };
     XP.send = function () {
-      if (!readOnly(this.__mqMethod)) {
-        rec('xhr ' + this.__mqMethod);
+      var m = methods.get(this);
+      if (!readOnly(m)) {
+        rec('xhr ' + m);
         var x = this;
         setTimeout(function () { x.dispatchEvent(new Event('error')); x.dispatchEvent(new Event('loadend')); }, 0);
         return;
@@ -277,9 +292,11 @@ export const GUARD_SOURCE = String.raw`
   if (realSubmit) HTMLFormElement.prototype.submit = function () { if (formWrites(this, null)) { rec('form.submit'); return; } return realSubmit.apply(this, arguments); };
   if (window.WebSocket) window.WebSocket = function () { rec('websocket'); throw new DOMException('mobile-qa write guard: WebSockets are blocked', 'SecurityError'); };
   return { ok: true, already: false };
-`;
-export const GUARD_CHECK = 'return !!window.__mqGuard;';
-export const GUARD_READ = 'return window.__mqGuard ? window.__mqGuard.blocked.slice() : null;';
+}
+export const guardSource = (key) => 'return (' + guardBody.toString() + ')(' + JSON.stringify(key) + ');';
+export const guardCheck = (key) => 'return !!window[' + JSON.stringify(key) + '];';
+export const guardRead = (key) => 'var g = window[' + JSON.stringify(key) + ']; return g ? g.blocked.slice() : null;';
+export const newGuardKey = () => '__mq' + randomBytes(9).toString('hex');
 
 // ---- verdict and summary (client side; the runner only records facts)
 export function flowVerdict(f) {
@@ -304,12 +321,26 @@ export function flowVerdict(f) {
   return { bad, notes };
 }
 
-export function renderFlowSummary(platform, f, { T = (s) => String(s), allowWritesText } = {}) {
+// Page- and runner-controlled text: no control, invisible or bidi characters, bounded (same rules as the private-mode sanitiser).
+export const clean = (s, max = 300) =>
+  String(s ?? '')
+    .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ')
+    .replace(/[\p{Cf}\p{Co}\p{Cn}\p{Cs}]+/gu, '')
+    .slice(0, max);
+
+// The number of flow results must match what was asked, unless the runner said why not (iOS under KITQA_NO_WRITES).
+export function flowCountIssue(res, requested) {
+  const got = Array.isArray(res.flows) ? res.flows.length : 0;
+  if (res.flowsSkipped) return null;
+  return got < requested ? 'only ' + got + ' of ' + requested + ' flow result(s) came back' : null;
+}
+
+export function renderFlowSummary(platform, f, { T = clean } = {}) {
   const v = flowVerdict(f);
   const L = ['# flow ' + f.name + ' on ' + platform + ': ' + (v.bad.length ? 'FAILED' : 'passed'), ''];
   L.push('start: ' + T(f.startShown || f.start || '?'), 'time: ' + Math.round((f.ms || 0) / 1000) + ' s', '');
   if (f.guard) L.push('write guard: ' + T(f.guard.how || '') + (f.guard.documents !== undefined ? ' (' + f.guard.documents + ' document(s), ' + (f.guard.late || 0) + ' guarded after load)' : ''), '');
-  if (f.allowWrites) L.push('WRITES ALLOWED: ' + (allowWritesText || T(f.allowWrites)), '');
+  if (f.allowWrites) L.push('WRITES ALLOWED: ' + T(f.allowWrites, 200), '');
   L.push('| # | step | result | ms | how | screenshot |', '|---|------|--------|----|-----|------------|');
   for (const s of f.steps || []) {
     L.push('| ' + s.i + ' | ' + T(s.label).replace(/\|/g, '/') + ' | ' + (s.skipped ? 'not run' : s.ok ? 'ok' : 'FAILED: ' + T(s.error || '', 160).replace(/\|/g, '/')) + ' | ' + (s.ms ?? '') + ' | ' + T(s.via || '', 60).replace(/\|/g, '/') + (s.kb === true ? ', keyboard up' : '') + ' | ' + (s.shot || '') + ' |');
@@ -322,7 +353,7 @@ export function renderFlowSummary(platform, f, { T = (s) => String(s), allowWrit
 
 // Client side: writes <dir>/flows/<name>/summary.md for every flow of one platform's results and returns the lines for the main
 // summary plus the number of issues. T cleans untrusted text (private runs); the shot paths are re-sanitised here.
-export function reportFlows(res, dir, { T = (s) => String(s), allowWritesText } = {}) {
+export function reportFlows(res, dir, { T = clean } = {}) {
   const lines = [];
   let issues = 0;
   for (const f of (Array.isArray(res.flows) ? res.flows : []).slice(0, LIMITS.flows)) {
@@ -331,7 +362,7 @@ export function reportFlows(res, dir, { T = (s) => String(s), allowWritesText } 
     for (const s of f.steps) if (s.shot) s.shot = String(s.shot).replace(/[^A-Za-z0-9._/-]/g, '_');
     const v = flowVerdict(f);
     issues += v.bad.length;
-    const md = renderFlowSummary(res.platform, { ...f, name }, { T, allowWritesText });
+    const md = renderFlowSummary(res.platform, { ...f, name }, { T });
     const fdir = path.join(dir, 'flows', name);
     fs.mkdirSync(fdir, { recursive: true });
     fs.writeFileSync(path.join(fdir, 'summary.md'), md);
@@ -362,5 +393,5 @@ export function loadRunnerFlows({ publicJson, privateDoc, base }) {
     return u.href;
   };
   const doc = parseFlows(src, { checkStart });
-  return { allowWrites: doc.allowWrites, flows: doc.flows.map((f) => ({ ...f, startShown: f.start, start: base ? new URL(f.start, base).href : f.start })) };
+  return { allowWrites: doc.allowWrites, noWrites: doc.noWrites, flows: doc.flows.map((f) => ({ ...f, startShown: f.start, start: base ? new URL(f.start, base).href : f.start })) };
 }
