@@ -35,7 +35,9 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     const r = await wd('POST', '/session/' + sid + '/elements', t.css !== undefined ? { using: 'css selector', value: t.css } : { using: 'xpath', value: textXPath(t.text) });
     return (r || []).map(idOf);
   };
-  const isShown = (id) => wd('GET', '/session/' + sid + '/element/' + id + '/displayed').catch(() => false);
+  // safaridriver has no "is displayed" endpoint: ask the page (a non-empty box that is not hidden, like Playwright's visible).
+  const VISIBLE_JS = 'var el=arguments[0]; var r=el.getBoundingClientRect(); if(!(r.width>0&&r.height>0)) return false; var cs=getComputedStyle(el); return cs.visibility!=="hidden"&&cs.display!=="none"&&parseFloat(cs.opacity)>0;';
+  const isShown = (id) => exec(VISIBLE_JS, [ref(id)]).catch(() => false);
   const visibleOnes = async (t) => {
     const out = [];
     for (const id of (await elements(t)).slice(0, 40)) if (await isShown(id)) out.push(id);

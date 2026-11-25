@@ -1,5 +1,6 @@
 // Flow steps on Chrome for Android (Playwright's Android API). Taps and swipes are real touches: Android's own input system
-// (adb input, the same path a finger takes), so Chrome shows the soft keyboard and the browser bars react. Because adb works in
+// (adb shell input, injected below the browser, the path a finger takes), so Chrome shows the soft keyboard and the browser bars react.
+// (Playwright's own device.input needs a driver apk the emulator image does not have, so the shell command is used.) Because adb works in
 // screen pixels, the page-to-screen offset is measured before each touch with a transparent overlay that swallows one tap
 // (the page never receives it). Text is typed with DevTools key events after a real tap focused the field (not through the
 // keyboard app). Back is the hardware Back key. Forward has no hardware key: DevTools history. Scroll to/by is a script scroll.
@@ -30,7 +31,7 @@ export async function keyboardUp(sh) {
 // Screen pixels of the page origin: tap the centre of the screen once, under a transparent overlay that eats the tap, and
 // compare where the page saw it (CSS px) with where adb sent it (screen px).
 async function calibrate(env) {
-  const { page, device, sh } = env;
+  const { page, sh } = env;
   const m = /(\d+)x(\d+)/.exec(await sh('wm size | tail -1'));
   if (!m) throw new Error('screen size unknown');
   const sw = Number(m[1]);
@@ -56,7 +57,7 @@ async function calibrate(env) {
       }),
   );
   await wait(page, 100);
-  await device.input.tap({ x: Math.round(sw / 2), y: Math.round(sh_ / 2) });
+  await sh('input tap ' + Math.round(sw / 2) + ' ' + Math.round(sh_ / 2));
   const r = await p;
   await wait(page, 250);
   if (!r) throw new Error('calibration tap not seen by the page');
@@ -97,7 +98,8 @@ async function realTap(env, l) {
   if (a.error) throw new Error(a.error);
   try {
     const c = await cal(env);
-    await env.device.input.tap(toScreen(c, a.x, a.y));
+    const p = toScreen(c, a.x, a.y);
+    await env.sh('input tap ' + p.x + ' ' + p.y);
     return 'real touch (adb input tap)';
   } catch (e) {
     env.cal = null;
@@ -114,7 +116,7 @@ async function realTap(env, l) {
 const KEYMAP = { Enter: 'Enter', Tab: 'Tab', Backspace: 'Backspace', Escape: 'Escape' };
 
 async function doStep(env, s) {
-  const { page, device, sh } = env;
+  const { page, sh } = env;
   const to = (t) => firstVisible(page, t);
   switch (s.do) {
     case 'tap': {
@@ -149,7 +151,7 @@ async function doStep(env, s) {
       return { via: 'DevTools key event' };
     case 'back': {
       const kb = await keyboardUp(sh);
-      await device.input.press('Back');
+      await sh('input keyevent KEYCODE_BACK');
       env.cal = null;
       await wait(page, 900);
       return { via: 'hardware Back key' + (kb ? ' (the keyboard was up: Back closed it first, the page did not go back)' : '') };
@@ -185,7 +187,9 @@ async function doStep(env, s) {
         toPt = { x: Math.round(s.to[0] * vp.w), y: Math.round(s.to[1] * vp.h) };
       }
       const c = await cal(env);
-      await device.input.swipe(toScreen(c, from.x, from.y), [toScreen(c, toPt.x, toPt.y)], 20);
+      const p0 = toScreen(c, from.x, from.y);
+      const p1 = toScreen(c, toPt.x, toPt.y);
+      await sh('input swipe ' + p0.x + ' ' + p0.y + ' ' + p1.x + ' ' + p1.y + ' 450');
       env.cal = null;
       await wait(page, 700);
       return { via: 'real touch (adb input swipe)' };
