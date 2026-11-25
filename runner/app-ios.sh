@@ -2,13 +2,14 @@
 # One shard: boots the newest plain iPhone simulator, installs the prepared release .app and runs one Maestro flow
 # (FLOW, name without .yaml) in light mode, or with PASS=dark in dark mode at the largest accessibility text size.
 # Records app size and the iCloud backup exclusion of the app's Bible folder. Results in out/ios-<pass>-<flow>.
+# PASS=widgets: the widget step instead of a flow (runner/app-widgets.mjs).
 set -uo pipefail
 [[ "${FLOW:-}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad FLOW"; exit 1; }
-PASS="${PASS:-light}"; [[ "$PASS" =~ ^(light|dark)$ ]] || { echo "bad PASS"; exit 1; }
+PASS="${PASS:-light}"; [[ "$PASS" =~ ^(light|dark|widgets)$ ]] || { echo "bad PASS"; exit 1; }
 OUT="$PWD/out/ios-$PASS-$FLOW"; mkdir -p "$OUT"
 APP=$(find "$RUNNER_TEMP/ready" -maxdepth 1 -name "*.app" | head -1)
 [ -n "$APP" ] || { echo "no prepared .app"; exit 1; }
-FILE="$RUNNER_TEMP/ready/.maestro/$FLOW.yaml"; [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
+FILE="$RUNNER_TEMP/ready/.maestro/$FLOW.yaml"; [ "$PASS" = widgets ] || [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
 du -sk "$APP" | awk '{print "app_kb=" $1}' > "$OUT/checks.txt"
 UDID=$(xcrun simctl list devices available -j | node -e '
   const j = JSON.parse(require("fs").readFileSync(0, "utf8")).devices;
@@ -28,6 +29,11 @@ xcrun simctl install "$UDID" "$APP"
 # The workflow warmed the simulator's TLS trust in the background after boot; wait for it (at most 2 min).
 for _ in $(seq 1 60); do [ -f "$RUNNER_TEMP/warm" ] && break; sleep 2; done
 status=0
+if [ "$PASS" = widgets ]; then
+  OUT="$OUT" UDID="$UDID" FLOWS="$RUNNER_TEMP/ready/.maestro" node runner/app-widgets.mjs ios > "$OUT/maestro.log" 2>&1 || status=1
+  grep -E "^\[widgets" "$OUT/maestro.log" | sed -E 's/ - .*//' || true
+  exit $status
+fi
 ( cd "$OUT" && maestro --device "$UDID" test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
 DATA=$(xcrun simctl get_app_container "$UDID" "$APP_ID" data 2>/dev/null)

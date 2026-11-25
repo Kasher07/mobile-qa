@@ -76,8 +76,10 @@ export function summarize({ outDir, platform, shards, log }) {
     if (!cases.length) ok = false;
     for (const c of cases) {
       const failed = /<failure/.test(c[3] || '');
+      // A best-effort step that could not be done (the widget step's lock screen, Tinted) is skipped, not failed.
+      const skipped = !failed && /<skipped/.test(c[3] || '');
       if (failed) ok = false;
-      log(platform + '/' + sh.pass + ': ' + (failed ? 'FAIL ' : 'ok   ') + c[1] + (failed ? ' - ' + ((c[3].match(/<failure[^>]*>([^<]{0,300})/) || c[3].match(/message="([^"]*)"/))?.[1] || '').trim() : ''));
+      log(platform + '/' + sh.pass + ': ' + (failed ? 'FAIL ' : skipped ? 'skip ' : 'ok   ') + c[1] + (failed || skipped ? ' - ' + ((c[3].match(/<(?:failure|skipped)[^>]*>([^<]{0,300})/) || c[3].match(/message="([^"]*)"/))?.[1] || '').trim() : ''));
     }
   }
   return ok;

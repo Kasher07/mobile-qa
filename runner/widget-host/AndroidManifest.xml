@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- app-qa widget host: shows another app's home-screen widgets the way a launcher does (AppWidgetHost), so the
+     emulator needs no launcher. Built by runner/widget-host-build.sh in the flow job; never published. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="qa.widgethost">
+  <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+  <queries>
+    <intent><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent>
+  </queries>
+  <application android:label="QA widgets" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+    <activity android:name=".HostActivity" android:exported="true" android:launchMode="singleTask"
+        android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+  </application>
+</manifest>

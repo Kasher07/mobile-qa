@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # One shard, inside android-emulator-runner: installs the prepared release APK and runs one Maestro flow (FLOW) in
 # light mode, or with PASS=dark in dark mode at font scale 2.0; records APK size, permissions and backup rules.
+# PASS=widgets: the widget step instead of a flow (runner/app-widgets.mjs; the launchers stay off for it too).
 # Results in out/android-<pass>-<flow>.
 set -uo pipefail
 [[ "${FLOW:-}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad FLOW"; exit 1; }
-PASS="${PASS:-light}"; [[ "$PASS" =~ ^(light|dark)$ ]] || { echo "bad PASS"; exit 1; }
+PASS="${PASS:-light}"; [[ "$PASS" =~ ^(light|dark|widgets)$ ]] || { echo "bad PASS"; exit 1; }
 OUT="$PWD/out/android-$PASS-$FLOW"; mkdir -p "$OUT"
 APK=$(ls "$RUNNER_TEMP"/ready/*.apk | head -1)
 [ -n "$APK" ] || { echo "no prepared APK"; exit 1; }
-FILE="$RUNNER_TEMP/ready/.maestro/$FLOW.yaml"; [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
+FILE="$RUNNER_TEMP/ready/.maestro/$FLOW.yaml"; [ "$PASS" = widgets ] || [ -f "$FILE" ] || { echo "no flow $FLOW"; exit 1; }
 AAPT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)aapt2
 { echo "apk_bytes=$(stat -c %s "$APK") (x86_64 only)"
   "$AAPT" dump permissions "$APK" | sed 's/^/manifest: /'
@@ -31,6 +32,12 @@ for pkg in com.android.launcher3 com.google.android.apps.nexuslauncher; do
 done
 adb shell settings put global hide_error_dialogs 1 > /dev/null 2>&1 || true
 status=0
+if [ "$PASS" = widgets ]; then
+  OUT="$OUT" FLOWS="$RUNNER_TEMP/ready/.maestro" node runner/app-widgets.mjs android > "$OUT/maestro.log" 2>&1 || status=1
+  grep -E "^\[widgets" "$OUT/maestro.log" | sed -E 's/ - .*//' || true
+  adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID|widget" | tail -200 > "$OUT/logcat-errors.txt" || true
+  exit $status
+fi
 ( cd "$OUT" && maestro test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
 adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID" | tail -200 > "$OUT/logcat-errors.txt" || true

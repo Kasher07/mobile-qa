@@ -2,7 +2,8 @@
 # iOS on one Mac (Codemagic M2): boots one simulator, warms its TLS trust, installs the prepared .app, then runs the
 # light-mode flows in a single Maestro session (one XCTest driver start instead of one per flow) and the dark +
 # largest-text flows after switching the simulator's look. SHARDS: JSON list of {flow, pass}. Results in
-# out/ios-light-<flow> / out/ios-dark-<flow>, one folder per flow like the GitHub shards.
+# out/ios-light-<flow> / out/ios-dark-<flow>, one folder per flow like the GitHub shards. A shard with pass "widgets" runs
+# the widget step (runner/app-widgets.mjs) after the light flows, before the simulator switches to dark + largest text.
 set -uo pipefail
 APP=$(find "$APP_READY" -maxdepth 1 -name "*.app" | head -1)
 [ -n "$APP" ] || { echo "no prepared .app"; exit 1; }
@@ -32,8 +33,15 @@ run_pass() { # $1 = light|dark, $2.. = flow names; one Maestro session, results 
   grep -E "^\[(Passed|Failed)\]" "$dir/maestro.log" | sed -E 's/ \(.*//' || true
   node runner/app-split-junit.mjs "$dir" "$pass" "$PWD/out" "$@"
 }
-[ ${#LIGHT[@]} -eq 0 ] && [ ${#DARK[@]} -eq 0 ] && { echo "no flows to run"; exit 1; }
+WIDGETS_STEP=$(node -e 'console.log(JSON.parse(process.env.SHARDS).some((s) => s.pass === "widgets") ? "yes" : "")')
+[ ${#LIGHT[@]} -eq 0 ] && [ ${#DARK[@]} -eq 0 ] && [ -z "$WIDGETS_STEP" ] && { echo "no flows to run"; exit 1; }
 [ ${#LIGHT[@]} -gt 0 ] && run_pass light "${LIGHT[@]}"
+if [ -n "$WIDGETS_STEP" ]; then
+  mkdir -p "$PWD/out/ios-widgets-home"
+  OUT="$PWD/out/ios-widgets-home" UDID="$UDID" FLOWS="$FLOWS" node runner/app-widgets.mjs ios > "$PWD/out/ios-widgets-home/maestro.log" 2>&1 || status=1
+  grep -E "^\[widgets" "$PWD/out/ios-widgets-home/maestro.log" | sed -E 's/ - .*//' || true
+  xcrun simctl ui "$UDID" appearance light
+fi
 DATA=$(xcrun simctl get_app_container "$UDID" "$APP_ID" data 2>/dev/null)
 { du -sk "$APP" | awk '{print "app_kb=" $1}'
   xcrun simctl list devices | grep "$UDID" | sed 's/^ */device=/'

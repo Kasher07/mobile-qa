@@ -7,6 +7,7 @@
 //
 // Usage: node bin/app-qa.mjs --app <expo project dir> [--changed | --flows a,b [--dark a,b]] [--platforms ios,android]
 //        [--ios background|wait] [--ios-on codemagic|codemagic:<n>|github] [--full] [--out DIR] [--app-id <id>] [--keep]
+//        [--widgets all|Name,...]
 //   --changed  only the flows the files changed since that platform's last passing run need (.maestro/flows-map.json);
 //              nothing changed that a flow covers = no run at all
 //   --flows    these flows (light), --dark these again in dark mode with the largest text
@@ -20,6 +21,11 @@
 //   --plan-only   print what would run (flows, lane decision line) and stop: nothing packed, started or written
 //   --ios      background (default): wait for Android only; iOS finishes in a detached process and the next call
 //              prints its result; wait: wait for both (store builds)
+//   --widgets all|Name,...   also put the app's home-screen widgets (expo-widgets in app.json) on the device and photograph
+//              them in light and dark (iOS also Tinted, plus lock-screen widgets, best effort): one extra step per platform
+//              after the app ran once. Alone (no --flows/--changed) it runs only that step. Optional app flows:
+//              .maestro/widgets/setup.yaml (first run of the app) and .maestro/widgets/after.yaml (runs on the screen with
+//              the widgets, e.g. press a widget button and check the app). How: runner/app-widgets.mjs.
 // Speed: a JS-only change (same Expo fingerprint and media files as a build kept on this machine) reuses that build
 // and replaces only the JS (no Xcode/Gradle); --full forces a native build.
 // The app (git-tracked + untracked-not-ignored files, so uncommitted work is tested) is packed, encrypted with a fresh
@@ -36,6 +42,7 @@ import { markIosResultSeen, readUnseenIosResults } from './app-qa-ios-results.mj
 import { chooseIosLane, parseIosOn } from './app-qa-pool.mjs';
 import { changedSince, describeDecision, fileMapHash, iosRisk, moveLastPass, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writePendingIos } from './app-qa-select.mjs';
 import { findShell, mediaHash, nativeFingerprint, shellKey, storeShell } from './app-qa-shell.mjs';
+import { widgetPlan, widgetPlatforms } from './app-qa-widgets.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -44,7 +51,7 @@ const log = makeLog('app-qa');
 const FLOWS_RE = /^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$/;
 
 function parseArgs(argv) {
-  const o = { app: null, platforms: 'ios,android', out: null, appId: null, keep: false, iosRunner: 'macos-26', flows: null, dark: null, changed: false, full: false, iosOn: null, ios: 'background', iosWhen: 'always', unitCovered: null, lang: 'en', planOnly: false };
+  const o = { app: null, platforms: 'ios,android', out: null, appId: null, keep: false, iosRunner: 'macos-26', flows: null, dark: null, changed: false, full: false, iosOn: null, ios: 'background', iosWhen: 'always', unitCovered: null, lang: 'en', planOnly: false, widgets: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--app') o.app = argv[++i];
@@ -63,6 +70,7 @@ function parseArgs(argv) {
     else if (a === '--unit-covered') o.unitCovered = argv[++i];
     else if (a === '--lang') o.lang = argv[++i];
     else if (a === '--plan-only') o.planOnly = true;
+    else if (a === '--widgets') o.widgets = argv[++i];
     else throw new Error('unknown option ' + a);
   }
   if (!o.app) throw new Error('--app <expo project dir> is required');
@@ -73,6 +81,7 @@ function parseArgs(argv) {
   if (!/^(risk|always)$/.test(o.iosWhen)) throw new Error('--ios-when must be risk or always');
   if (!/^(vi|en)$/.test(o.lang)) throw new Error('--lang must be vi or en');
   if (o.changed && o.flows) throw new Error('--changed and --flows exclude each other');
+  if (o.widgets != null && !/^(all|[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*)$/.test(o.widgets)) throw new Error('--widgets takes all or widget names, comma-separated');
   return o;
 }
 
@@ -88,6 +97,7 @@ const flowNames = fs.readdirSync(maestroDir).filter((f) => f.endsWith('.yaml')).
 const readList = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').split(/\s+/).filter(Boolean) : []);
 const darkDefault = readList(path.join(maestroDir, 'dark-flows.txt'));
 const flowMap = fs.existsSync(path.join(maestroDir, 'flows-map.json')) ? JSON.parse(fs.readFileSync(path.join(maestroDir, 'flows-map.json'), 'utf8')) : null;
+const wplan = opts.widgets ? widgetPlan(appJson, opts.widgets) : null;
 for (const f of [opts.flows, opts.dark].filter((x) => x && x !== 'none').join(',').split(',').filter(Boolean)) {
   if (!flowNames.includes(f)) throw new Error('no flow .maestro/' + f + '.yaml');
 }
@@ -144,7 +154,14 @@ for (const p of opts.platforms.split(',')) {
       if (opts.iosWhen === 'risk' && opts.ios === 'background' && !risk) { decided.deferred = plan.ios; plan.ios = []; }
     }
     log(p + ': ' + (plan[p].length ? plan[p].map((s) => (s.pass === 'dark' ? 'dark ' : '') + s.flow).join(', ') : 'nothing to run') + ' (' + sel.why.slice(0, 300) + ')');
-  } else plan[p] = toShards(flowNames, opts.dark === 'none' ? [] : opts.dark ? opts.dark.split(',') : darkDefault);
+  } else if (wplan) plan[p] = [];
+  else plan[p] = toShards(flowNames, opts.dark === 'none' ? [] : opts.dark ? opts.dark.split(',') : darkDefault);
+}
+// The widget step: one shard per platform that has widgets, after the flows (pass "widgets", runner/app-widgets.mjs).
+if (wplan) {
+  const wp = widgetPlatforms(wplan, Object.keys(plan));
+  for (const p of wp) plan[p].push({ flow: 'home', pass: 'widgets' });
+  log('widgets: ' + (wp.length ? wp.map((p) => p + ' ' + (p === 'android' ? wplan.android.join(', ') : [...wplan.ios.map((k) => k.name + ' ' + k.families.join('/')), ...wplan.lock.map((k) => k.name + ' (lock) ' + k.families.join('/'))].join(', '))).join('; ') : 'none on ' + opts.platforms));
 }
 const platforms = Object.keys(plan).filter((p) => plan[p].length);
 if (opts.changed) {
@@ -180,7 +197,8 @@ const useLane = (conf) => {
 };
 useLane(null);
 // A snapshot says "everything that changed passed": only a --changed or full run, with the default dark pass, earns it.
-const savesSnapshot = !opts.flows && !opts.dark;
+// A widgets-only call ran no flow.
+const savesSnapshot = !opts.flows && !opts.dark && !(opts.widgets && !opts.changed);
 
 const token = execFileSync('gh', ['auth', 'token', '--user', ACCOUNT], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const env = { ...process.env, GH_TOKEN: token };
@@ -329,7 +347,7 @@ try {
   setKey(key.toString('hex'));
   gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
   if (cm) {
-    cmBuildId = await cm.start({ ASSET_TAG: tag, APP_ID: appId, APP_QA_KEY: key.toString('hex'), REUSE: reuse.includes('ios') ? 'ios' : '', SHARDS: JSON.stringify(plan.ios) });
+    cmBuildId = await cm.start({ ASSET_TAG: tag, APP_ID: appId, APP_QA_KEY: key.toString('hex'), REUSE: reuse.includes('ios') ? 'ios' : '', SHARDS: JSON.stringify(plan.ios), WIDGETS: wplan ? JSON.stringify(wplan) : '' });
     log('ios on Codemagic M2' + (iosBackground ? ' (background)' : '') + ': https://codemagic.io/app/' + cmConf.appId + '/build/' + cmBuildId);
     if (iosBackground) {
       // The detached process owns the iOS half from here: results, kept build, release deletion, the iOS snapshot.
@@ -351,7 +369,7 @@ try {
   if (ghPlatforms.length) {
     dispatched = true;
     gh(['workflow', 'run', WORKFLOW, '-R', REPO, '-f', 'request_id=' + rid, '-f', 'asset_tag=' + tag, '-f', 'platforms=' + ghPlatforms.join(','), '-f', 'app_id=' + appId,
-      '-f', 'ios_runner=' + opts.iosRunner, '-f', 'shards=' + JSON.stringify(ghShards), '-f', 'reuse=' + reuse.filter((p) => ghPlatforms.includes(p)).join(',')]);
+      '-f', 'ios_runner=' + opts.iosRunner, '-f', 'shards=' + JSON.stringify(ghShards), '-f', 'reuse=' + reuse.filter((p) => ghPlatforms.includes(p)).join(','), ...(wplan ? ['-f', 'widgets=' + JSON.stringify(wplan)] : [])]);
     for (let t = 0; !runId && t < 24; t++) { await sleep(3000); runId = findRun(); }
     if (!runId) throw new Error('run not found');
     log('run ' + rid + ': https://github.com/' + REPO + '/actions/runs/' + runId);

@@ -38,6 +38,10 @@ on:
         description: Platforms whose earlier release build is reused (JS-only change; shell-<platform>.tgz.enc)
         default: ''
         type: string
+      widgets:
+        description: 'Widget plan for shards with pass "widgets" (JSON, bin/app-qa-widgets.mjs); empty = none'
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -46,6 +50,7 @@ env:
   ASSET_TAG: ${{ inputs.asset_tag }}
   APP_ID: ${{ inputs.app_id }}
   REUSE: ${{ inputs.reuse }}
+  WIDGETS: ${{ inputs.widgets }}
   MAESTRO_VERSION: cli-2.12.1
   MAESTRO_SHA256: 54dbb0716425626604973cbb374c585ca30272375d9ce15177a1152765ddd9d7
   MAESTRO_CLI_NO_ANALYTICS: '1'
