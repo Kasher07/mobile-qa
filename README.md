@@ -73,7 +73,7 @@ time, how it was done, screenshot) plus the screenshots next to it.
   goes in); functions the page captured before the guard (its own references to fetch, XHR or sendBeacon, ofetch/ky-style instances);
   popups and `target=_blank` windows; dedicated workers; `<a ping>`; WebRTC and WebTransport; a clean `fetch` or
   `HTMLFormElement.prototype.submit` taken from an iframe; a capture-phase listener that hides a submit from the guard; a page that
-  finds the random marker through `getOwnPropertyNames`. **iOS flows are for pages whose buttons are safe to press; the iOS guard is never
+  finds the random marker through `getOwnPropertyNames`. The fixture flow `examples/guard-race.json` (a page that POSTs 1 s after it loads) shows the guard working after a navigating step on iOS, but it is a race against that 1 s timer (passed in some runs, failed in others on the hosted Macs): the proof that the first second of a document is not covered. **iOS flows are for pages whose buttons are safe to press; the iOS guard is never
   "no writes".** The flow summary counts the documents guarded; a document where the guard cannot be installed fails the flow before
   or right after the step that reached it, and a flow without an active guard is an issue.
 - `--allow-writes "<reason>"` (or `"allowWrites"` in the file) turns the guard off for the flow run and prints the reason in every

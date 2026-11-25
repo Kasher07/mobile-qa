@@ -128,30 +128,6 @@
           }
         }
       ]
-    },
-    {
-      "name": "guard-after-nav",
-      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
-      "steps": [
-        {
-          "tap": "#timer-link"
-        },
-        {
-          "wait": {
-            "text": "timer POST",
-            "timeout": 8000
-          }
-        },
-        {
-          "expect": {
-            "text": "timer POST failed",
-            "visible": true
-          }
-        },
-        {
-          "shot": "timer"
-        }
-      ]
     }
   ]
 }
