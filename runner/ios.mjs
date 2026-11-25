@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadPrivateJob, installPrivateLogging, toWebDriverCookies, cookieTargetOk } from './private.mjs';
 import { settleProbe, waitSettled } from './lib.mjs';
+import { loadRunnerFlows } from './flows.mjs';
+import { runFlowIos } from './flows-ios.mjs';
 import { readUrls, slug, probe, sleep, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
 const STARTED = Date.now();
@@ -15,6 +17,8 @@ fs.mkdirSync(OUT, { recursive: true });
 const PRIV = loadPrivateJob();
 if (PRIV) installPrivateLogging(PRIV, process.env, 'ios');
 const urls = PRIV ? PRIV.urls : readUrls();
+// Flows (scripted steps): public = the FLOWS workflow input, private = inside the sealed job. Null when this run has none.
+const FLOWS = loadRunnerFlows({ publicJson: PRIV ? '' : process.env.FLOWS, privateDoc: PRIV && PRIV.flows, base: PRIV && PRIV.base });
 const MAX_SEG = maxSegments();
 const run = (cmd, args, opts) =>
   execFileSync(cmd, args, Object.assign({ encoding: 'utf8', maxBuffer: 64 << 20, stdio: ['ignore', 'pipe', 'pipe'] }, opts));
@@ -47,6 +51,10 @@ function rankDevices() {
 }
 
 function boot(d) {
+  // Let the simulator raise the on-screen keyboard (it stays hidden while a hardware keyboard is "connected").
+  try {
+    run('defaults', ['write', 'com.apple.iphonesimulator', 'ConnectHardwareKeyboard', '-bool', 'false']);
+  } catch {}
   try {
     run('xcrun', ['simctl', 'boot', d.udid]);
   } catch (e) {
@@ -207,7 +215,7 @@ async function startDriver() {
 // "Safari is Running an Automated Test" over the page. The dismissal persists, so the automated Safari opens clean.
 // Taps happen only here, on a fixed neutral page, never on a page under test.
 async function warmUp() {
-  if (!axe || !urls.length) return;
+  if (!axe || !(urls.length || FLOWS)) return;
   try {
     run('xcrun', ['simctl', 'openurl', dev.udid, 'https://example.com/']);
     await sleep(8000);
@@ -340,6 +348,28 @@ for (const [i, url] of urls.entries()) {
     } catch {}
   }
   saveResults(OUT, results);
+}
+// Flows (scripted steps) run last, in the same Safari session, each starting with a fresh load of its start page.
+if (FLOWS) {
+  results.flows = [];
+  for (const [fi, flow] of FLOWS.flows.entries()) {
+    console.log('[flow ' + (fi + 1) + '/' + FLOWS.flows.length + ']' + (PRIV ? '' : ' ' + flow.name));
+    let r;
+    try {
+      if (Date.now() - STARTED > JOB_BUDGET_MS) throw new Error('not run: the job time budget was used up');
+      if (!hasWd) throw new Error('no WebDriver session: flows need WebDriver');
+      if (PRIV && cookieError) throw new Error(cookieError);
+      await wd('POST', '/session/' + sid + '/url', { url: flow.start });
+      await sleep(2000);
+      if (PRIV) await waitSettled(() => exec('return (' + settleProbe.toString() + ')();'), sleep);
+      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: FLOWS.allowWrites };
+      r = await runFlowIos(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
+    } catch (e) {
+      r = { name: flow.name, start: flow.startShown, status: 'failed', error: String((e && e.message) || e).split('\n')[0].slice(0, 300), steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 };
+    }
+    results.flows.push(r);
+    saveResults(OUT, results);
+  }
 }
 if (sid) await wd('DELETE', '/session/' + sid).catch(() => {});
 if (driver) driver.kill();

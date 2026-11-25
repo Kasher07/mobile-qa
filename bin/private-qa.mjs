@@ -9,7 +9,8 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict, gitBashPaths, rawArtifactLeaks } from '../runner/private.mjs';
+import { reportFlows } from '../runner/flows.mjs';
+import { privateFlows, buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict, gitBashPaths, rawArtifactLeaks } from '../runner/private.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -149,7 +150,20 @@ export async function runPrivate(opts, deps) {
   const { verdict, starvedAction, iosPools, InputError } = deps;
   let built;
   try {
-    built = buildJob(process.env, process.platform === 'win32' ? gitBashPaths(opts.urls) : opts.urls);
+    let flowsWire = null;
+    if (opts.steps) {
+      let doc;
+      try {
+        const raw = fs.readFileSync(opts.steps, 'utf8');
+        if (raw.length > 80000) throw new Error('the steps file is too large');
+        doc = JSON.parse(raw);
+      } catch (e) {
+        throw new Error('cannot use the steps file: ' + String(e.message).slice(0, 100));
+      }
+      if (opts.allowWrites !== null && doc && typeof doc === 'object') doc.allowWrites = String(opts.allowWrites);
+      flowsWire = JSON.parse(privateFlows(process.env.KITQA_BASE, doc).wireJson); // the steps travel inside the sealed job
+    }
+    built = buildJob(process.env, process.platform === 'win32' ? gitBashPaths(opts.urls) : opts.urls, undefined, flowsWire);
   } catch (e) {
     throw new InputError(e.message);
   }
@@ -396,7 +410,7 @@ export async function runPrivate(opts, deps) {
       const dir = path.dirname(f);
       const plat = res.platform === 'ios' ? 'ios' : 'android';
       lines.push('## ' + plat + ' [untrusted] ' + T(res.device, 80) + ', ' + T(res.browser, 80) + ' (' + T(res.mode, 40) + ')', '');
-      if (plat === 'ios') lines.push('iOS: writes are not blocked (Safari has no request interception; the run only loads and scrolls).', '');
+      if (plat === 'ios') lines.push('iOS: writes are not blocked in plain page loads (Safari has no request interception); flows use a page script guard injected after each document loads (see each flow).', '');
       for (const n of res.notes || []) lines.push('note [untrusted]: ' + T(n, 300));
       for (const p of res.pages || []) {
         const { bad, notes } = verdict(p);
@@ -407,6 +421,11 @@ export async function runPrivate(opts, deps) {
         const st = p.settle && !p.settle.settled ? ' (page did not settle in ' + Math.round(p.settle.ms / 1000) + ' s)' : '';
         lines.push('- ' + T(where, 80) + ' :: ' + (bad.length ? 'ISSUES: [untrusted] ' + T(bad.join(' | '), 300) : 'ok') + (notes.length ? ' [untrusted] (' + T(notes.join(', '), 300) + ')' : '') + st + (plat === 'android' ? ' [blocked writes/websockets: ' + bw + ']' : ''));
         for (const s of p.shots || []) lines.push('  - ' + path.join(dir, String(s).replace(/[^A-Za-z0-9._-]/g, '_')));
+      }
+      if (Array.isArray(res.flows) && res.flows.length) {
+        const fr = reportFlows(res, dir, { T });
+        issues += fr.issues;
+        lines.push(...fr.lines);
       }
       lines.push('');
     }

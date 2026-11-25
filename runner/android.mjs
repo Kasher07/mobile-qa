@@ -5,6 +5,8 @@ import path from 'node:path';
 import { _android as android } from 'playwright-core';
 import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies, isBlockedWrite, sameHost } from './private.mjs';
 import { settleProbe, waitSettled } from './lib.mjs';
+import { loadRunnerFlows } from './flows.mjs';
+import { runFlowAndroid } from './flows-android.mjs';
 import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
 const STARTED = Date.now();
@@ -15,6 +17,8 @@ fs.mkdirSync(OUT, { recursive: true });
 const PRIV = loadPrivateJob();
 if (PRIV) installPrivateLogging(PRIV, process.env, 'android');
 const urls = PRIV ? PRIV.urls : readUrls();
+// Flows (scripted steps): public = the FLOWS workflow input, private = inside the sealed job. Null when this run has none.
+const FLOWS = loadRunnerFlows({ publicJson: PRIV ? '' : process.env.FLOWS, privateDoc: PRIV && PRIV.flows, base: PRIV && PRIV.base });
 const blocked = [];
 const MAX_SEG = maxSegments();
 const results = { platform: 'android', device: null, browser: null, mode: 'playwright-android', notes: [], pages: [] };
@@ -46,25 +50,36 @@ async function ensureChromeOnTop(cur) {
   }
 }
 
+// A hardware keyboard setting would keep Android's soft keyboard hidden: show it, as on a phone.
+await sh('settings put secure show_ime_with_hard_keyboard 1').catch(() => {});
+
 // Private run guards (all fail closed): service workers blocked; ONE context-level route, registered and awaited before any page
 // loads, aborts same-origin writes from every page and tab (also pages the site opens itself); same-origin WebSockets are closed.
 // If a guard cannot be installed no page is loaded and the error is recorded.
 let guardError = null;
-async function launch() {
-  const ctx = await device.launchBrowser(PRIV ? { serviceWorkers: 'block', args: ['--disable-features=Translate,TranslateUI'] } : undefined);
-  if (!PRIV) return ctx;
+// kind 'flow': the context of the scripted steps. Its guard (unless the file allows writes) aborts every non-GET/HEAD/OPTIONS
+// request to ANY origin, public runs included, and closes every WebSocket.
+async function launch(kind = 'pages') {
+  const flowKind = kind === 'flow';
+  const guarded = flowKind ? !FLOWS.allowWrites : !!PRIV;
+  const ctx = await device.launchBrowser(PRIV || flowKind ? { serviceWorkers: 'block', args: ['--disable-features=Translate,TranslateUI'] } : undefined);
+  if (!PRIV && !guarded) return ctx;
   try {
-    await ctx.addCookies(toPlaywrightCookies(PRIV));
+    if (PRIV) await ctx.addCookies(toPlaywrightCookies(PRIV));
+    if (!guarded) {
+      guardError = null;
+      return ctx;
+    }
     await ctx.route('**/*', (route) => {
       const req = route.request();
-      if (isBlockedWrite(req.method(), req.url(), PRIV.base)) {
+      if (flowKind ? !['GET', 'HEAD', 'OPTIONS'].includes(req.method().toUpperCase()) : isBlockedWrite(req.method(), req.url(), PRIV.base)) {
         blocked.push(req.method() + ' ' + new URL(req.url()).pathname);
         return route.abort('blockedbyclient');
       }
       return route.continue();
     });
     guardError = null;
-    console.log('[private] cookies set: ' + PRIV.cookies.length);
+    if (PRIV) console.log('[private] cookies set: ' + PRIV.cookies.length);
     console.log('[private] read-only guard active');
   } catch (e) {
     guardError = 'read-only guard could not be installed: ' + String(e.message).split('\n')[0].slice(0, 160);
@@ -72,10 +87,12 @@ async function launch() {
     return ctx;
   }
   try {
-    await ctx.routeWebSocket((u) => sameHost(u.href, PRIV.base), (ws) => {
+    const closeWs = (ws) => {
       blocked.push('WEBSOCKET');
       ws.close().catch(() => {});
-    });
+    };
+    if (flowKind) await ctx.routeWebSocket(() => true, closeWs);
+    else await ctx.routeWebSocket((u) => sameHost(u.href, PRIV.base), closeWs);
   } catch (e) {
     results.notes.push('websocket blocking is not available on this context: ' + String(e.message).split('\n')[0].slice(0, 120));
   }
@@ -245,6 +262,35 @@ for (const [i, url] of urls.entries()) {
   saveResults(OUT, results);
 }
 cur = null;
+// Flows (scripted steps) run last, in a fresh Chrome whose context carries the write guard (see launch('flow')).
+if (FLOWS) {
+  results.flows = [];
+  await withTimeout(context.close(), 20000, 'close').catch(() => {});
+  context = await launch('flow');
+  const failedFlow = (flow, msg) => ({ name: flow.name, start: flow.startShown, status: 'failed', error: msg, steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 });
+  for (const [fi, flow] of FLOWS.flows.entries()) {
+    console.log('[flow ' + (fi + 1) + '/' + FLOWS.flows.length + ']' + (PRIV ? '' : ' ' + flow.name));
+    let r;
+    try {
+      if (Date.now() - STARTED > JOB_BUDGET_MS) throw new Error('not run: the job time budget was used up');
+      if (guardError) throw new Error('the flow did not run: ' + guardError); // fail closed
+      const prev = page;
+      page = await withTimeout(context.newPage(), 30000, 'new tab');
+      prev.close({ runBeforeUnload: false }).catch(() => {});
+      page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
+      await gotoOnce(flow.start);
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1200);
+      if (PRIV) await waitSettled(() => page.evaluate(settleProbe), (ms) => page.waitForTimeout(ms));
+      const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: FLOWS.allowWrites, guardActive: !guardError, cal: null };
+      r = await runFlowAndroid(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
+    } catch (e) {
+      r = failedFlow(flow, String((e && e.message) || e).split('\n')[0].slice(0, 300));
+    }
+    results.flows.push(r);
+    saveResults(OUT, results);
+  }
+}
 // Results first: closing Chrome or adb has hung before, and nothing may stop the upload step.
 writeResults(OUT, results);
 await withTimeout(context.close(), 20000, 'close').catch(() => {});

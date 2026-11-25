@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow fixture</title>
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;margin:0;padding:16px 16px 120px;line-height:1.5}
+h1{font-size:26px;margin:0 0 8px}
+section{margin:20px 0;padding:14px;border:1px solid #ccd;border-radius:12px}
+label{display:block;font-weight:600;margin-bottom:4px}
+input{box-sizing:border-box;width:100%;font-size:18px;padding:10px;border:1px solid #889;border-radius:8px}
+button{font-size:18px;padding:12px 16px;margin:8px 8px 0 0;border-radius:8px;border:1px solid #446;background:#eef}
+#dialog{margin-top:12px;padding:14px;border:2px solid #446;border-radius:10px;background:#fff}
+#carousel{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;gap:0;border-radius:10px}
+#carousel div{flex:0 0 100%;scroll-snap-align:start;box-sizing:border-box;padding:40px 16px;font-size:22px;text-align:center}
+#carousel div:nth-child(1){background:#fdd}#carousel div:nth-child(2){background:#dfd}#carousel div:nth-child(3){background:#ddf}
+.filler{height:520px;background:linear-gradient(#fff,#eef);border-radius:10px;padding:12px}
+.dock{position:fixed;left:0;right:0;bottom:0;padding:10px 16px;background:#fff;border-top:1px solid #aab}
+</style>
+</head>
+<body>
+<h1>Flow fixture</h1>
+<p>A page built for scripted steps: a form, a dialog that Back closes, a carousel to swipe, a button that would POST.</p>
+<section>
+  <label for="name">Your name</label>
+  <input id="name" autocomplete="off" placeholder="type here">
+  <button id="save" type="button">Save name</button>
+  <p id="greeting">Nobody yet</p>
+</section>
+<section>
+  <button id="open" type="button">Open details</button>
+  <div id="dialog" role="dialog" hidden><p>Details panel</p><button id="close" type="button">Close panel</button></div>
+</section>
+<section>
+  <div id="carousel"><div>Slide one</div><div>Slide two</div><div>Slide three</div></div>
+  <p id="slide-label">Slide 1 of 3</p>
+</section>
+<section>
+  <button id="post" type="button">Send data (POST)</button>
+  <p id="post-result">not sent</p>
+  <form method="post" action="post-target.html"><button id="form-post" type="submit">Submit form (POST)</button></form>
+</section>
+<div class="filler">Long page, so the note box below sits at the bottom edge where a keyboard comes up.</div>
+<div class="dock"><input id="note" autocomplete="off" placeholder="Note (bottom of the screen)"></div>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  function greet() { $('greeting').textContent = 'Hello ' + ($('name').value || 'nobody'); }
+  $('save').addEventListener('click', greet);
+  $('name').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); greet(); } });
+  $('open').addEventListener('click', function () { history.pushState({ d: 1 }, '', '#details'); $('dialog').hidden = false; });
+  $('close').addEventListener('click', function () { history.back(); });
+  window.addEventListener('popstate', function () { $('dialog').hidden = true; });
+  var car = $('carousel');
+  car.addEventListener('scroll', function () { $('slide-label').textContent = 'Slide ' + (Math.round(car.scrollLeft / car.clientWidth) + 1) + ' of 3'; });
+  $('post').addEventListener('click', function () {
+    $('post-result').textContent = 'sending';
+    fetch('post-target.html', { method: 'POST', body: 'x=1' })
+      .then(function (r) { $('post-result').textContent = 'POST answered ' + r.status; })
+      .catch(function (e) { $('post-result').textContent = 'POST failed: ' + (e && e.name); });
+  });
+})();
+</script>
+</body>
+</html>

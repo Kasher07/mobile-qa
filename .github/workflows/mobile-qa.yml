@@ -47,6 +47,10 @@ on:
         description: Sealed job of a private (qa-agent) run, base64 ciphertext; empty = public run
         default: ''
         type: string
+      flows:
+        description: Scripted steps (JSON, validated by the client) of a public run; empty = none. Private runs carry theirs inside private_job
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -54,6 +58,7 @@ permissions:
 env:
   URLS: ${{ inputs.urls }}
   MAX_SEGMENTS: ${{ inputs.max_segments }}
+  FLOWS: ${{ inputs.flows }}
 
 jobs:
   ios:

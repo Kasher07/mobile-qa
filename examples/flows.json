@@ -1,0 +1,139 @@
+{
+  "flows": [
+    {
+      "name": "form",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
+      "steps": [
+        {
+          "tap": "#name"
+        },
+        {
+          "type": {
+            "selector": "#name",
+            "text": "Linh"
+          }
+        },
+        {
+          "key": "Enter"
+        },
+        {
+          "expect": {
+            "text": "Hello Linh",
+            "visible": true
+          }
+        },
+        {
+          "shot": "greeted"
+        },
+        {
+          "tap": {
+            "text": "Open details"
+          }
+        },
+        {
+          "expect": {
+            "selector": "#dialog",
+            "visible": true
+          }
+        },
+        {
+          "back": true
+        },
+        {
+          "expect": {
+            "selector": "#dialog",
+            "visible": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "carousel",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
+      "steps": [
+        {
+          "scroll": {
+            "to": "#carousel"
+          }
+        },
+        {
+          "swipe": {
+            "on": "#carousel",
+            "direction": "left"
+          }
+        },
+        {
+          "wait": {
+            "text": "Slide 2 of 3",
+            "timeout": 5000
+          }
+        },
+        {
+          "expect": {
+            "text": "Slide 2 of 3",
+            "visible": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "write-guard",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
+      "steps": [
+        {
+          "scroll": {
+            "to": "#post"
+          }
+        },
+        {
+          "tap": "#post"
+        },
+        {
+          "wait": {
+            "text": "POST failed",
+            "timeout": 8000
+          }
+        },
+        {
+          "tap": "#form-post"
+        },
+        {
+          "expect": {
+            "text": "Form target page",
+            "visible": false
+          }
+        },
+        {
+          "expect": {
+            "selector": "#post",
+            "visible": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "keyboard",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
+      "steps": [
+        {
+          "tap": "#note"
+        },
+        {
+          "type": {
+            "selector": "#note",
+            "text": "hello"
+          }
+        },
+        {
+          "shot": "keyboard-up"
+        },
+        {
+          "expect": {
+            "selector": "#note",
+            "inViewport": true
+          }
+        }
+      ]
+    }
+  ]
+}

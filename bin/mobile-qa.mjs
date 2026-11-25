@@ -4,6 +4,7 @@
 // Private pages (kit-qa qa-agent sites): kit-qa exec <site> -- node bin/mobile-qa.mjs --private </path> [more paths] (see README)
 // Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android] [--out DIR] [--segments N]
 //        [--ios-device "iPhone SE (3rd generation)"] [--file urls.txt] [--keep] [--sweep-only]
+//        [--steps flows.json [--allow-writes "<reason>"]]   scripted steps: tap, type, key, back, swipe, expect, shot (README)
 // Exit: 0 no issues, 1 issues found, 2 run failed / bad input / tool error.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -11,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPrivate } from './private-qa.mjs';
+import { parseFlows, reportFlows, FlowError, LIMITS as FLOW_LIMITS } from '../runner/flows.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -33,7 +35,7 @@ export function readUrlFile(f) {
   return fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !l.trim().startsWith('#')).flatMap((l) => l.match(/https?:\/\/[^\s<>`"')]+/g) || []);
 }
 export function parseArgs(argv) {
-  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, private: false, urls: [] };
+  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, private: false, steps: null, allowWrites: null, urls: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--platforms') opts.platforms = argv[++i];
@@ -44,6 +46,8 @@ export function parseArgs(argv) {
     else if (a === '--sweep-only') opts.sweepOnly = true;
     else if (a === '--private') opts.private = true;
     else if (a === '--ios-mode') opts.iosMode = argv[++i];
+    else if (a === '--steps') opts.steps = argv[++i];
+    else if (a === '--allow-writes') opts.allowWrites = argv[++i];
     else if (a === '--file') opts.urls.push(...readUrlFile(argv[++i]));
     else if (a === '-h' || a === '--help') {
       console.log(fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(1, 7).join('\n'));
@@ -55,6 +59,9 @@ export function parseArgs(argv) {
   if (!Number.isInteger(opts.segments) || opts.segments < 1 || opts.segments > 12) throw new InputError('--segments must be 1..12');
   if (/[\r\n]/.test(opts.iosDevice)) throw new InputError('bad --ios-device');
   if (!/^(webdriver|openurl)$/.test(opts.iosMode)) throw new InputError('--ios-mode must be webdriver or openurl');
+  if (opts.steps !== null && !opts.steps) throw new InputError('--steps needs a file');
+  if (opts.allowWrites !== null && (!opts.steps || !String(opts.allowWrites).trim())) throw new InputError('--allow-writes "<reason>" needs --steps and a non-empty reason');
+  if (opts.steps && opts.sweepOnly) throw new InputError('--steps cannot be combined with --sweep-only');
   if (opts.private && (opts.keep || opts.sweepOnly)) throw new InputError('--private cannot be combined with --keep or --sweep-only (a private run is always deleted)');
   return opts;
 }
@@ -119,6 +126,44 @@ export function checkUrl(raw) {
   return { href: u.href };
 }
 
+// Typed or matched text travels as a public workflow input in public mode: nothing secret-looking or personal goes.
+export function textGuard(t) {
+  const words = [t, ...t.split(/\s+/)];
+  if (words.some((w) => w && (secretValue(w) || personalValue(w)))) return 'looks like a secret or personal data (public repo: the steps are a public workflow input)';
+  return null;
+}
+
+// Reads and validates the steps file (public mode: starts are public URLs, all rules of checkUrl apply). Returns parseFlows' result.
+export function readFlows(file, { allowWrites = null } = {}) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    throw new InputError('cannot read the steps file');
+  }
+  if (raw.length > 4 * FLOW_LIMITS.jsonBytes) throw new InputError('the steps file is too large');
+  let doc;
+  try {
+    doc = JSON.parse(raw);
+  } catch (e) {
+    throw new InputError('the steps file is not valid JSON: ' + e.message.slice(0, 80));
+  }
+  if (allowWrites !== null && doc && typeof doc === 'object') doc.allowWrites = String(allowWrites);
+  try {
+    return parseFlows(doc, {
+      textGuard,
+      checkStart: (s, where) => {
+        const c = checkUrl(s);
+        if (c.why) throw new FlowError(where + ': refused start URL: ' + c.why);
+        return c.href;
+      },
+    });
+  } catch (e) {
+    if (e instanceof FlowError) throw new InputError(e.message);
+    throw e;
+  }
+}
+
 // ---- GitHub API with rate-limit handling
 let token = null;
 async function api(method, p, body, { retry = true } = {}, attempt = 0) {
@@ -179,6 +224,7 @@ const runUrl = (id) => 'https://github.com/' + REPO + '/actions/runs/' + id;
 const runs = [];
 let outDir = null;
 let opts = null;
+let flowsJson = ''; // the validated steps (wire form) of this call; sent with the first run only
 
 async function findRunByTitle(rid) {
   const l = await api('GET', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/runs?event=workflow_dispatch&per_page=30');
@@ -198,8 +244,8 @@ async function dispatch(chunk, i, baseId, total, extra = {}) {
   try {
     // Never retried: a POST that timed out may still have queued a run (duplicates would stay public).
     const res = await api('POST', '/repos/' + REPO + '/actions/workflows/' + WORKFLOW + '/dispatches', {
-      ref: 'main',
-      inputs: { urls: chunk.join('\n'), platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool], ios_mode: opts.iosMode, test_fault: process.env.MOBILE_QA_TEST_FAULT || 'none' },
+      ref: process.env.MOBILE_QA_REF || 'main', // a branch name only to test a workflow change before it is merged
+      inputs: { urls: chunk.length ? chunk.join('\n') : 'flows', flows: i === 0 ? flowsJson : '', platforms, request_id: rid, max_segments: String(opts.segments), ios_device: opts.iosDevice, ios_runner: IOS_POOLS[pool], ios_mode: opts.iosMode, test_fault: process.env.MOBILE_QA_TEST_FAULT || 'none' },
       return_run_details: true,
     }, { retry: false });
     id = res && (res.workflow_run_id || res.id);
@@ -399,7 +445,12 @@ async function main() {
     if (c.why) throw new InputError('refused ' + raw + ': ' + c.why);
     if (!urls.includes(c.href)) urls.push(c.href);
   }
-  if (!urls.length && !opts.sweepOnly) throw new InputError('no URLs. Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android]');
+  let flows = null;
+  if (opts.steps) {
+    flows = readFlows(opts.steps, { allowWrites: opts.allowWrites });
+    flowsJson = flows.wireJson;
+  }
+  if (!urls.length && !flows && !opts.sweepOnly) throw new InputError('no URLs. Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android] [--steps flows.json]');
   if (urls.length > PER_RUN * MAX_RUNS) throw new InputError('max ' + PER_RUN * MAX_RUNS + ' URLs per call (got ' + urls.length + '); split the list');
 
   try {
@@ -421,6 +472,7 @@ async function main() {
   fs.mkdirSync(outDir, { recursive: true });
   const chunks = [];
   for (let i = 0; i < urls.length; i += PER_RUN) chunks.push(urls.slice(i, i + PER_RUN));
+  if (!chunks.length && flows) chunks.push([]); // flows only: one run, no plain pages
   for (const [i, chunk] of chunks.entries()) await dispatch(chunk, i, baseId, chunks.length); // serial: GitHub asks for no concurrent writes
 
   // wait: one request per unfinished run per poll (~3/min per run, far under 5000/h). Each run is downloaded and
@@ -506,6 +558,7 @@ async function main() {
     const dir = path.dirname(f);
     lines.push('## ' + res.platform + ': ' + res.device + ', ' + res.browser + ' (' + res.mode + ')', '');
     if (res.platform === 'ios') lines.push('iOS: JS errors are not captured (WebDriver has no console); the Android section covers them.', '');
+    if (res.platform === 'ios' && (res.flows || []).length) lines.push('iOS flows: element clicks and key input are WebDriver commands (synthesized, not a finger); the write guard is a page script injected after each document loads (see each flow summary).', '');
     for (const n of res.notes || []) lines.push('note: ' + n);
     if ((res.notes || []).length) lines.push('');
     for (const p of res.pages || []) {
@@ -513,6 +566,11 @@ async function main() {
       issues += bad.length;
       lines.push('- ' + p.url + ' :: ' + (bad.length ? 'ISSUES: ' + bad.join(' | ') : 'ok') + (notes.length ? ' (' + notes.join(', ') + ')' : ''));
       for (const s of p.shots || []) lines.push('  - ' + path.join(dir, s));
+    }
+    if (Array.isArray(res.flows) && res.flows.length) {
+      const fr = reportFlows(res, dir, {});
+      issues += fr.issues;
+      lines.push(...fr.lines);
     }
     lines.push('');
   }

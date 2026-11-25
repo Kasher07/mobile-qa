@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseFlows } from './flows.mjs';
 
 const KEY_RE = /^[0-9a-f]{64}$/;
 export const jobAad = (rid) => 'mq-private-job|' + rid;
@@ -59,7 +60,7 @@ export function gitBashPaths(args, root = process.env.EXEPATH || 'C:/Program Fil
 }
 
 // baseRaw: KITQA_BASE. rawPaths: what the caller typed. Returns { origin, host, paths } (paths start with "/").
-export function checkPrivateTarget(baseRaw, rawPaths) {
+export function checkPrivateTarget(baseRaw, rawPaths, { allowEmpty = false } = {}) {
   let b;
   try {
     b = new URL(baseRaw);
@@ -72,7 +73,7 @@ export function checkPrivateTarget(baseRaw, rawPaths) {
   if (host.endsWith('.')) throw new PrivateInputError('the site host has a trailing dot: use the plain host name');
   if (!hostOk(host)) throw new PrivateInputError('the site host is not public (the runner cannot reach it)');
   const origin = b.origin;
-  if (!rawPaths.length) throw new PrivateInputError('no paths. Usage: kit-qa exec <site> -- node bin/mobile-qa.mjs --private /#sales /#inventory');
+  if (!rawPaths.length && !allowEmpty) throw new PrivateInputError('no paths. Usage: kit-qa exec <site> -- node bin/mobile-qa.mjs --private /#sales /#inventory');
   const paths = [];
   for (const raw of rawPaths) {
     let p = String(raw);
@@ -112,10 +113,25 @@ export function cookiesFor(state, host, now = Date.now()) {
   return out;
 }
 
-export function buildJob(env, rawPaths, readState = (f) => JSON.parse(fs.readFileSync(f, 'utf8'))) {
+// A flow's start is a path on the site, checked with the same rules as the plain paths.
+export function privateFlows(baseRaw, doc) {
+  return parseFlows(doc, {
+    checkStart: (s, where) => {
+      try {
+        const t = checkPrivateTarget(baseRaw, [s]);
+        return t.paths[0];
+      } catch (e) {
+        throw new PrivateInputError(where + ': ' + e.message);
+      }
+    },
+  });
+}
+
+// flowsWire: the wire form of validated flows (flows.mjs parseFlows().wireJson, parsed), or null.
+export function buildJob(env, rawPaths, readState = (f) => JSON.parse(fs.readFileSync(f, 'utf8')), flowsWire = null) {
   if (env.KITQA_TOKEN || (env.KITQA_URL && !env.KITQA_STORAGE_STATE)) throw new PrivateInputError('token sites (static ?token= URL) are not supported in private mode: only qa-agent sites');
   if (!env.KITQA_BASE || !env.KITQA_STORAGE_STATE) throw new PrivateInputError('private mode runs under kit-qa: kit-qa exec <site> -- node bin/mobile-qa.mjs --private <paths>');
-  const t = checkPrivateTarget(env.KITQA_BASE, rawPaths);
+  const t = checkPrivateTarget(env.KITQA_BASE, rawPaths, { allowEmpty: !!flowsWire });
   let state;
   try {
     state = readState(env.KITQA_STORAGE_STATE);
@@ -124,12 +140,13 @@ export function buildJob(env, rawPaths, readState = (f) => JSON.parse(fs.readFil
   }
   const cookies = cookiesFor(state, t.host);
   if (!cookies.length) throw new PrivateInputError('no usable session cookie for this site (run kit-qa login <site>)');
-  return { origin: t.origin, host: t.host, job: { v: 1, base: t.origin, paths: t.paths, cookies } };
+  return { origin: t.origin, host: t.host, job: { v: 1, base: t.origin, paths: t.paths, cookies, ...(flowsWire ? { flows: flowsWire } : {}) } };
 }
 
 export function validateJob(job) {
   if (!job || job.v !== 1) throw new Error('bad job');
-  const t = checkPrivateTarget(job.base, job.paths); // the runner re-checks what it was sent
+  const t = checkPrivateTarget(job.base, job.paths, { allowEmpty: !!job.flows }); // the runner re-checks what it was sent
+  if (job.flows) privateFlows(job.base, job.flows);
   const cookies = cookiesFor({ cookies: (job.cookies || []).map((c) => ({ ...c, domain: (c.hostOnly ? '' : '.') + c.domain })) }, t.host);
   if (!cookies.length) throw new Error('job has no cookies for its host');
   return { ...job, base: t.origin, host: t.host, paths: t.paths, cookies, urls: t.paths.map((p) => t.origin + p) };
@@ -228,6 +245,9 @@ const ALLOWED = [
   /^webdriver session ok \(round \d, \d+ s\)$/,
   /^(ios|android) \| [A-Za-z0-9_ ]+ \/ (iOS|Android) [\d.]+ \| (Safari \(iOS [\d.]+\)|Chrome [\d.]+) \| mode=(webdriver|openurl|playwright-android)$/,
   // the only "[private]" messages: fixed texts, never free text
+  /^\[flow \d+\/\d+\]\s*$/,
+  /^\s+step \d+\/\d+\s*$/,
+  /^\s+step \d+\/\d+ (ok|failed) in \d+ s$/,
   /^\[private\] (cookies set: \d+|emulator network not up|fatal error, details are sealed|sealed (ios|android): \d+ bytes|read-only guard active)$/,
 ];
 export const allowedLine = (s) => ALLOWED.some((r) => r.test(s));
