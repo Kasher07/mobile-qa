@@ -45,7 +45,7 @@ time, how it was done, screenshot) plus the screenshots next to it.
 - **Android** (Chrome on the emulator): tap and swipe are real touches injected below the browser with `adb shell input` (the soft
   keyboard shows, the toolbar reacts); because adb works in screen pixels, a transparent overlay measures the page-to-screen offset before
   a touch and eats that one tap. Typing sends DevTools key events after a real tap has focused the field (the keyboard app itself is not
-  typed into). Back is the hardware Back key (with the keyboard up the first Back only closes the keyboard, as on a phone). Forward has
+  typed into). A tap on a non-field target while the keyboard is up closes the keyboard first (Back), because Chrome then shrinks and pans the visual viewport and page coordinates stop matching the screen; the step says so, and `expect ... inViewport` is how a flow checks what the keyboard hides. Back is the hardware Back key (with the keyboard up the first Back only closes the keyboard, as on a phone). Forward has
   no key on Android: DevTools history. Scroll is a script scroll. If `adb input` fails the step falls back to a DevTools touch, then to a
   click, and the summary says which one was used.
 - **iOS** (Safari on the Simulator, WebDriver): tap is a **WebDriver element click** (a synthesized click, not a finger); the page must

@@ -98,24 +98,26 @@ async function aim(l) {
     if (x1 - x0 < 1 || y1 - y0 < 1) return { frac: 0, error: 'the element is outside the visible screen (covered by the keyboard or off screen)' };
     const x = (x0 + x1) / 2;
     const y = (y0 + y1) / 2;
+    const pan = !!vv && (vv.offsetTop > 0.5 || vv.height < innerHeight - 5);
     const dbg = ' [aim y=' + Math.round(y) + ' frac=' + frac.toFixed(2) + ' vvH=' + Math.round(h) + ' innerH=' + innerHeight + ' scrollY=' + Math.round(scrollY) + ']';
     const hit = document.elementFromPoint(x, y);
     const label = (n) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '');
-    if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) return { x, y, frac, dbg, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, error: 'another element covers the tap point: ' + label(hit) };
-    return { x, y, frac, dbg, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+    if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) return { x, y, frac, dbg, pan, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, error: 'another element covers the tap point: ' + label(hit) };
+    return { x, y, frac, dbg, pan, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
   });
 }
 
 async function realTap(env, l, { editable = false } = {}) {
   let a = await aim(l);
   let pre = '';
-  // Under the keyboard a user closes it (Back closes the keyboard first) or scrolls; a sliver of a button is not tapped.
-  if (!editable && a.frac < 0.6 && (await keyboardUp(env.sh))) {
+  // With the keyboard up Chrome shrinks and pans the visual viewport, so page coordinates no longer map one-to-one to the screen
+  // (measured: a tap on a button above the keyboard missed). A user closes the keyboard to reach a button (Back closes it first).
+  if (!editable && (a.pan || a.frac < 0.6) && (await keyboardUp(env.sh))) {
     await env.sh('input keyevent KEYCODE_BACK');
     await wait(env.page, 700);
     env.cal = null;
     a = await aim(l);
-    pre = ' (keyboard closed first: the element was under it)';
+    pre = ' (keyboard closed first, as a user does to reach a button: the visual viewport was shrunk/panned)';
   }
   if (a.error) throw new Error(a.error);
   if (a.frac < 0.6) throw new Error('only ' + Math.round(a.frac * 100) + '% of the element is on screen');
