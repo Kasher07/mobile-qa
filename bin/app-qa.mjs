@@ -384,8 +384,9 @@ try {
   openArtifacts({ outDir, key, work, log, onApp: keepShell });
   for (const p of platforms.filter((x) => !(x === 'ios' && iosBackground))) {
     const ok = summarize({ outDir, platform: p, shards: plan[p], log });
-    if (ok && savesSnapshot) { if (!moveLastPass(appId, p, current, baseHash[p])) log(p + ': last pass not moved (another run changed it meanwhile); the next --changed run covers the difference'); }
-    else code = 1;
+    // A passing --flows / --widgets run (no snapshot) still exits 0.
+    if (!ok) code = 1;
+    else if (savesSnapshot && !moveLastPass(appId, p, current, baseHash[p])) log(p + ': last pass not moved (another run changed it meanwhile); the next --changed run covers the difference');
   }
   log('results: ' + outDir + ' (' + Math.round((Date.now() - started) / 6000) / 10 + ' min)');
 } catch (e) {

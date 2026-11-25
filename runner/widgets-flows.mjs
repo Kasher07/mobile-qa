@@ -74,9 +74,9 @@ export function iosLockFlow(plan) {
 }
 
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-/** junit with one test case per step: failure, skipped (a best-effort step that could not be done) or passed. */
+/** junit with one test case per step (name last: summarize() reads the last name= of the tag): failure, skipped (a best-effort step that could not be done) or passed. */
 export function junitXml(suite, cases) {
-  const body = cases.map((c) => `  <testcase name="${esc(c.name)}" classname="${esc(suite)}">` +
+  const body = cases.map((c) => `  <testcase classname="${esc(suite)}" name="${esc(c.name)}">` +
     (c.ok ? '' : c.skipped ? `<skipped message="${esc(c.msg)}">${esc(c.msg)}</skipped>` : `<failure message="${esc(c.msg)}">${esc(c.msg)}</failure>`) + '</testcase>').join('\n');
   const failures = cases.filter((c) => !c.ok && !c.skipped).length;
   return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n<testsuite name="${esc(suite)}" tests="${cases.length}" failures="${failures}">\n${body}\n</testsuite>\n</testsuites>\n`;

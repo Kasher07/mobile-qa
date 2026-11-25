@@ -42,6 +42,9 @@ function maestro(name, file) {
   const args = [...(UDID ? ['--device', UDID] : []), 'test', '--format', 'junit', '--output', junit, '--test-output-dir', path.join(GEN, 'maestro-' + name), file];
   const r = run('maestro', args, { cwd: SHOTS, timeout: 900000 });
   fs.writeFileSync(path.join(GEN, 'maestro-' + name + '.log'), (r.stdout || '') + (r.stderr || ''));
+  // Maestro writes takeScreenshot files under its test output folder (.../<flow>/takeScreenshot/): gather them.
+  const walk = (d) => (fs.existsSync(d) ? fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)])) : []);
+  for (const f of walk(path.join(GEN, 'maestro-' + name))) if (/[\\/]takeScreenshot[\\/][^\\/]+\.png$/.test(f)) fs.copyFileSync(f, path.join(SHOTS, path.basename(f)));
   const xml = fs.existsSync(junit) ? fs.readFileSync(junit, 'utf8') : '';
   const ok = r.status === 0 && !/<failure/.test(xml);
   if (!ok) {
