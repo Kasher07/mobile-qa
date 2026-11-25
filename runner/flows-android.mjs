@@ -98,10 +98,11 @@ async function aim(l) {
     if (x1 - x0 < 1 || y1 - y0 < 1) return { frac: 0, error: 'the element is outside the visible screen (covered by the keyboard or off screen)' };
     const x = (x0 + x1) / 2;
     const y = (y0 + y1) / 2;
+    const dbg = ' [aim y=' + Math.round(y) + ' frac=' + frac.toFixed(2) + ' vvH=' + Math.round(h) + ' innerH=' + innerHeight + ' scrollY=' + Math.round(scrollY) + ']';
     const hit = document.elementFromPoint(x, y);
     const label = (n) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '');
-    if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) return { x, y, frac, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, error: 'another element covers the tap point: ' + label(hit) };
-    return { x, y, frac, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+    if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) return { x, y, frac, dbg, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, error: 'another element covers the tap point: ' + label(hit) };
+    return { x, y, frac, dbg, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
   });
 }
 
@@ -122,7 +123,7 @@ async function realTap(env, l, { editable = false } = {}) {
     const c = await cal(env);
     const p = toScreen(c, a.x, a.y);
     await env.sh('input tap ' + p.x + ' ' + p.y);
-    return 'real touch (adb input tap)' + pre;
+    return 'real touch (adb input tap)' + pre + (a.dbg || '');
   } catch (e) {
     env.cal = null;
     try {
