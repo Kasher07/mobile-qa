@@ -15,9 +15,14 @@ node bin/mobile-qa.mjs https://example.com https://example.com/pricing [--platfo
 ## Flows: scripted steps (tap, type, Back, swipe, expect, screenshots)
 
 ```bash
-node bin/mobile-qa.mjs --steps examples/flows.json [--platforms ios,android] [--allow-writes "<reason>"]
+node bin/mobile-qa.mjs --steps examples/flows.json [--steps more.json] [--allow-post /api/rpc] [--allow-writes "<reason>"] [--platforms ios,android]
 kit-qa exec <site> -- node bin/mobile-qa.mjs --private --steps flows.json     # signed-in pages: start is a path, steps travel sealed
 ```
+
+**Flows run on Android only unless you ask for iOS**: with `--steps` the default platform is Android; `--platforms ios,android` (or `ios`) must be
+stated explicitly, and the summary says "iOS was not asked" otherwise (plain URL mode keeps its ios,android default). iOS is slow on the hosted
+Macs, its guard is only a page script and it failed 3 of 3 flows in the first real pilot. Several `--steps` files can be given in one call (their
+flows are merged; the caps below apply to the total).
 
 A flow file holds up to 6 flows (name, `start` URL or, with `--private`, a path on the site, up to 60 steps, `examples/flows.json` is a
 working one). A step is an object with one action key; a screenshot of the whole device screen (browser bars and the on-screen keyboard
@@ -27,17 +32,18 @@ when it is up) is taken after every step and on a failure.
 |------|---------|
 | `{"tap": "#go"}` / `{"tap": {"text": "Save"}}` | CSS selector, or the deepest element whose visible text contains the text |
 | `{"type": {"selector": "#q", "text": "hello", "clear": true}}` | focus the field, type |
+| `{"longpress": {"on": ".card", "ms": 600}}` | hold: `on` is a selector, `{"text": ...}` or a point `[x, y]`; 300..3000 ms (default 600). A swipe with from == to is refused: use this |
 | `{"key": "Enter"}` | Enter, Tab, Backspace, Escape |
 | `{"back": true}` / `{"forward": true}` | browser history |
 | `{"scroll": {"to": "#x"}}` / `{"scroll": {"by": 600}}` | into view / pixels |
 | `{"swipe": {"on": ".carousel", "direction": "left"}}` / `{"swipe": {"from": [0.8, 0.5], "to": [0.2, 0.5]}}` | direction = the way the content moves; from/to are fractions of the screen |
 | `{"wait": {"selector": "#x", "state": "visible"}}` (or `"gone"`, `"text"`, `"timeout"` ms) / `{"wait": {"ms": 500}}` | wait (max 20 s / 10 s) |
-| `{"expect": {"selector": "#x", "visible": true}}` | also `"count": 3` and `"inViewport": true` (not hidden under the keyboard); polls up to 2 s; a miss fails the flow |
+| `{"expect": {"selector": "#x", "visible": true}}` | also `"count": 3` and `"inViewport": true` (not hidden under the keyboard; the answer depends on how Chrome resizes the page for the keyboard, so a flow that must be stable should look at the `shot` too); polls up to 2 s; a miss fails the flow |
 | `{"shot": "name"}` | an extra named screenshot |
 
 Selectors are plain CSS only (no `text=`, `xpath=`, `>>`, `:has-text`: they would not mean the same on Safari); selectors and texts are data
 handed to Playwright's locator or WebDriver's find-element, never evaluated as code. Limits: 30 s per step (the step itself; its screenshot has its own cap), 4 min per flow, 60 steps,
-6 flows, the file at most 20 kB (bytes). A step that times out closes its page and is waited for, so it cannot act on the next flow;
+6 flows, the file at most 20 kB (bytes). If Chrome closes its tab or refuses a new target while a flow starts ("Target.createTarget: Not supported", seen in the first pilot; cause not proven, a launch right after the previous Chrome context closed is the suspect), the flow is retried ONCE on a fresh browser and the summary carries a "RETRIED ONCE" note: never silent. A step that times out closes its page and is waited for, so it cannot act on the next flow;
 a run that returns fewer flow results than asked is an issue (exit 1). A failed step or `expect` stops its flow, is an issue (exit 1) and keeps its screenshot; the layout probe
 (overflow, tap targets) also runs on each flow's end state. Output: `<out>/<run>/<platform>/flows/<name>/summary.md` (each step's result,
 time, how it was done, screenshot) plus the screenshots next to it.
@@ -49,6 +55,9 @@ time, how it was done, screenshot) plus the screenshots next to it.
   typed into). A tap on a non-field target while the keyboard is up closes the keyboard first (Back), because Chrome then shrinks and pans the visual viewport and page coordinates stop matching the screen; the step says so, and `expect ... inViewport` is how a flow checks what the keyboard hides. Back is the hardware Back key (with the keyboard up the first Back only closes the keyboard, as on a phone). Forward has
   no key on Android: DevTools history. Scroll is a script scroll. If `adb input` fails the step falls back to a DevTools touch, then to a
   click, and the summary says which one was used.
+- **Long press:** Android holds a real touch for `ms` (`adb input swipe` from a point to the same point). On iOS it sends W3C touch pointer
+  actions with a pause and checks that the page saw a pointerdown and a pointerup that far apart (still WebDriver, **not a finger**); if the page saw no
+  hold it dispatches pointer/mouse down and up from script, holds, releases (no click) and says "NOT a finger" in the summary.
 - **iOS** (Safari on the Simulator, WebDriver): tap is a **WebDriver element click** (a synthesized click, not a finger); the page must
   see a click on the element, else the step falls back to a script click (or fails if the click landed elsewhere) and says so. Typing
   is click + sendKeys, verified against the field's value; when Safari ignores the text (measured on iOS 26.2: it does) the step retries
@@ -57,8 +66,23 @@ time, how it was done, screenshot) plus the screenshots next to it.
   scrolled; measured on iOS 26.2 the actions are accepted and do nothing, so the swipe is done as a script scroll and the summary says
   "NOT a finger swipe". The on-screen keyboard did not appear for synthesized focus. So on iOS the flow proves the page's logic, not
   finger or keyboard behaviour. Pinch and multi-finger gestures are not available on either platform.
+  A Back that WebDriver does not answer within 12 s is repeated as a script `history.back()` and flagged; the first simulator screenshot gets 90 s (later ones 45 s, one retry
+that is noted) because a 30 s limit ended in ETIMEDOUT; the first-run Safari tip bubble is closed by the warm-up (3 passes, one retry of the warm-up), and when the
+warm-up itself fails the bubble can still cover the bottom bar of the screenshots.
   **Known limit:** on a heavy live page (measured on a charting dashboard) the iOS swipe can hang safaridriver; the step then fails at its
   cap, the flow stops and no further WebDriver call is made.
+
+**Read-style POSTs (`allowPost`).** Some pages READ with a POST (an RPC endpoint: the page's data call is a POST), and under no-writes they show their
+error state and nothing behind them can be reached. `"allowPost": ["/api/rpc"]` in the steps file, or `--allow-post <path>` (repeatable), lets POST
+requests through to those paths only: **same origin as the flow's start page, exact path (no wildcards; a query does not matter), POST only (PUT, PATCH and
+DELETE stay blocked), at most 5 paths**. Every allowed request is counted and listed by path in the flow summary, the list is printed at the start of the
+run, and it is refused when the session is write-protected (a minted session, `KITQA_NO_WRITES`), exactly like `allowWrites`. In public mode the paths
+travel in the public input and go through the secret-looking check. On iOS the page-script guard applies the same list (requests the page makes while it
+loads are not seen there, so they are neither blocked nor counted). **This is for RPC-style reads only: a path whose POST can change data must never be
+listed**, and a path that carries both reads and writes (one endpoint, the action in the body) cannot be listed at all, because the match is by path. The
+caller reads the repo's handler first and says in the report which handler each path is. Fixture: `examples/read-post.json` (content loaded by POST
+passes, another POST on the page stays blocked) against `examples/read-post-blocked.json` (the same page without the list shows its error).
+`examples/sheet.json` opens a bottom sheet, types in it and uses Back twice (Android: the first Back closes the keyboard, the second the sheet).
 
 **Writes: default NO WRITES.** A flow can press real buttons, so unless the file (or `--allow-writes "<reason>"`) says otherwise:
 - Android: one context-level route, installed before any page loads, aborts every non-GET/HEAD/OPTIONS request to ANY origin (public
