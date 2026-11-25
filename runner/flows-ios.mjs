@@ -3,13 +3,13 @@
 // W3C pointer actions of type touch when this Safari accepts them and otherwise falls back to a script scroll, which the step result
 // says in plain words. Back and Forward are WebDriver history commands. Pinch and multi-finger gestures are not available.
 // safaridriver has no run-at-document-start hook, so the write guard (flows.mjs guardBody) is injected as soon as WebDriver gives
-// control back after a load, re-checked every 150 ms while a step settles, and checked again right after every step (a step that
+// control back after a load, re-checked every 60 ms while a step settles, and checked again right after every step (a step that
 // navigates, such as a tap on a link, Back or Enter, hands the next document to the same code). The marker is a random per-run
 // property name. Requests a page sends while its document loads are not covered, and the README lists the other holes.
 import fs from 'node:fs';
 import path from 'node:path';
 import { probe, withTimeout } from './lib.mjs';
-import { LIMITS, textXPath, stepLabel, swipePoints, fileSafe, guardSource, guardCheck, guardRead, newGuardKey } from './flows.mjs';
+import { LIMITS, textXPath, stepLabel, swipePoints, fileSafe, guardSource, guardRead, newGuardKey } from './flows.mjs';
 
 const ELEMENT_KEY = 'element-6066-11e4-a52e-4f735466cecf';
 const KEYS = { Enter: '', Tab: '', Backspace: '', Escape: '' };
@@ -64,32 +64,32 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   let seen = 0;
   const ensureGuard = async () => {
     if (env.allowWrites) return;
-    let has = false;
+    // ONE round trip: the guard source is idempotent per document ("already" when this document has it), so a new document
+    // is guarded as soon as WebDriver answers after its load (every extra round trip is time a page's own timer can use).
+    let r;
     try {
-      has = await exec(guardCheck(GKEY));
-    } catch (e) {
-      res.guard.failed++;
-      throw new Error('write guard could not be checked: ' + String(e.message).slice(0, 80));
-    }
-    if (has) { res.guard.active = true; return; }
-    try {
-      const r = await exec(guardSource(GKEY));
-      if (!r || !r.ok || !(await exec(guardCheck(GKEY)))) throw new Error('guard did not take');
+      r = await exec(guardSource(GKEY));
     } catch (e) {
       res.guard.failed++;
       throw new Error('write guard could not be installed: ' + String(e.message).slice(0, 80));
     }
-    res.guard.documents++;
-    res.guard.late++;
+    if (!r || r.ok !== true) {
+      res.guard.failed++;
+      throw new Error('write guard did not take');
+    }
     res.guard.active = true;
-    seen = 0;
+    if (!r.already) {
+      res.guard.documents++;
+      res.guard.late++;
+      seen = 0;
+    }
   };
   // While a step settles: look for a new document every 150 ms and guard it at once (errors are raised by the check after the step).
   const settle = async (ms) => {
     const end = Date.now() + ms;
     do {
       await ensureGuard().catch(() => {});
-      await sleep(150);
+      await sleep(60);
     } while (Date.now() < end);
   };
   const readBlocked = async () => {
