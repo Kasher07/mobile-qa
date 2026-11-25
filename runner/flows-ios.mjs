@@ -249,8 +249,10 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   }
 
   let failed = false;
+  let stuck = false;
+  const quick = (p) => withTimeout(p, 10000, 'webdriver');
   try {
-    await ensureGuard();
+    await withTimeout(ensureGuard(), 20000, 'write guard check');
   } catch (e) {
     res.error = 'the flow did not run: ' + e.message;
     failed = true;
@@ -268,15 +270,17 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     const st = Date.now();
     log('  step ' + i + '/' + flow.steps.length + (showLabels ? ' ' + rec.label : ''));
     try {
-      await ensureGuard();
+      await withTimeout(ensureGuard(), 20000, 'write guard check');
       const out = await withTimeout(doStep(s), LIMITS.stepMs, 'step');
       rec.via = out.via;
       rec.ok = true;
-      await readBlocked();
+      await quick(readBlocked());
     } catch (e) {
       rec.error = String((e && e.message) || e).split('\n')[0].slice(0, 300);
       failed = true;
-      await readBlocked().catch(() => {});
+      // A step that timed out leaves safaridriver busy (a heavy live page): every later call would hang for minutes, so none is made.
+      if (/did not finish/.test(rec.error)) stuck = true;
+      else await quick(readBlocked()).catch(() => {});
     }
     rec.ms = Date.now() - st;
     try {
@@ -289,12 +293,15 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     }
     log('    step ' + i + '/' + flow.steps.length + ' ' + (rec.ok ? 'ok' : 'failed') + ' in ' + Math.round(rec.ms / 1000) + ' s');
   }
-  try {
-    res.probe = await exec('return (' + probe.toString() + ')();');
-  } catch (e) {
-    res.notes.push('end-state probe failed: ' + String(e.message).split('\n')[0].slice(0, 100));
+  if (stuck) res.notes.push('Safari stopped answering during a step (a heavy live page); the end-state probe and the write-guard read-out were skipped');
+  else {
+    try {
+      res.probe = await quick(exec('return (' + probe.toString() + ')();'));
+    } catch (e) {
+      res.notes.push('end-state probe failed: ' + String(e.message).split('\n')[0].slice(0, 100));
+    }
+    await quick(readBlocked()).catch(() => {});
   }
-  await readBlocked().catch(() => {});
   res.ms = Date.now() - t0;
   res.status = failed ? 'failed' : 'passed';
   return res;
