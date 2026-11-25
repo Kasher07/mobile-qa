@@ -72,7 +72,7 @@ test('public mode refuses secret-looking and personal text', () => {
     assert.ok(textGuard(t), t + ' should be refused');
     assert.throws(() => parseFlows(doc([{ type: { selector: '#a', text: t } }]), { textGuard }), /secret|personal/);
   }
-  for (const t of ['hello world', 'Nguyen Van A', 'Save changes', '12345']) assert.equal(textGuard(t), null, t);
+  for (const t of ['hello world', 'Nguyen Van A', 'Save changes', '12345', 'fixture page POST against a static host (answers 405)', 'order 66 for table 12 please']) assert.equal(textGuard(t), null, t);
   assert.throws(() => parseFlows(doc([{ tap: '#a' }], { allowWrites: 'token a8f9c2d7e6b5a4f3c2d1e0f9' }), { textGuard }), /secret/);
 });
 

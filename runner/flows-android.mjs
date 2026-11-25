@@ -93,29 +93,41 @@ async function aim(l) {
     const x1 = Math.min(r.right, left0 + w);
     const y0 = Math.max(r.top, top0);
     const y1 = Math.min(r.bottom, top0 + h);
-    if (x1 - x0 < 1 || y1 - y0 < 1) return { error: 'the element is outside the visible screen (covered by the keyboard or off screen)' };
+    const area = Math.max(1, r.width * r.height);
+    const frac = Math.max(0, x1 - x0) * Math.max(0, y1 - y0) / area;
+    if (x1 - x0 < 1 || y1 - y0 < 1) return { frac: 0, error: 'the element is outside the visible screen (covered by the keyboard or off screen)' };
     const x = (x0 + x1) / 2;
     const y = (y0 + y1) / 2;
     const hit = document.elementFromPoint(x, y);
     const label = (n) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '');
-    if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) return { x, y, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, error: 'another element covers the tap point: ' + label(hit) };
-    return { x, y, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+    if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) return { x, y, frac, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, error: 'another element covers the tap point: ' + label(hit) };
+    return { x, y, frac, rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
   });
 }
 
-async function realTap(env, l) {
-  const a = await aim(l);
+async function realTap(env, l, { editable = false } = {}) {
+  let a = await aim(l);
+  let pre = '';
+  // Under the keyboard a user closes it (Back closes the keyboard first) or scrolls; a sliver of a button is not tapped.
+  if (!editable && a.frac < 0.6 && (await keyboardUp(env.sh))) {
+    await env.sh('input keyevent KEYCODE_BACK');
+    await wait(env.page, 700);
+    env.cal = null;
+    a = await aim(l);
+    pre = ' (keyboard closed first: the element was under it)';
+  }
   if (a.error) throw new Error(a.error);
+  if (a.frac < 0.6) throw new Error('only ' + Math.round(a.frac * 100) + '% of the element is on screen');
   try {
     const c = await cal(env);
     const p = toScreen(c, a.x, a.y);
     await env.sh('input tap ' + p.x + ' ' + p.y);
-    return 'real touch (adb input tap)';
+    return 'real touch (adb input tap)' + pre;
   } catch (e) {
     env.cal = null;
     try {
       await env.page.touchscreen.tap(a.x, a.y);
-      return 'DevTools touch (adb tap unavailable: ' + String(e.message).split('\n')[0].slice(0, 60) + ')';
+      return 'DevTools touch (adb tap unavailable: ' + String(e.message).split('\n')[0].slice(0, 60) + ')' + pre;
     } catch {
       await l.click({ timeout: 5000 });
       return 'synthesized click (no touch available)';
@@ -140,7 +152,7 @@ async function doStep(env, s) {
     case 'type': {
       const l = to(s.target);
       await l.waitFor({ state: 'visible', timeout: 10000 });
-      let via = await realTap(env, l);
+      let via = await realTap(env, l, { editable: true });
       env.cal = null;
       await wait(page, 700);
       const focused = await l.evaluate((el) => document.activeElement === el);

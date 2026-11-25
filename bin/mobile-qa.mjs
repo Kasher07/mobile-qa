@@ -128,7 +128,7 @@ export function checkUrl(raw) {
 
 // Typed or matched text travels as a public workflow input in public mode: nothing secret-looking or personal goes.
 export function textGuard(t) {
-  const words = [t, ...t.split(/\s+/)];
+  const words = t.split(/\s+/); // the URL heuristics expect one word: a sentence with a digit in it is not a token
   if (words.some((w) => w && (secretValue(w) || personalValue(w)))) return 'looks like a secret or personal data (public repo: the steps are a public workflow input)';
   return null;
 }
