@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runPrivate } from './private-qa.mjs';
-import { parseFlows, reportFlows, flowCountIssue, clean, FlowError, LIMITS as FLOW_LIMITS } from '../runner/flows.mjs';
+import { parseFlows, readStepDocs, mergeStepDocs, reportFlows, flowCountIssue, clean, FlowError, LIMITS as FLOW_LIMITS } from '../runner/flows.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
 const ACCOUNT = process.env.MOBILE_QA_ACCOUNT || 'Kasher07';
@@ -35,10 +35,13 @@ export function readUrlFile(f) {
   return fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !l.trim().startsWith('#')).flatMap((l) => l.match(/https?:\/\/[^\s<>`"')]+/g) || []);
 }
 export function parseArgs(argv) {
-  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, private: false, steps: null, allowWrites: null, urls: [] };
+  const opts = { platforms: 'ios,android', out: null, segments: 6, iosDevice: '', iosMode: 'webdriver', keep: false, sweepOnly: false, private: false, steps: null, allowWrites: null, allowPost: [], platformsExplicit: false, iosNotAsked: false, urls: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--platforms') opts.platforms = argv[++i];
+    if (a === '--platforms') {
+      opts.platforms = argv[++i];
+      opts.platformsExplicit = true;
+    }
     else if (a === '--out') opts.out = argv[++i];
     else if (a === '--segments') opts.segments = Number(argv[++i]);
     else if (a === '--ios-device') opts.iosDevice = argv[++i] || '';
@@ -46,7 +49,8 @@ export function parseArgs(argv) {
     else if (a === '--sweep-only') opts.sweepOnly = true;
     else if (a === '--private') opts.private = true;
     else if (a === '--ios-mode') opts.iosMode = argv[++i];
-    else if (a === '--steps') opts.steps = argv[++i];
+    else if (a === '--steps') (opts.steps ||= []).push(argv[++i]);
+    else if (a === '--allow-post') opts.allowPost.push(argv[++i]);
     else if (a === '--allow-writes') opts.allowWrites = argv[++i];
     else if (a === '--file') opts.urls.push(...readUrlFile(argv[++i]));
     else if (a === '-h' || a === '--help') {
@@ -59,7 +63,14 @@ export function parseArgs(argv) {
   if (!Number.isInteger(opts.segments) || opts.segments < 1 || opts.segments > 12) throw new InputError('--segments must be 1..12');
   if (/[\r\n]/.test(opts.iosDevice)) throw new InputError('bad --ios-device');
   if (!/^(webdriver|openurl)$/.test(opts.iosMode)) throw new InputError('--ios-mode must be webdriver or openurl');
-  if (opts.steps !== null && !opts.steps) throw new InputError('--steps needs a file');
+  if (opts.steps !== null && opts.steps.some((s) => !s)) throw new InputError('--steps needs a file');
+  if (opts.allowPost.length && !opts.steps) throw new InputError('--allow-post <path> needs --steps');
+  if (opts.allowPost.some((p) => !p)) throw new InputError('--allow-post needs a path');
+  // Flows run on Android only unless iOS is asked for explicitly (iOS is slow, its guard is a script, and it failed 3 of 3 in the pilot).
+  if (opts.steps && !opts.platformsExplicit) {
+    opts.platforms = 'android';
+    opts.iosNotAsked = true;
+  }
   if (opts.allowWrites !== null && (!opts.steps || !String(opts.allowWrites).trim())) throw new InputError('--allow-writes "<reason>" needs --steps and a non-empty reason');
   if (opts.steps && opts.sweepOnly) throw new InputError('--steps cannot be combined with --sweep-only');
   if (opts.private && (opts.keep || opts.sweepOnly)) throw new InputError('--private cannot be combined with --keep or --sweep-only (a private run is always deleted)');
@@ -134,22 +145,9 @@ export function textGuard(t) {
 }
 
 // Reads and validates the steps file (public mode: starts are public URLs, all rules of checkUrl apply). Returns parseFlows' result.
-export function readFlows(file, { allowWrites = null } = {}) {
-  let raw;
+export function readFlows(files, { allowWrites = null, allowPost = [] } = {}) {
   try {
-    raw = fs.readFileSync(file, 'utf8');
-  } catch {
-    throw new InputError('cannot read the steps file');
-  }
-  if (raw.length > 4 * FLOW_LIMITS.jsonBytes) throw new InputError('the steps file is too large');
-  let doc;
-  try {
-    doc = JSON.parse(raw);
-  } catch (e) {
-    throw new InputError('the steps file is not valid JSON: ' + e.message.slice(0, 80));
-  }
-  if (allowWrites !== null && doc && typeof doc === 'object') doc.allowWrites = String(allowWrites);
-  try {
+    const doc = mergeStepDocs(readStepDocs([].concat(files)), { allowWrites: allowWrites === null ? null : String(allowWrites), allowPost });
     return parseFlows(doc, {
       textGuard,
       noWrites: process.env.KITQA_NO_WRITES === '1', // set by kit-qa --mint: a write-protected session never opts out of the guard
@@ -448,8 +446,10 @@ async function main() {
   }
   let flows = null;
   if (opts.steps) {
-    flows = readFlows(opts.steps, { allowWrites: opts.allowWrites });
+    flows = readFlows(opts.steps, { allowWrites: opts.allowWrites, allowPost: opts.allowPost });
     flowsJson = flows.wireJson;
+    if (flows.allowPost.length) log('POST allowed (read-style RPC only, exact same-origin paths) on: ' + flows.allowPost.join(', '));
+    if (opts.iosNotAsked) log('flows run on Android only (iOS was not asked: add --platforms ios,android to include it)');
   }
   if (!urls.length && !flows && !opts.sweepOnly) throw new InputError('no URLs. Usage: node bin/mobile-qa.mjs <url> [more urls] [--platforms ios,android] [--steps flows.json]');
   if (urls.length > PER_RUN * MAX_RUNS) throw new InputError('max ' + PER_RUN * MAX_RUNS + ' URLs per call (got ' + urls.length + '); split the list');
@@ -545,6 +545,8 @@ async function main() {
   // summary
   let issues = 0;
   const lines = ['# mobile-qa ' + baseId, ''];
+  if (opts.iosNotAsked) lines.push('note: flows ran on Android only: iOS was not asked (add --platforms ios,android with --steps to include it).', '');
+  if (flows && flows.allowPost.length) lines.push('POST allowed (read-style RPC) on: ' + flows.allowPost.join(', '), '');
   // A replacement run writes below its first run's folder: take each results file once.
   const files = [...new Set(runs.flatMap((r) => findResults(r.dir)))];
   for (const f of files) {

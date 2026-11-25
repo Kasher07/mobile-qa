@@ -15,6 +15,8 @@ button{font-size:18px;padding:12px 16px;margin:8px 8px 0 0;border-radius:8px;bor
 #carousel{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;gap:0;border-radius:10px}
 #carousel div{flex:0 0 100%;scroll-snap-align:start;scroll-snap-stop:always;box-sizing:border-box;padding:40px 16px;font-size:22px;text-align:center}
 #carousel div:nth-child(1){background:#fdd}#carousel div:nth-child(2){background:#dfd}#carousel div:nth-child(3){background:#ddf}
+#hold{padding:24px;border:2px dashed #446;border-radius:12px;text-align:center;font-size:20px;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+#sheet{position:fixed;left:0;right:0;bottom:0;z-index:5;background:#fff;border-top:3px solid #446;padding:16px;box-shadow:0 -6px 20px rgba(0,0,0,.25)}
 .filler{height:520px;background:linear-gradient(#fff,#eef);border-radius:10px;padding:12px}
 .dock{position:fixed;left:0;right:0;bottom:0;padding:10px 16px;background:#fff;border-top:1px solid #aab}
 </style>
@@ -42,10 +44,18 @@ button{font-size:18px;padding:12px 16px;margin:8px 8px 0 0;border-radius:8px;bor
   <form method="post" action="post-target.html"><button id="form-post" type="submit">Submit form (POST)</button></form>
 </section>
 <section>
+  <div id="hold" role="button" tabindex="0">Hold me for half a second</div>
+  <p id="hold-state">Hold state: idle</p>
+</section>
+<section>
+  <button id="open-sheet" type="button">Open sheet</button>
+</section>
+<section>
   <a id="timer-link" href="post-timer.html">Go to the timer page</a>
   <p>That page sends a POST one second after it loads.</p>
 </section>
 <div class="filler">Long page, so the note box below sits at the bottom edge where a keyboard comes up.</div>
+<div id="sheet" role="dialog" hidden><p><b>Booking sheet</b></p><label for="sheet-name">Your name</label><input id="sheet-name" autocomplete="off" placeholder="name for the sheet"></div>
 <div class="dock"><input id="note" autocomplete="off" placeholder="Note (bottom of the screen)"></div>
 <script>
 (function () {
@@ -56,6 +66,20 @@ button{font-size:18px;padding:12px 16px;margin:8px 8px 0 0;border-radius:8px;bor
   $('open').addEventListener('click', function () { history.pushState({ d: 1 }, '', '#details'); $('dialog').hidden = false; });
   $('close').addEventListener('click', function () { history.back(); });
   window.addEventListener('popstate', function () { $('dialog').hidden = true; });
+  var timer = null;
+  var held = false;
+  var hold = $('hold');
+  hold.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  hold.addEventListener('pointerdown', function () {
+    held = false;
+    clearTimeout(timer);
+    timer = setTimeout(function () { held = true; $('hold-state').textContent = 'Hold state: held'; }, 500);
+  });
+  var release = function () { clearTimeout(timer); if (!held) $('hold-state').textContent = 'Hold state: released early'; };
+  hold.addEventListener('pointerup', release);
+  hold.addEventListener('pointercancel', release);
+  $('open-sheet').addEventListener('click', function () { history.pushState({ s: 1 }, '', '#sheet'); $('sheet').hidden = false; });
+  window.addEventListener('popstate', function () { $('sheet').hidden = true; });
   var car = $('carousel');
   car.addEventListener('scroll', function () { $('slide-label').textContent = 'Slide ' + (Math.round(car.scrollLeft / car.clientWidth) + 1) + ' of 3'; });
   $('post').addEventListener('click', function () {

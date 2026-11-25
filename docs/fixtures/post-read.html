@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Read by POST</title></head>
+<body style="font-family:-apple-system,system-ui,sans-serif;padding:16px">
+<h1>Read by POST</h1>
+<p>Like an RPC page: its content is fetched with a POST. This static host answers 405, which still proves the request left the phone.</p>
+<p id="content">loading the content</p>
+<button id="save" type="button" style="font-size:18px;padding:12px 16px">Save (a write)</button>
+<p id="save-result">not saved</p>
+<script>
+var out = document.getElementById('content');
+fetch('post-read.html', { method: 'POST', body: 'read=1' })
+  .then(function (r) { out.textContent = 'content loaded (POST answered ' + r.status + ')'; })
+  .catch(function () { out.textContent = "We couldn't load the content"; });
+document.getElementById('save').addEventListener('click', function () {
+  var s = document.getElementById('save-result');
+  fetch('post-write.html', { method: 'POST', body: 'write=1' })
+    .then(function (r) { s.textContent = 'write sent (POST answered ' + r.status + ')'; })
+    .catch(function () { s.textContent = 'write blocked'; });
+});
+</script>
+</body></html>

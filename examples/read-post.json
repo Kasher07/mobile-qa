@@ -1,0 +1,31 @@
+{
+  "allowPost": [
+    "/mobile-qa/fixtures/post-read.html"
+  ],
+  "flows": [
+    {
+      "name": "read-post",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/post-read.html",
+      "steps": [
+        {
+          "expect": {
+            "text": "content loaded",
+            "visible": true
+          }
+        },
+        {
+          "tap": "#save"
+        },
+        {
+          "expect": {
+            "text": "write blocked",
+            "visible": true
+          }
+        },
+        {
+          "shot": "read-ok-write-blocked"
+        }
+      ]
+    }
+  ]
+}

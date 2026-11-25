@@ -1,0 +1,19 @@
+{
+  "flows": [
+    {
+      "name": "read-post-blocked",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/post-read.html",
+      "steps": [
+        {
+          "expect": {
+            "text": "We couldn't load the content",
+            "visible": true
+          }
+        },
+        {
+          "shot": "blocked-by-default"
+        }
+      ]
+    }
+  ]
+}

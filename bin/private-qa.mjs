@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { reportFlows, flowCountIssue, clean } from '../runner/flows.mjs';
+import { reportFlows, flowCountIssue, clean, readStepDocs, mergeStepDocs } from '../runner/flows.mjs';
 import { privateFlows, isMintedState, buildJob, sealJob, unseal, resultAad, untrusted, leakVerdict, gitBashPaths, rawArtifactLeaks } from '../runner/private.mjs';
 
 const REPO = process.env.MOBILE_QA_REPO || 'Kasher07/mobile-qa';
@@ -154,15 +154,7 @@ export async function runPrivate(opts, deps) {
   try {
     let flowsWire = null;
     if (opts.steps) {
-      let doc;
-      try {
-        const raw = fs.readFileSync(opts.steps, 'utf8');
-        if (raw.length > 80000) throw new Error('the steps file is too large');
-        doc = JSON.parse(raw);
-      } catch (e) {
-        throw new Error('cannot use the steps file: ' + String(e.message).slice(0, 100));
-      }
-      if (opts.allowWrites !== null && doc && typeof doc === 'object') doc.allowWrites = String(opts.allowWrites);
+      const doc = mergeStepDocs(readStepDocs(opts.steps), { allowWrites: opts.allowWrites === null ? null : String(opts.allowWrites), allowPost: opts.allowPost || [] });
       let minted = false;
       try {
         minted = isMintedState(JSON.parse(fs.readFileSync(process.env.KITQA_STORAGE_STATE, 'utf8')));
@@ -171,6 +163,8 @@ export async function runPrivate(opts, deps) {
       flowsWire = JSON.parse(pf.wireJson);
       flowsRequested = flowsWire.flows.length;
       flowsNoWrites = pf.noWrites;
+      if (pf.allowPost.length) log('POST allowed (read-style RPC only, exact same-origin paths) on: ' + pf.allowPost.join(', '));
+      if (opts.iosNotAsked) log('flows run on Android only (iOS was not asked: add --platforms ios,android to include it)');
     }
     built = buildJob(process.env, process.platform === 'win32' ? gitBashPaths(opts.urls) : opts.urls, undefined, flowsWire);
   } catch (e) {
@@ -411,6 +405,7 @@ export async function runPrivate(opts, deps) {
     let issues = 0;
     const T = (s, n) => untrusted(String(s).split(host).join('<site>'), n);
     const lines = ['# mobile-qa private ' + baseId, '', 'Trusted (computed here): paths, counts, file paths. Everything after a "[untrusted]" tag is text from the runner or the page: control characters removed, truncated, not verified.', ''];
+    if (opts.iosNotAsked) lines.push('note: flows ran on Android only: iOS was not asked (add --platforms ios,android with --steps to include it).', '');
     const files = [];
     const find = (d) => { for (const e of fs.existsSync(d) ? fs.readdirSync(d, { withFileTypes: true }) : []) { const p = path.join(d, e.name); if (e.isDirectory()) find(p); else if (e.name === 'results.json') files.push(p); } };
     for (const a of attempts) find(a.dir);

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { _android as android } from 'playwright-core';
 import { loadPrivateJob, installPrivateLogging, toPlaywrightCookies, isBlockedWrite, sameHost } from './private.mjs';
 import { settleProbe, waitSettled } from './lib.mjs';
-import { loadRunnerFlows } from './flows.mjs';
+import { loadRunnerFlows, postAllowed } from './flows.mjs';
 import { runFlowAndroid } from './flows-android.mjs';
 import { readUrls, slug, probe, writeResults, maxSegments, newPage, segmentPlan, saveResults, withTimeout, PAGE_LIMIT_MS, JOB_BUDGET_MS } from './lib.mjs';
 
@@ -20,6 +20,8 @@ const urls = PRIV ? PRIV.urls : readUrls();
 // Flows (scripted steps): public = the FLOWS workflow input, private = inside the sealed job. Null when this run has none.
 const FLOWS = loadRunnerFlows({ publicJson: PRIV ? '' : process.env.FLOWS, privateDoc: PRIV && PRIV.flows, base: PRIV && PRIV.base });
 const blocked = [];
+const allowedPosts = []; // paths of the POSTs that the allowPost list let through (flows only)
+let flowAllow = null; // { origin, paths } of the flow that is running
 const MAX_SEG = maxSegments();
 const results = { platform: 'android', device: null, browser: null, mode: 'playwright-android', notes: [], pages: [] };
 
@@ -72,6 +74,11 @@ async function launch(kind = 'pages') {
     }
     await ctx.route('**/*', (route) => {
       const req = route.request();
+      // Read-style POSTs the caller listed (exact path, this flow's own origin, POST only): let through and counted.
+      if (flowKind && flowAllow && postAllowed({ method: req.method(), url: req.url() }, flowAllow)) {
+        allowedPosts.push(new URL(req.url()).pathname);
+        return route.continue();
+      }
       if (flowKind ? !['GET', 'HEAD', 'OPTIONS'].includes(req.method().toUpperCase()) : isBlockedWrite(req.method(), req.url(), PRIV.base)) {
         blocked.push(req.method() + ' ' + new URL(req.url()).pathname);
         return route.abort('blockedbyclient');
@@ -269,32 +276,57 @@ cur = null;
 if (FLOWS) {
   results.flows = [];
   await withTimeout(context.close(), 20000, 'close').catch(() => {});
+  await new Promise((r) => setTimeout(r, 2000)); // Chrome needs a moment after its last context closed (a launch right away has met "Target.createTarget: Not supported")
   let flowLaunchError = null;
-  try {
-    context = await launch('flow');
-  } catch (e) {
-    flowLaunchError = 'the flow browser could not be started: ' + String((e && e.message) || e).split('\n')[0].slice(0, 160);
-  }
+  const startFlowContext = async () => {
+    try {
+      context = await launch('flow');
+      flowLaunchError = null;
+    } catch (e) {
+      flowLaunchError = 'the flow browser could not be started: ' + String((e && e.message) || e).split('\n')[0].slice(0, 160);
+    }
+  };
+  await startFlowContext();
   const failedFlow = (flow, msg) => ({ name: flow.name, start: flow.startShown, status: 'failed', error: msg, steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 });
+  const runOne = async (flow) => {
+    if (Date.now() - STARTED > JOB_BUDGET_MS) throw new Error('not run: the job time budget was used up');
+    if (flowLaunchError) throw new Error(flowLaunchError);
+    if (guardError) throw new Error('the flow did not run: ' + guardError); // fail closed
+    const prev = page;
+    page = await withTimeout(context.newPage(), 30000, 'new tab');
+    prev.close({ runBeforeUnload: false }).catch(() => {});
+    page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
+    flowAllow = (FLOWS.allowPost || []).length ? { origin: new URL(flow.start).origin, paths: FLOWS.allowPost } : null;
+    await gotoOnce(flow.start);
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    if (PRIV) await waitSettled(() => page.evaluate(settleProbe), (ms) => page.waitForTimeout(ms));
+    const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: FLOWS.allowWrites, allowPost: FLOWS.allowPost, allowedPosts, guardActive: !guardError, cal: null };
+    return runFlowAndroid(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
+  };
+  // Chrome on the emulator sometimes closes its tab or refuses new targets while a flow starts: ONE explicit retry on a fresh
+  // browser, always written in the flow's notes (never silent).
+  const BROWSER_GONE = /has been closed|Target\.createTarget|Not supported|browser has been closed|Target closed|crashed/i;
   for (const [fi, flow] of FLOWS.flows.entries()) {
     console.log('[flow ' + (fi + 1) + '/' + FLOWS.flows.length + ']' + (PRIV ? '' : ' ' + flow.name));
     let r;
     try {
-      if (Date.now() - STARTED > JOB_BUDGET_MS) throw new Error('not run: the job time budget was used up');
-      if (flowLaunchError) throw new Error(flowLaunchError);
-      if (guardError) throw new Error('the flow did not run: ' + guardError); // fail closed
-      const prev = page;
-      page = await withTimeout(context.newPage(), 30000, 'new tab');
-      prev.close({ runBeforeUnload: false }).catch(() => {});
-      page.on('dialog', (d) => (d.type() === 'beforeunload' ? d.accept() : d.dismiss()).catch(() => {}));
-      await gotoOnce(flow.start);
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(1200);
-      if (PRIV) await waitSettled(() => page.evaluate(settleProbe), (ms) => page.waitForTimeout(ms));
-      const env = { device, sh, page, outDir: OUT, ensureTop: ensureChromeOnTop, blocked, allowWrites: FLOWS.allowWrites, guardActive: !guardError, cal: null };
-      r = await runFlowAndroid(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
+      r = await runOne(flow);
     } catch (e) {
-      r = failedFlow(flow, String((e && e.message) || e).split('\n')[0].slice(0, 300));
+      const first = String((e && e.message) || e).split('\n')[0].slice(0, 200);
+      if (!BROWSER_GONE.test(first) || Date.now() - STARTED > JOB_BUDGET_MS) r = failedFlow(flow, first.slice(0, 300));
+      else {
+        console.log('    retrying the flow once on a fresh browser');
+        await withTimeout(context.close(), 20000, 'close').catch(() => {});
+        await new Promise((r) => setTimeout(r, 2000));
+        await startFlowContext();
+        try {
+          r = await runOne(flow);
+          r.notes = [...(r.notes || []), 'RETRIED ONCE on a fresh browser after: ' + first];
+        } catch (e2) {
+          r = failedFlow(flow, 'failed twice. first: ' + first + ' | retry: ' + String((e2 && e2.message) || e2).split('\n')[0].slice(0, 120));
+        }
+      }
     }
     results.flows.push(r);
     saveResults(OUT, results);

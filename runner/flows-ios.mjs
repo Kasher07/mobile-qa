@@ -22,6 +22,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   // Every wait in a flow step (timers, polling for an element, settling after an action) goes through settle(): the guard is looked
   // for every 60 ms, so a document that appears while any step waits is guarded at once.
   const sleep = (ms) => settle(ms);
+  const ALLOW = (env.allowPost || []).length ? { origin: new URL(flow.start).origin, paths: env.allowPost } : null; // RPC-style reads the caller listed
   const GKEY = newGuardKey(); // random per flow: a page cannot know which property says "guarded"
   const dir = path.join(env.outDir, 'flows', flow.name);
   fs.mkdirSync(dir, { recursive: true });
@@ -35,6 +36,8 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
     shots: [],
     guard: { active: false, how: env.allowWrites ? 'off (writes allowed)' : 'JavaScript guard injected right after each document loads and re-checked after every step (fetch/XHR writes, sendBeacon, non-GET forms, WebSockets); it is NOT a request-level block, see the README for what it misses', documents: 0, late: 0, failed: 0 },
     allowWrites: env.allowWrites || null,
+    allowPost: env.allowPost || [],
+    postsAllowed: [],
     ms: 0,
   };
   const t0 = Date.now();
@@ -66,13 +69,14 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
 
   // Guard: checked before every step (a new document has none), injected when missing, read after the step.
   let seen = 0;
+  let seenAllowed = 0;
   const ensureGuard = async () => {
     if (env.allowWrites) return;
     // ONE round trip: the guard source is idempotent per document ("already" when this document has it), so a new document
     // is guarded as soon as WebDriver answers after its load (every extra round trip is time a page's own timer can use).
     let r;
     try {
-      r = await exec(guardSource(GKEY));
+      r = await exec(guardSource(GKEY, ALLOW));
     } catch (e) {
       res.guard.failed++;
       throw new Error('write guard could not be installed: ' + String(e.message).slice(0, 80));
@@ -86,6 +90,7 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
       res.guard.documents++;
       res.guard.late++;
       seen = 0;
+      seenAllowed = 0;
     }
   };
   // While a step settles: look for a new document every 60 ms and guard it at once (errors are raised by the check after the step).
@@ -99,9 +104,13 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
   const readBlocked = async () => {
     if (env.allowWrites) return;
     const b = await exec(guardRead(GKEY)).catch(() => null);
-    if (Array.isArray(b) && b.length > seen) {
-      res.blocked.push(...b.slice(seen));
-      seen = b.length;
+    if (b && Array.isArray(b.b) && b.b.length > seen) {
+      res.blocked.push(...b.b.slice(seen));
+      seen = b.b.length;
+    }
+    if (b && Array.isArray(b.a) && b.a.length > seenAllowed) {
+      res.postsAllowed.push(...b.a.slice(seenAllowed));
+      seenAllowed = b.a.length;
     }
   };
 
@@ -171,13 +180,58 @@ export async function runFlowIos(env, flow, { log = () => {}, showLabels = true 
         }
       }
       case 'back':
-        await wd('POST', '/session/' + sid + '/back', {});
+      case 'forward': {
+        // A WebDriver Back has hung for the whole step cap on the hosted Macs: give it 12 s, then ask the page itself and say so.
+        const dir = s.do === 'back' ? 'back' : 'forward';
+        let via = 'WebDriver history ' + dir;
+        try {
+          await wd('POST', '/session/' + sid + '/' + dir, {}, 0, 12000);
+        } catch (e) {
+          await exec('history.' + dir + '(); return true;');
+          via = 'script history.' + dir + '() (WebDriver ' + dir + ' did not answer in 12 s: ' + String(e.message).split('\n')[0].slice(0, 50) + ')';
+          res.notes.push(s.do + ': WebDriver did not answer, history.' + dir + '() was called by script');
+        }
         await settle(1200);
-        return { via: 'WebDriver history back' };
-      case 'forward':
-        await wd('POST', '/session/' + sid + '/forward', {});
-        await settle(1200);
-        return { via: 'WebDriver history forward' };
+        return { via };
+      }
+      case 'longpress': {
+        let id = null;
+        let px;
+        let py;
+        if (s.target) {
+          id = await firstVisible(s.target);
+          const r = await rectOf(id);
+          px = Math.round(r.x + r.w / 2);
+          py = Math.round(r.y + r.h / 2);
+        } else {
+          const vp = await viewport();
+          px = Math.round(s.point[0] * vp.w);
+          py = Math.round(s.point[1] * vp.h);
+        }
+        const HOLD_ARM = 'var log=[]; window.__mqHold=log; var types=["pointerdown","pointerup","touchstart","touchend","mousedown","mouseup"]; var h=function(e){ log.push([e.type, Math.round(performance.now())]); }; types.forEach(function(t){document.addEventListener(t,h,true);}); window.__mqHoldOff=function(){ types.forEach(function(t){document.removeEventListener(t,h,true);}); }; return true;';
+        const HOLD_READ = 'var l=window.__mqHold||[]; if(window.__mqHoldOff) window.__mqHoldOff(); return l;';
+        await exec(HOLD_ARM);
+        try {
+          await wd('POST', '/session/' + sid + '/actions', { actions: [{ type: 'pointer', id: 'finger', parameters: { pointerType: 'touch' }, actions: [
+            { type: 'pointerMove', duration: 0, x: px, y: py, origin: 'viewport' },
+            { type: 'pointerDown', button: 0 },
+            { type: 'pause', duration: s.ms },
+            { type: 'pointerUp', button: 0 },
+          ] }] }, 0, s.ms + 12000);
+          await wd('DELETE', '/session/' + sid + '/actions').catch(() => {});
+        } catch { /* judged by what the page saw */ }
+        const log = (await exec(HOLD_READ).catch(() => [])) || [];
+        const down = log.find((e) => /down|start/.test(e[0]));
+        const up = log.filter((e) => /up|end/.test(e[0])).pop();
+        if (down && up && up[1] - down[1] >= s.ms * 0.8) return { via: 'W3C touch pointer actions held ' + s.ms + ' ms (WebDriver synthesized, not a finger; the page saw down and up ' + (up[1] - down[1]) + ' ms apart)' };
+        // The page did not see a hold: dispatch the events from script, hold, release (no click), and say so.
+        const fire = (phase) => exec('var el = arguments[0] || document.elementFromPoint(arguments[1], arguments[2]); if(!el) return false; var o={bubbles:true,cancelable:true,clientX:arguments[1],clientY:arguments[2],pointerType:"touch",isPrimary:true,button:0}; if(arguments[3]==="down"){ el.dispatchEvent(new PointerEvent("pointerdown",o)); el.dispatchEvent(new MouseEvent("mousedown",o)); } else { el.dispatchEvent(new PointerEvent("pointerup",o)); el.dispatchEvent(new MouseEvent("mouseup",o)); } return true;', [id ? ref(id) : null, px, py, phase]);
+        if (!(await fire('down'))) throw new Error('nothing at that point to press');
+        await sleep(s.ms);
+        await fire('up');
+        res.notes.push('longpress: Safari showed the page no hold from touch actions; pointer/mouse down and up were dispatched by script, held ' + s.ms + ' ms: NOT a finger, no real touch');
+        return { via: 'script-dispatched pointer/mouse events held ' + s.ms + ' ms (touch actions had no effect: NOT a finger)' };
+      }
       case 'scroll':
         if (s.target) await exec('arguments[0].scrollIntoView({block:"center",inline:"nearest"}); return true;', [ref(await firstVisible(s.target))]);
         else await exec('window.scrollBy(0, arguments[0]); return true;', [s.by]);

@@ -69,10 +69,23 @@ function boot(d) {
 const candidates = rankDevices();
 let dev = candidates[0];
 
+let shotsTaken = 0;
 function shot(file) {
   const p = path.join(OUT, file);
-  // execFileSync blocks the event loop: a hung simctl must end by itself, never hold the job.
-  run('xcrun', ['simctl', 'io', dev.udid, 'screenshot', '--type=jpeg', p], { timeout: 30000, killSignal: 'SIGKILL' });
+  // execFileSync blocks the event loop: a hung simctl must end by itself, never hold the job. The FIRST simctl call after boot can take
+  // over a minute on a hosted Mac (a 30 s limit ended in ETIMEDOUT at the first screenshot): 90 s for the first, 45 s for the rest,
+  // and one retry that is written in the notes.
+  const limit = shotsTaken === 0 ? 90000 : 45000;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      run('xcrun', ['simctl', 'io', dev.udid, 'screenshot', '--type=jpeg', p], { timeout: limit, killSignal: 'SIGKILL' });
+      break;
+    } catch (e) {
+      if (attempt >= 2 || !/ETIMEDOUT|timed out/i.test(String(e.code) + String(e.message))) throw e;
+      note('screenshot: simctl did not answer in ' + limit / 1000 + ' s, retried once');
+    }
+  }
+  shotsTaken++;
   try {
     run('sips', ['-Z', '1600', '-s', 'formatOptions', '72', p], { timeout: 20000, killSignal: 'SIGKILL' });
   } catch {}
@@ -217,16 +230,24 @@ async function startDriver() {
 // Taps happen only here, on a fixed neutral page, never on a page under test.
 async function warmUp() {
   if (!axe || !(urls.length || FLOWS)) return;
-  try {
-    run('xcrun', ['simctl', 'openurl', dev.udid, 'https://example.com/']);
-    await sleep(8000);
-    await dismissTips();
-    await sleep(1000);
-    await dismissTips();
-    run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
-    await sleep(1500);
-  } catch (e) {
-    note('warm-up failed on ' + dev.name + ': ' + String(e.stderr || e.message || e).slice(0, 200));
+  // The first simctl openurl on a hosted Mac sometimes times out (seen: "Operation timed out", code 60): one more try, and the tip
+  // bubble ("View Bookmarks, Share Menu, and Open Tabs") is then closed on every pass. When warm-up still fails the bubble can cover
+  // the bottom bar in the screenshots (README).
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      run('xcrun', ['simctl', 'openurl', dev.udid, 'https://example.com/'], { timeout: 120000 });
+      await sleep(8000);
+      for (let k = 0; k < 3; k++) {
+        await dismissTips();
+        await sleep(1000);
+      }
+      run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
+      await sleep(1500);
+      return;
+    } catch (e) {
+      note('warm-up try ' + attempt + ' failed on ' + dev.name + ': ' + String(e.stderr || e.message || e).slice(0, 160));
+      await sleep(5000);
+    }
   }
 }
 // Some runner images carry a simulator whose Safari never accepts automation (and even openurl fails): try the next
@@ -371,7 +392,7 @@ if (FLOWS && FLOWS.noWrites) {
         await sleep(2000);
         if (PRIV) await waitSettled(() => exec('return (' + settleProbe.toString() + ')();'), sleep);
       };
-      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: FLOWS.allowWrites, afterStart };
+      const env = { wd, sid, exec, sleep, shot, outDir: OUT, allowWrites: FLOWS.allowWrites, allowPost: FLOWS.allowPost, afterStart };
       r = await runFlowIos(env, flow, { log: (s) => console.log(s), showLabels: !PRIV });
     } catch (e) {
       r = { name: flow.name, start: flow.startShown, status: 'failed', error: String((e && e.message) || e).split('\n')[0].slice(0, 300), steps: [], blocked: [], notes: [], shots: [], probe: null, guard: { active: false, how: 'not installed' }, allowWrites: FLOWS.allowWrites || null, ms: 0 };

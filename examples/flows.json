@@ -128,6 +128,27 @@
           }
         }
       ]
+    },
+    {
+      "name": "longpress",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
+      "steps": [
+        {
+          "longpress": {
+            "on": "#hold",
+            "ms": 700
+          }
+        },
+        {
+          "expect": {
+            "text": "Hold state: held",
+            "visible": true
+          }
+        },
+        {
+          "shot": "held"
+        }
+      ]
     }
   ]
 }

@@ -13,6 +13,10 @@ export const LIMITS = {
   textMax: 200,
   selectorMax: 200,
   scrollByMax: 20000,
+  holdMsMin: 300,
+  holdMsMax: 3000,
+  holdMsDefault: 600,
+  allowPostMax: 5,
   shotNameMax: 40,
   jsonBytes: 20000, // a workflow dispatch carries 65535 bytes in all
 };
@@ -26,7 +30,7 @@ export class FlowError extends Error {}
 const NAME_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const KEYS = ['Enter', 'Tab', 'Backspace', 'Escape'];
 const DIRECTIONS = ['up', 'down', 'left', 'right'];
-const ACTIONS = ['tap', 'type', 'key', 'back', 'forward', 'scroll', 'swipe', 'wait', 'expect', 'shot'];
+const ACTIONS = ['tap', 'type', 'longpress', 'key', 'back', 'forward', 'scroll', 'swipe', 'wait', 'expect', 'shot'];
 // Playwright-only selector engines and pseudo-classes: they would not mean the same on Safari, so a flow may only use plain CSS.
 const ENGINE_RE = /^\s*(xpath|text|css|id|data-testid|data-test|data-test-id|role|internal:[a-z-]+|js|nth|>>)\b|^\s*\/\/|>>|internal:|^\s*["'`]|^\s*\.\./i;
 const PSEUDO_RE = /:(has-text|text|text-is|text-matches|visible|nth-match|right-of|left-of|above|below|near|light|is-visible)\b/i;
@@ -102,6 +106,14 @@ export function parseStep(raw, where, opts = {}) {
       onlyKeys(v, ['selector', 'text', 'clear'], w);
       return out({ do: 'type', target: { css: checkSelector(v.selector, w + '.selector', opts) }, text: checkText(v.text, w + '.text', opts), clear: v.clear === true });
     }
+    case 'longpress': {
+      if (!isObj(v)) fail(w, 'use {"on": target or [x, y], "ms": 300..3000}');
+      onlyKeys(v, ['on', 'ms'], w);
+      const ms = v.ms === undefined ? LIMITS.holdMsDefault : intIn(v.ms, LIMITS.holdMsMin, LIMITS.holdMsMax, w, '"ms"');
+      if (Array.isArray(v.on)) return out({ do: 'longpress', point: frac(v.on, w + '.on'), ms });
+      if (v.on === undefined) fail(w, '"on" is required: a CSS selector, {"text": ...} or a point [x, y] (fractions of the screen)');
+      return out({ do: 'longpress', target: parseTarget(v.on, w + '.on', opts), ms });
+    }
     case 'key':
       if (!KEYS.includes(v)) fail(w, 'key must be one of ' + KEYS.join(', '));
       return out({ do: 'key', key: v });
@@ -125,7 +137,10 @@ export function parseStep(raw, where, opts = {}) {
         return out({ do: 'swipe', target: v.on === undefined ? null : parseTarget(v.on, w + '.on', opts), direction: v.direction });
       }
       if (v.on !== undefined) fail(w, '"on" needs "direction"');
-      return out({ do: 'swipe', from: frac(v.from, w + '.from'), to: frac(v.to, w + '.to') });
+      const from = frac(v.from, w + '.from');
+      const to = frac(v.to, w + '.to');
+      if (from[0] === to[0] && from[1] === to[1]) fail(w, 'a swipe with from == to is a long press: use {"longpress": {"on": [x, y], "ms": 600}}');
+      return out({ do: 'swipe', from, to });
     }
     case 'wait': {
       if (!isObj(v)) fail(w, 'use {"ms": N} or {"selector"|"text": ..., "state": "visible"|"gone"}');
@@ -162,16 +177,49 @@ export function parseStep(raw, where, opts = {}) {
   }
 }
 
-// doc: { flows: [{ name, start, steps }], allowWrites?: "reason" }. mode public: start is a URL checked by checkStart (the
+// ---- allowPost: RPC-style READS made by POST. Exact same-origin paths, POST only, at most 5.
+export function parseAllowPost(v, { textGuard } = {}) {
+  if (v === undefined) return [];
+  if (!Array.isArray(v)) fail('allowPost', 'must be a list of paths');
+  if (v.length > LIMITS.allowPostMax) fail('allowPost', 'at most ' + LIMITS.allowPostMax + ' paths');
+  const out = [];
+  for (const p of v) {
+    if (typeof p !== 'string' || !/^\/[A-Za-z0-9._~!$&'()+,;=:@%\/-]{0,198}$/.test(p) || p.startsWith('//') || /\.\.|[?#*]/.test(p)) fail('allowPost', 'a path starts with one /, has no query, #, * or .. and no spaces: "' + String(p).slice(0, 40) + '"');
+    if (textGuard) {
+      const why = textGuard(p);
+      if (why) fail('allowPost', 'path ' + why);
+    }
+    if (!out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+// Does the allow-list let this request through? POST only (PUT, PATCH, DELETE never), the origin of the flow's start page only, the
+// path matched exactly (a query does not matter, there are no wildcards).
+export function postAllowed({ method, url }, { origin, paths }) {
+  if (String(method).toUpperCase() !== 'POST' || !paths || !paths.length) return false;
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  return u.origin === origin && paths.includes(u.pathname);
+}
+
+// doc: { flows: [{ name, start, steps }], allowWrites?: "reason", allowPost?: ["/path"] }. mode public: start is a URL checked by checkStart (the
 // caller's public-URL rules); mode private: start is a path on the site. Returns { allowWrites, noWrites, flows, wireJson }.
 export function parseFlows(doc, { checkStart, textGuard, noWrites = false } = {}) {
   if (!isObj(doc)) fail('steps file', 'must be an object {"flows": [...]}');
-  onlyKeys(doc, ['flows', 'allowWrites', 'noWrites'], 'steps file');
+  onlyKeys(doc, ['flows', 'allowWrites', 'noWrites', 'allowPost'], 'steps file');
   // A write-protected session (kit-qa --mint sets KITQA_NO_WRITES=1; the flag then travels in the steps) never opts out of the guard.
   const protectedRun = noWrites === true || doc.noWrites === true;
   if (protectedRun && doc.allowWrites !== undefined) fail('allowWrites', 'refused: this session is write-protected (KITQA_NO_WRITES=1), flows cannot opt out of the no-writes guard');
   if (!Array.isArray(doc.flows) || !doc.flows.length) fail('steps file', '"flows" must be a non-empty array');
   if (doc.flows.length > LIMITS.flows) fail('steps file', 'max ' + LIMITS.flows + ' flows per file');
+  if (protectedRun && doc.allowPost !== undefined) fail('allowPost', 'refused: this session is write-protected, flows cannot open a POST path (a POST can change data)');
+  if (doc.allowPost !== undefined && doc.allowWrites !== undefined) fail('allowPost', 'allowPost and allowWrites together make no sense: allowWrites turns the whole guard off');
+  const allowPost = parseAllowPost(doc.allowPost, { textGuard });
   let allowWrites = null;
   if (doc.allowWrites !== undefined) {
     if (typeof doc.allowWrites !== 'string' || !doc.allowWrites.trim()) fail('allowWrites', 'needs a non-empty reason');
@@ -196,9 +244,9 @@ export function parseFlows(doc, { checkStart, textGuard, noWrites = false } = {}
     return { name: f.name, start, steps };
   });
   // "wire" is what travels (authoring form, so the runner validates it again with the same rules); "flows" is the parsed form.
-  const wireJson = JSON.stringify({ flows: wire, ...(allowWrites ? { allowWrites } : {}), ...(protectedRun ? { noWrites: true } : {}) });
+  const wireJson = JSON.stringify({ flows: wire, ...(allowWrites ? { allowWrites } : {}), ...(allowPost.length ? { allowPost } : {}), ...(protectedRun ? { noWrites: true } : {}) });
   if (Buffer.byteLength(wireJson) > LIMITS.jsonBytes) fail('steps file', 'too large to send (max ' + LIMITS.jsonBytes + ' bytes)');
-  return { allowWrites, noWrites: protectedRun, flows, wireJson };
+  return { allowWrites, allowPost, noWrites: protectedRun, flows, wireJson };
 }
 
 // ---- targets, shared by both drivers
@@ -219,6 +267,7 @@ export function stepLabel(s) {
   switch (s.do) {
     case 'tap': return 'tap ' + describeTarget(t);
     case 'type': return 'type into ' + describeTarget(t) + ' (' + s.text.length + ' characters)';
+    case 'longpress': return 'longpress ' + (s.target ? describeTarget(t) : 'point [' + s.point + ']') + ' ' + s.ms + ' ms';
     case 'key': return 'key ' + s.key;
     case 'back': return 'back';
     case 'forward': return 'forward';
@@ -249,29 +298,41 @@ export const fileSafe = (s) => String(s).replace(/[^A-Za-z0-9_-]+/g, '_').slice(
 // a write), sendBeacon, form submissions whose method is not GET, and WebSockets. Records what it blocked in a per-flow, random,
 // non-enumerable property (window[KEY]) that the page does not know; idempotent per document. It is a JavaScript guard: see the
 // README for everything it does not cover.
-function guardBody(KEY) {
+function guardBody(KEY, ALLOW) {
   if (Object.prototype.hasOwnProperty.call(window, KEY)) return { ok: true, already: true }; // own property only, never through the prototype chain
   var blocked = [];
   var rec = function (what) { if (blocked.length < 50) blocked.push(String(what).slice(0, 60)); };
   var readOnly = function (m) { return m === 'GET' || m === 'HEAD' || m === 'OPTIONS'; };
-  Object.defineProperty(window, KEY, { value: { blocked: blocked }, enumerable: false });
+  var allowed = [];
+  // ALLOW = { origin, paths }: exact-path POSTs to the flow's own origin (RPC-style reads) pass and are counted.
+  var permit = function (m, url) {
+    if (m !== 'POST' || !ALLOW || !ALLOW.paths.length) return false;
+    try {
+      var u = new URL(String(url), location.href);
+      if (u.origin !== ALLOW.origin || ALLOW.paths.indexOf(u.pathname) < 0) return false;
+      if (allowed.length < 200) allowed.push(u.pathname);
+      return true;
+    } catch (e) { return false; }
+  };
+  Object.defineProperty(window, KEY, { value: { blocked: blocked, allowed: allowed }, enumerable: false });
   var realFetch = window.fetch;
   if (realFetch) {
     window.fetch = function (input, init) {
       var m = String((init && init.method) || (input && typeof input === 'object' && input.method) || 'GET').toUpperCase();
-      if (!readOnly(m)) { rec('fetch ' + m); return Promise.reject(new TypeError('mobile-qa write guard: ' + m + ' blocked')); }
+      if (!readOnly(m) && !permit(m, (input && typeof input === 'object' && input.url) || input)) { rec('fetch ' + m); return Promise.reject(new TypeError('mobile-qa write guard: ' + m + ' blocked')); }
       return realFetch.apply(this, arguments);
     };
   }
   var XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
   if (XP) {
     var methods = new WeakMap();
+    var urls = new WeakMap();
     var realOpen = XP.open;
     var realSend = XP.send;
-    XP.open = function (m) { methods.set(this, String(m).toUpperCase()); return realOpen.apply(this, arguments); };
+    XP.open = function (m, url) { methods.set(this, String(m).toUpperCase()); urls.set(this, url); return realOpen.apply(this, arguments); };
     XP.send = function () {
       var m = methods.get(this);
-      if (!readOnly(m)) {
+      if (!readOnly(m) && !permit(m, urls.get(this))) {
         rec('xhr ' + m);
         var x = this;
         setTimeout(function () { x.dispatchEvent(new Event('error')); x.dispatchEvent(new Event('loadend')); }, 0);
@@ -293,9 +354,9 @@ function guardBody(KEY) {
   if (window.WebSocket) window.WebSocket = function () { rec('websocket'); throw new DOMException('mobile-qa write guard: WebSockets are blocked', 'SecurityError'); };
   return { ok: true, already: false };
 }
-export const guardSource = (key) => 'return (' + guardBody.toString() + ')(' + JSON.stringify(key) + ');';
+export const guardSource = (key, allow = null) => 'return (' + guardBody.toString() + ')(' + JSON.stringify(key) + ', ' + JSON.stringify(allow) + ');';
 export const guardCheck = (key) => 'return Object.prototype.hasOwnProperty.call(window, ' + JSON.stringify(key) + ');';
-export const guardRead = (key) => 'var g = window[' + JSON.stringify(key) + ']; return g ? g.blocked.slice() : null;';
+export const guardRead = (key) => 'var g = window[' + JSON.stringify(key) + ']; return g ? { b: g.blocked.slice(), a: g.allowed.slice() } : null;';
 export const newGuardKey = () => '__mq' + randomBytes(9).toString('hex');
 
 // ---- verdict and summary (client side; the runner only records facts)
@@ -315,11 +376,19 @@ export function flowVerdict(f) {
   }
   if (f.allowWrites) notes.push('writes ALLOWED: ' + f.allowWrites);
   else if (!f.guard || !f.guard.active) bad.push('write guard not active: the flow must not run without it');
+  if ((f.allowPost || []).length) notes.push('POST allowed on ' + f.allowPost.join(', ') + ': ' + countBy(f.postsAllowed || []));
   if (f.guard && f.guard.failed) bad.push('write guard missing on ' + f.guard.failed + ' document(s)');
   if ((f.blocked || []).length) notes.push((f.blocked || []).length + ' write(s) blocked: ' + (f.blocked || []).slice(0, 4).join(', '));
   for (const n of f.notes || []) notes.push(n);
   return { bad, notes };
 }
+
+const countBy = (list) => {
+  const m = {};
+  for (const p of list) m[p] = (m[p] || 0) + 1;
+  const e = Object.entries(m);
+  return e.length ? e.map(([p, n]) => n + ' request(s) to ' + p).join(', ') : '0 requests';
+};
 
 // Page- and runner-controlled text: no control, invisible or bidi characters, bounded (same rules as the private-mode sanitiser).
 export const clean = (s, max = 300) =>
@@ -342,6 +411,7 @@ export function renderFlowSummary(platform, f, { T = clean } = {}) {
   L.push('start: ' + T(f.startShown || f.start || '?'), 'time: ' + Math.round((f.ms || 0) / 1000) + ' s', '');
   if (f.guard) L.push('write guard: ' + T(f.guard.how || '') + (f.guard.documents !== undefined ? ' (' + f.guard.documents + ' document(s), ' + (f.guard.late || 0) + ' guarded after load)' : ''), '');
   if (f.allowWrites) L.push('WRITES ALLOWED: ' + T(f.allowWrites, 200), '');
+  if ((f.allowPost || []).length) L.push('POST ALLOWED (RPC-style reads) on: ' + f.allowPost.map((p) => T(p, 200)).join(', ') + '; made: ' + T(countBy(f.postsAllowed || []), 300), '');
   L.push('| # | step | result | ms | how | screenshot |', '|---|------|--------|----|-----|------------|');
   for (const s of f.steps || []) {
     L.push('| ' + s.i + ' | ' + T(s.label).replace(/\|/g, '/') + ' | ' + (s.skipped ? 'not run' : s.ok ? 'ok' : 'FAILED: ' + T(s.error || '', 160).replace(/\|/g, '/')) + ' | ' + (s.ms ?? '') + ' | ' + T(s.via || '', 60).replace(/\|/g, '/') + (s.kb === true ? ', keyboard up' : '') + ' | ' + (s.shot || '') + ' |');
@@ -374,6 +444,46 @@ export function reportFlows(res, dir, { T = clean } = {}) {
   return { lines, issues };
 }
 
+// ---- several steps files in one call: flows are concatenated, the caps apply to the total (parseFlows checks the merged document)
+export function readStepDocs(files, { maxBytes = 80000 } = {}) {
+  let total = 0;
+  return files.map((file) => {
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch {
+      return fail('steps file', 'cannot read ' + path.basename(String(file)));
+    }
+    total += Buffer.byteLength(raw);
+    if (total > maxBytes) fail('steps file', 'the steps files are too large');
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      return fail('steps file', path.basename(String(file)) + ' is not valid JSON: ' + e.message.slice(0, 80));
+    }
+  });
+}
+export function mergeStepDocs(docs, { allowWrites = null, allowPost = [] } = {}) {
+  for (const d of docs) if (!isObj(d)) fail('steps file', 'must be an object {"flows": [...]}');
+  if (docs.length === 1 && allowWrites === null && !allowPost.length) return docs[0];
+  const merged = { flows: [] };
+  const reasons = [];
+  const posts = [];
+  for (const d of docs) {
+    if (Array.isArray(d.flows)) merged.flows.push(...d.flows);
+    else merged.flows = d.flows; // not an array: parseFlows reports it
+    if (d.allowWrites !== undefined) reasons.push(d.allowWrites);
+    if (d.noWrites === true) merged.noWrites = true;
+    if (Array.isArray(d.allowPost)) posts.push(...d.allowPost);
+    else if (d.allowPost !== undefined) posts.push(d.allowPost);
+  }
+  if (allowWrites !== null) reasons.push(allowWrites);
+  if (reasons.length) merged.allowWrites = reasons.every((r) => typeof r === 'string') ? [...new Set(reasons)].join('; ') : reasons[0];
+  const all = [...posts, ...allowPost];
+  if (all.length) merged.allowPost = [...new Set(all)];
+  return merged;
+}
+
 // ---- runner side: the flows of this job (public: the FLOWS workflow input; private: inside the sealed job).
 export function loadRunnerFlows({ publicJson, privateDoc, base }) {
   const src = privateDoc || (publicJson && publicJson.trim() ? JSON.parse(publicJson) : null);
@@ -394,5 +504,5 @@ export function loadRunnerFlows({ publicJson, privateDoc, base }) {
     return u.href;
   };
   const doc = parseFlows(src, { checkStart });
-  return { allowWrites: doc.allowWrites, noWrites: doc.noWrites, flows: doc.flows.map((f) => ({ ...f, startShown: f.start, start: base ? new URL(f.start, base).href : f.start })) };
+  return { allowWrites: doc.allowWrites, allowPost: doc.allowPost, noWrites: doc.noWrites, flows: doc.flows.map((f) => ({ ...f, startShown: f.start, start: base ? new URL(f.start, base).href : f.start })) };
 }

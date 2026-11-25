@@ -1,0 +1,51 @@
+{
+  "flows": [
+    {
+      "name": "sheet",
+      "start": "https://kasher07.github.io/mobile-qa/fixtures/flow.html",
+      "steps": [
+        {
+          "tap": "#open-sheet"
+        },
+        {
+          "expect": {
+            "selector": "#sheet",
+            "visible": true
+          }
+        },
+        {
+          "tap": "#sheet-name"
+        },
+        {
+          "type": {
+            "selector": "#sheet-name",
+            "text": "Linh"
+          }
+        },
+        {
+          "shot": "keyboard-up"
+        },
+        {
+          "back": true,
+          "note": "Android: the first Back closes the keyboard"
+        },
+        {
+          "expect": {
+            "selector": "#sheet",
+            "visible": true
+          }
+        },
+        {
+          "back": true,
+          "note": "the second Back closes the sheet"
+        },
+        {
+          "expect": {
+            "selector": "#sheet",
+            "visible": false
+          }
+        }
+      ]
+    }
+  ]
+}

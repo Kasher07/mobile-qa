@@ -4,7 +4,7 @@ import vm from 'node:vm';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseFlows, parseStep, FlowError, LIMITS, xpathLiteral, textXPath, swipePoints, stepLabel, flowVerdict, renderFlowSummary, reportFlows, guardSource, newGuardKey, flowCountIssue, clean, loadRunnerFlows } from '../runner/flows.mjs';
+import { parseAllowPost, postAllowed, mergeStepDocs, parseFlows, parseStep, FlowError, LIMITS, xpathLiteral, textXPath, swipePoints, stepLabel, flowVerdict, renderFlowSummary, reportFlows, guardSource, newGuardKey, flowCountIssue, clean, loadRunnerFlows } from '../runner/flows.mjs';
 import { textGuard, readFlows, parseArgs } from '../bin/mobile-qa.mjs';
 import { buildJob, validateJob, privateFlows, isMintedState, allowedLine, checkPrivateTarget } from '../runner/private.mjs';
 
@@ -90,7 +90,7 @@ test('public start URLs go through the public URL rules', () => {
 });
 
 test('--steps and --allow-writes arguments', () => {
-  assert.equal(parseArgs(['--steps', 'f.json']).steps, 'f.json');
+  assert.deepEqual(parseArgs(['--steps', 'f.json']).steps, ['f.json']);
   assert.throws(() => parseArgs(['--allow-writes', 'why']), /needs --steps/);
   assert.throws(() => parseArgs(['--steps', 'f.json', '--allow-writes', ' ']), /non-empty reason/);
   assert.equal(parseArgs(['https://a.com']).steps, null, 'plain URL mode is unchanged');
@@ -388,4 +388,123 @@ test('guard presence is an OWN property: one planted on the prototype chain does
   assert.equal(Object.prototype.hasOwnProperty.call(g, KEY), true);
   assert.deepEqual(runGuard(g), { ok: true, already: true });
   void sent;
+});
+
+test('longpress: a selector, text or a point; 300..3000 ms, default 600; swipe with from == to is refused', () => {
+  const r = ok([{ longpress: { on: '#hold' } }, { longpress: { on: { text: 'Hold' }, ms: 3000 } }, { longpress: { on: [0.5, 0.5], ms: 300 } }]);
+  assert.equal(r.flows[0].steps[0].ms, 600);
+  assert.deepEqual(r.flows[0].steps[2].point, [0.5, 0.5]);
+  assert.match(stepLabel(r.flows[0].steps[0]), /longpress #hold 600 ms/);
+  bad([{ longpress: { on: '#a', ms: 299 } }], /300\.\.3000/);
+  bad([{ longpress: { on: '#a', ms: 3001 } }], /300\.\.3000/);
+  bad([{ longpress: { on: '#a', ms: '600' } }], /integer/);
+  bad([{ longpress: { ms: 600 } }], /"on" is required/);
+  bad([{ longpress: { on: [2, 0.5] } }], /fractions/);
+  bad([{ longpress: '#a' }], /use \{"on"/);
+  bad([{ swipe: { from: [0.5, 0.5], to: [0.5, 0.5] } }], /long press: use \{"longpress"/);
+});
+
+test('allowPost: exact same-origin paths, at most 5, refused when write-protected or next to allowWrites, public input is checked', () => {
+  assert.deepEqual(parseAllowPost(['/api/booking/actions', '/api/x', '/api/x']), ['/api/booking/actions', '/api/x']);
+  assert.deepEqual(parseAllowPost(undefined), []);
+  for (const p of ['api/x', '//evil.example/x', '/api/x?a=1', '/api/*', '/api/../x', '/api/x#y', '/a b', 5, '', 'https://a.com/x', '/x'.repeat(120)]) assert.throws(() => parseAllowPost([p]), /allowPost/, String(p));
+  assert.throws(() => parseAllowPost('/api/x'), /list of paths/);
+  assert.throws(() => parseAllowPost(['/a', '/b', '/c', '/d', '/e', '/f']), /at most 5/);
+  assert.equal(parseAllowPost(['/a', '/b', '/c', '/d', '/e']).length, 5);
+  assert.throws(() => parseAllowPost(['/api/a8f9c2d7e6b5a4f3c2d1e0f9'], { textGuard }), /secret/, 'public input: the secret-looking check');
+  const r = parseFlows(wdoc([{ key: 'Tab' }], { allowPost: ['/api/rpc'] }), {});
+  assert.deepEqual(r.allowPost, ['/api/rpc']);
+  assert.deepEqual(JSON.parse(r.wireJson).allowPost, ['/api/rpc']);
+  assert.throws(() => parseFlows(wdoc([{ key: 'Tab' }], { allowPost: ['/api/rpc'] }), { noWrites: true }), /write-protected/, 'KITQA_NO_WRITES');
+  assert.throws(() => parseFlows(wdoc([{ key: 'Tab' }], { allowPost: ['/api/rpc'], noWrites: true }), {}), /write-protected/, 'the flag inside the sealed steps');
+  assert.throws(() => parseFlows(wdoc([{ key: 'Tab' }], { allowPost: ['/api/rpc'], allowWrites: 'x' }), {}), /make no sense/);
+});
+
+test('allowPost matcher: exact path, own origin, POST only', () => {
+  const allow = { origin: 'https://app.example.com', paths: ['/api/rpc', '/api/read'] };
+  const m = (method, url) => postAllowed({ method, url }, allow);
+  assert.equal(m('POST', 'https://app.example.com/api/rpc'), true);
+  assert.equal(m('post', 'https://app.example.com/api/read'), true);
+  assert.equal(m('POST', 'https://app.example.com/api/rpc?x=1'), true, 'the query does not take part in the match');
+  assert.equal(m('POST', 'https://app.example.com/api/rpc/'), false, 'no prefix or trailing-slash matching');
+  assert.equal(m('POST', 'https://app.example.com/api/rpc2'), false);
+  assert.equal(m('POST', 'https://app.example.com/api/RPC'), false, 'case sensitive');
+  assert.equal(m('POST', 'https://app.example.com/other'), false);
+  assert.equal(m('POST', 'https://other.example.com/api/rpc'), false, 'another origin');
+  assert.equal(m('POST', 'http://app.example.com/api/rpc'), false, 'another scheme is another origin');
+  assert.equal(m('POST', 'https://app.example.com:8443/api/rpc'), false, 'another port');
+  for (const method of ['PUT', 'PATCH', 'DELETE', 'GET', 'HEAD']) assert.equal(m(method, 'https://app.example.com/api/rpc'), false, method);
+  assert.equal(m('POST', 'not a url'), false);
+  assert.equal(postAllowed({ method: 'POST', url: 'https://app.example.com/api/rpc' }, { origin: 'https://app.example.com', paths: [] }), false);
+});
+
+test('iOS guard with an allow-list: the listed POST passes and is counted, others stay blocked', async () => {
+  const { g, sent } = pageLike();
+  g.location = { href: 'https://app.example.com/page' };
+  g.URL = URL;
+  const allow = { origin: 'https://app.example.com', paths: ['/api/rpc'] };
+  const run = (key = KEY) => JSON.parse(JSON.stringify(vm.runInNewContext('(function(){' + guardSource(key, allow) + '})()', g)));
+  run();
+  assert.equal(await g.window.fetch('/api/rpc', { method: 'POST' }), 'sent');
+  assert.equal(await g.window.fetch('https://app.example.com/api/rpc?x=1', { method: 'post' }), 'sent');
+  await assert.rejects(g.window.fetch('/api/other', { method: 'POST' }), /POST blocked/);
+  await assert.rejects(g.window.fetch('https://evil.example/api/rpc', { method: 'POST' }), /POST blocked/);
+  await assert.rejects(g.window.fetch('/api/rpc', { method: 'PUT' }), /PUT blocked/);
+  await assert.rejects(g.window.fetch('/api/rpc', { method: 'DELETE' }), /DELETE blocked/);
+  const x = new g.XMLHttpRequest();
+  x.open('POST', '/api/rpc'); x.send();
+  const y = new g.XMLHttpRequest();
+  y.open('POST', '/api/other'); y.send();
+  assert.deepEqual(sent.map((s) => s.join(' ')), ['fetch POST', 'fetch post', 'xhr POST']);
+  assert.deepEqual([...g.window[KEY].allowed], ['/api/rpc', '/api/rpc', '/api/rpc']);
+  assert.ok(g.window[KEY].blocked.length >= 5);
+});
+
+test('several --steps files: flows are merged, the caps apply to the total, allowPost is the union with --allow-post', () => {
+  const f = fs.mkdtempSync(path.join(os.tmpdir(), 'mqs-'));
+  const w = (n, d) => { const p = path.join(f, n); fs.writeFileSync(p, JSON.stringify(d)); return p; };
+  const one = (name) => ({ name, start: 'https://a.com/x', steps: [{ key: 'Tab' }] });
+  const a = w('a.json', { flows: [one('a1'), one('a2'), one('a3')], allowPost: ['/p1'] });
+  const b = w('b.json', { flows: [one('b1'), one('b2')], allowPost: ['/p2'] });
+  const c = w('c.json', { flows: [one('c1'), one('c2'), one('c3')] });
+  const r = readFlows([a, b], { allowPost: ['/p3', '/p1'] });
+  assert.deepEqual(r.flows.map((x) => x.name), ['a1', 'a2', 'a3', 'b1', 'b2']);
+  assert.deepEqual(r.allowPost, ['/p1', '/p2', '/p3']);
+  assert.throws(() => readFlows([a, b, c]), /max 6 flows/, 'the cap counts the total');
+  assert.throws(() => readFlows([a, a]), /duplicate flow name/);
+  assert.throws(() => readFlows([a, b], { allowPost: ['/q1', '/q2', '/q3', '/q4'] }), /at most 5/);
+  assert.equal(readFlows([a]).flows.length, 3);
+  assert.equal(mergeStepDocs([{ flows: [], allowWrites: 'x' }, { flows: [], allowWrites: 'y' }]).allowWrites, 'x; y');
+  fs.rmSync(f, { recursive: true, force: true });
+});
+
+test('--steps runs on Android only unless iOS is asked; --allow-post and --steps repeat', () => {
+  const d = parseArgs(['--steps', 'f.json']);
+  assert.equal(d.platforms, 'android');
+  assert.equal(d.iosNotAsked, true);
+  const e = parseArgs(['--steps', 'f.json', '--platforms', 'ios,android']);
+  assert.equal(e.platforms, 'ios,android');
+  assert.equal(e.iosNotAsked, false);
+  assert.equal(parseArgs(['--steps', 'f.json', '--platforms', 'ios']).platforms, 'ios');
+  const p = parseArgs(['--steps', 'a.json', '--steps', 'b.json', '--allow-post', '/x', '--allow-post', '/y']);
+  assert.deepEqual(p.steps, ['a.json', 'b.json']);
+  assert.deepEqual(p.allowPost, ['/x', '/y']);
+  assert.throws(() => parseArgs(['--allow-post', '/x']), /needs --steps/);
+  assert.equal(parseArgs(['https://a.com']).platforms, 'ios,android', 'plain URL mode keeps its default');
+  assert.equal(parseArgs(['https://a.com']).iosNotAsked, false);
+});
+
+test('a minted session refuses allowPost exactly like allowWrites', () => {
+  assert.throws(() => privateFlows('https://app.example.com', { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }], allowPost: ['/api/rpc'] }, { minted: true }), /write-protected/);
+  const pf = privateFlows('https://app.example.com', { flows: [{ name: 'a', start: '/p', steps: [{ tap: '#a' }] }], allowPost: ['/api/rpc'] });
+  assert.deepEqual(pf.allowPost, ['/api/rpc'], 'an ordinary qa-agent session may list a path');
+  const wire = JSON.parse(pf.wireJson);
+  wire.noWrites = true; // a sealed job that says write-protected and lists a path is refused by the runner's re-parse
+  assert.throws(() => loadRunnerFlows({ privateDoc: wire, base: 'https://app.example.com' }), /write-protected/);
+});
+
+test('summaries list the allowed POSTs by path', () => {
+  const md = renderFlowSummary('android', flow({ allowPost: ['/api/rpc'], postsAllowed: ['/api/rpc', '/api/rpc'] }));
+  assert.match(md, /POST ALLOWED \(RPC-style reads\) on: \/api\/rpc; made: 2 request\(s\) to \/api\/rpc/);
+  assert.ok(flowVerdict(flow({ allowPost: ['/api/rpc'], postsAllowed: [] })).notes.some((n) => /POST allowed on \/api\/rpc: 0 requests/.test(n)));
 });

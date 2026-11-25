@@ -107,7 +107,7 @@ async function aim(l) {
   });
 }
 
-async function realTap(env, l, { editable = false } = {}) {
+async function realTap(env, l, { editable = false, holdMs = 0 } = {}) {
   let a = await aim(l);
   let pre = '';
   // With the keyboard up Chrome shrinks and pans the visual viewport, so page coordinates no longer map one-to-one to the screen
@@ -124,10 +124,12 @@ async function realTap(env, l, { editable = false } = {}) {
   try {
     const c = await cal(env);
     const p = toScreen(c, a.x, a.y);
-    await env.sh('input tap ' + p.x + ' ' + p.y);
-    return 'real touch (adb input tap)' + pre + (a.dbg || '');
+    // A long press is a touch that stays down: adb input swipe from a point to the same point lasts as long as asked.
+    await env.sh(holdMs ? 'input swipe ' + p.x + ' ' + p.y + ' ' + p.x + ' ' + p.y + ' ' + holdMs : 'input tap ' + p.x + ' ' + p.y);
+    return (holdMs ? 'real touch held ' + holdMs + ' ms (adb input swipe on one point)' : 'real touch (adb input tap)') + pre + (a.dbg || '');
   } catch (e) {
     env.cal = null;
+    if (holdMs) throw new Error('the long press could not be sent: ' + String(e.message).split('\n')[0].slice(0, 80));
     try {
       await env.page.touchscreen.tap(a.x, a.y);
       return 'DevTools touch (adb tap unavailable: ' + String(e.message).split('\n')[0].slice(0, 60) + ')' + pre;
@@ -151,6 +153,23 @@ async function doStep(env, s) {
       env.cal = null;
       await wait(page, 500);
       return { via };
+    }
+    case 'longpress': {
+      if (s.target) {
+        const l = to(s.target);
+        await l.waitFor({ state: 'visible', timeout: 10000 });
+        const via = await realTap(env, l, { holdMs: s.ms });
+        env.cal = null;
+        await wait(page, 500);
+        return { via };
+      }
+      const vp = await page.evaluate(() => ({ w: innerWidth, h: innerHeight }));
+      const c = await cal(env);
+      const p = toScreen(c, s.point[0] * vp.w, s.point[1] * vp.h);
+      await sh('input swipe ' + p.x + ' ' + p.y + ' ' + p.x + ' ' + p.y + ' ' + s.ms);
+      env.cal = null;
+      await wait(page, 500);
+      return { via: 'real touch held ' + s.ms + ' ms at a point (adb input swipe on one point)' };
     }
     case 'type': {
       const l = to(s.target);
@@ -269,8 +288,10 @@ async function doStep(env, s) {
 export async function runFlowAndroid(env, flow, { log = () => {}, startedAt = Date.now(), showLabels = true } = {}) {
   const dir = path.join(env.outDir, 'flows', flow.name);
   fs.mkdirSync(dir, { recursive: true });
-  const res = { name: flow.name, start: flow.startShown || flow.start, steps: [], blocked: [], notes: [], probe: null, shots: [], guard: { active: !!env.guardActive, how: env.allowWrites ? 'off (writes allowed)' : 'context route: every non-GET/HEAD/OPTIONS request to any origin is aborted; service workers blocked; WebSockets closed' }, allowWrites: env.allowWrites || null, ms: 0 };
+  const res = { name: flow.name, start: flow.startShown || flow.start, steps: [], blocked: [], notes: [], probe: null, shots: [], guard: { active: !!env.guardActive, how: env.allowWrites ? 'off (writes allowed)' : 'context route: every non-GET/HEAD/OPTIONS request to any origin is aborted' + ((env.allowPost || []).length ? ' except POST to the listed paths of this origin' : '') + '; service workers blocked; WebSockets closed' }, allowWrites: env.allowWrites || null, ms: 0 };
   const blockedBefore = env.blocked.length;
+  const allowedBefore = (env.allowedPosts || []).length;
+  res.allowPost = env.allowPost || [];
   const t0 = Date.now();
   const snap = async (stem) => {
     await env.ensureTop({});
@@ -328,6 +349,7 @@ export async function runFlowAndroid(env, flow, { log = () => {}, startedAt = Da
     res.notes.push('end-state probe failed: ' + String(e.message).split('\n')[0].slice(0, 100));
   }
   res.blocked = env.blocked.slice(blockedBefore);
+  res.postsAllowed = (env.allowedPosts || []).slice(allowedBefore);
   res.ms = Date.now() - t0;
   res.status = failed ? 'failed' : 'passed';
   void startedAt;
