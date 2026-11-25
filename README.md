@@ -59,7 +59,9 @@ time, how it was done, screenshot) plus the screenshots next to it.
 
 **Writes: default NO WRITES.** A flow can press real buttons, so unless the file (or `--allow-writes "<reason>"`) says otherwise:
 - Android: one context-level route, installed before any page loads, aborts every non-GET/HEAD/OPTIONS request to ANY origin (public
-  runs included), service workers are blocked and every WebSocket is closed. If it cannot be installed the flow does not run.
+  runs included), service workers are blocked and every WebSocket is closed. If it cannot be installed the flow does not run. A
+  blocked form submission leaves Chrome's blank error page (the request never left), so a flow that submits a form on Android
+  continues on that page; a page's own background POSTs just fail. The count and the paths of blocked requests are in the summary.
 - iOS (no request interception): a JavaScript guard is injected through WebDriver and checked before every step; it blocks fetch/XHR
   with a method other than GET/HEAD/OPTIONS, `sendBeacon`, form submissions whose method is not GET, and WebSockets, for every origin.
   safaridriver has no run-at-document-start hook, so the guard goes in as soon as each new document has loaded: **requests a page sends
