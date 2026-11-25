@@ -1,14 +1,17 @@
 // Maestro flows the widget step (runner/app-widgets.mjs) generates, and its junit. Pure; tested in
-// test/app-qa-widgets.test.mjs. The iOS flows drive SpringBoard (English simulator) with the labels in LABELS, read from
-// a fresh iOS 26 simulator (probe 2026-11-26); a new iOS that renames one breaks only that step.
+// test/app-qa-widgets.test.mjs. The iOS flows drive SpringBoard (English iPhone 17 Pro simulator, iOS 26.5) with the
+// labels in LABELS. Three probes (2026-11-26) showed: Maestro sees and taps SpringBoard, but its longPressOn does nothing
+// on the home screen (it works on the lock screen); a zero-length 2.5 s swipe on a dock icon opens the icon menu with
+// "Edit Home Screen"; the lock-screen editor shows "ADD WIDGETS". The steps after the icon menu (Edit > Add Widget >
+// the app's pages) have not run yet: the iOS widget step is unproven (README, "Home-screen widgets").
 
 export const LABELS = {
-  editHome: 'Edit Home Screen', // long-press menu of an icon
-  edit: 'Edit', // top-left button in jiggle mode
-  addWidget: 'Add Widget', // Edit menu item and the gallery's button
-  customize: 'Customize',
+  editHome: 'Edit Home Screen', // icon menu item (seen)
+  edit: 'Edit', // top-left button in jiggle mode (not seen yet)
+  addWidget: 'Add Widget', // Edit menu item and the gallery's button (not seen yet)
+  customize: 'Customize', // lock-screen gallery button (seen)
   done: 'Done',
-  addLockWidgets: 'Add Widgets',
+  addLockWidgets: '(?i)add widgets', // lock-screen editor, drawn as ADD WIDGETS (seen)
 };
 
 const q = (s) => JSON.stringify(String(s));
@@ -21,9 +24,9 @@ export function setupFlow(appId, platform) {
   return header(appId) + '- launchApp\n- waitForAnimationToEnd\n' + wait(20000) + (platform === 'ios' ? '- pressKey: home\n' : '');
 }
 
-/** Long-press an empty spot of the home screen into jiggle mode (an icon under the finger offers "Edit Home Screen"). */
+/** Jiggle mode: hold the first dock icon (a zero-length swipe; longPressOn is ignored there), then "Edit Home Screen". */
 const jiggle = () =>
-  `- pressKey: home\n- waitForAnimationToEnd\n- longPressOn:\n    point: "50%,80%"\n` +
+  `- pressKey: home\n- waitForAnimationToEnd\n- swipe:\n    start: "39%,92%"\n    end: "39%,92%"\n    duration: 2500\n` +
   `- runFlow:\n    when:\n      visible: ${q(LABELS.editHome)}\n    commands:\n      - tapOn: ${q(LABELS.editHome)}\n- waitForAnimationToEnd\n`;
 
 /**

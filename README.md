@@ -210,6 +210,34 @@ second native build, doubling its minutes for a modest time gain, and it cannot 
 
 Self-check: `npm test` (the picker and config loader are pure/fake-API tests in `test/app-qa-pool.test.mjs`).
 
+### Home-screen widgets (`--widgets`)
+
+`node bin/app-qa.mjs --app <dir> --widgets all` (or `--widgets NameA,NameB`) adds one step per platform that puts the
+app's widgets (the `expo-widgets` plugin in `app.json`) on the device and photographs them; alone it runs only that step,
+with `--flows` / `--changed` it runs after the flows. Steps (`runner/app-widgets.mjs`), results in
+`<out>/<platform>-widgets-home/` (`widgets/*.png`, `junit.xml`, `widget-host.log`):
+
+1. The app runs once so it writes its widget data: the app's `.maestro/widgets/setup.yaml`, else launch + 20 s.
+2. **Android**: the emulator keeps its launchers off (they froze over the app, see `runner/app-android.sh`). A small
+   widget host (`runner/widget-host`, plain Java built with the SDK's own tools in a few seconds) gets the bind
+   permission (`adb shell appwidget grantbind`) and binds every widget of the app at its `targetCellWidth` x
+   `targetCellHeight` on a 4-column grid, like a launcher page: what you see is the app's real RemoteViews in a real
+   `AppWidgetHostView`, light and dark (`cmd uimode night`), and a step fails when a widget sends no views or fails to
+   inflate. Not a launcher: cell size, corner clipping and margins are approximations of a Pixel launcher.
+3. **iOS** (Simulator, English): **unproven, not yet seen working** (2026-11-26). The step drives SpringBoard with
+   Maestro: hold the first dock icon > Edit Home Screen > Edit > Add Widget > the app > the N-th page > Add Widget for
+   each kind and size, then home-screen pages in light, dark and Tinted; lock-screen widgets and Tinted are best effort
+   (`skip`, not `FAIL`, when they cannot be driven). StandBy is not covered. What three probes on a GitHub `macos-26`
+   runner (iPhone 17 Pro, iOS 26.5) showed: Maestro sees and taps SpringBoard; `longPressOn` does nothing on the home
+   screen but a zero-length 2.5 s `swipe` on a dock icon opens its menu with "Edit Home Screen"; `longPressOn` on the
+   lock screen opens the wallpaper gallery, Customize opens the editor with "ADD WIDGETS"; `swipe LEFT` did not always
+   change the home page; a widget written into `data/Library/SpringBoard/IconState.plist` while the simulator was shut
+   down did not appear after boot; `maestro hierarchy` hangs in the lock-screen editor; each Maestro call costs 2-3 min
+   of driver start on those runners. Next step for whoever continues: run the step once with `--platforms ios` and read
+   `gen/hierarchy-add.json` + `widgets/fail-add.png`.
+4. The app's `.maestro/widgets/after.yaml`, if any, runs with the widgets on screen (press a widget button, open the app,
+   check it), followed by one more round of screenshots.
+
 ### Is device QA worth running at all? (`--changed`)
 
 `--changed` compares the app files with the last passing run of each platform and looks the difference up in the app's
