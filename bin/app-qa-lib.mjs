@@ -62,6 +62,24 @@ export function openArtifacts({ outDir, key, work, onApp, log }) {
   }
 }
 
+/**
+ * Removes what an earlier app-qa call left in outDir under the names this tool writes there (the unpacked results
+ * <platform>-<pass>-<flow>, the build logs android/ and ios/, sealed artifact folders, timings.txt, failed.log,
+ * ios-background.log), so a result can only come from this run's own download. 'gh run download' merges into the folder:
+ * without this, a run whose build failed read the previous run's junit.xml as its own verdict (PTH, 2026-11-25). Anything
+ * else in outDir is left alone. Returns the removed names.
+ */
+export function clearStaleResults(outDir) {
+  const owned = /^(?:(?:android|ios)(?:-(?:light|dark|widgets)-.+)?|(?:app|build|res)-.+|timings\.txt|failed\.log|ios-background\.log)$/;
+  const removed = [];
+  for (const name of fs.existsSync(outDir) ? fs.readdirSync(outDir) : []) {
+    if (!owned.test(name)) continue;
+    fs.rmSync(path.join(outDir, name), { recursive: true, force: true });
+    removed.push(name);
+  }
+  return removed;
+}
+
 /** Logs one line per flow and returns true when every flow of the platform passed. */
 export function summarize({ outDir, platform, shards, log }) {
   let ok = shards.length > 0;

@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
+import { clearStaleResults, codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
 import { markIosResultSeen, readUnseenIosResults } from './app-qa-ios-results.mjs';
 import { chooseIosLane, parseIosOn } from './app-qa-pool.mjs';
 import { changedSince, describeDecision, fileMapHash, iosRisk, moveLastPass, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writePendingIos } from './app-qa-select.mjs';
@@ -338,6 +338,9 @@ async function waitGithub() {
 let code = 0;
 try {
   await sweepAndLock();
+  // This call holds the lock now: nothing an earlier call left in outDir may be read as this run's result.
+  const stale = clearStaleResults(outDir);
+  if (stale.length) log('removed ' + stale.length + ' result entries of an earlier run from ' + outDir);
   if (platforms.includes('ios')) {
     const lane = await chooseIosLane({ configs: cmConfigs, force, log, rid });
     log('ios lane: ' + (lane.conf ? 'Codemagic ' + lane.conf.label : 'GitHub macOS') + ' - ' + lane.why);
