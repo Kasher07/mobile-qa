@@ -92,10 +92,18 @@ function hostShow(names, page) {
   text = adb('logcat', '-d', '-s', 'QaWidgetHost:*').stdout || '';
   fs.appendFileSync(path.join(OUT, 'widget-host.log'), text);
   const updated = new Set([...text.matchAll(/ update (\S+)/g)].map((m) => m[1]));
+  // A Glance widget whose composition fails still sends views: its own error card "Can't show content" (seen 2026-11-26,
+  // "There are too many views"). Read the screen for it, and keep Glance's logcat lines.
+  adb('shell', 'uiautomator', 'dump', '/sdcard/qa-widgets.xml');
+  const screen = adb('shell', 'cat', '/sdcard/qa-widgets.xml').stdout || '';
+  const failedCards = (screen.match(/Can(?:'|&apos;|’)t show content/g) || []).length;
+  const glance = (adb('logcat', '-d', '-s', 'GlanceAppWidget:E').stdout || '').split('\n').filter((l) => /Exception|Error in/.test(l)).slice(0, 4);
+  if (glance.length) fs.appendFileSync(path.join(OUT, 'widget-host.log'), glance.join('\n') + '\n');
   return {
     pages: Number((text.match(/pages (\d+)/) || [])[1] || 1),
     missing: names.filter((n) => !updated.has(n)),
-    errors: [...new Set([...text.matchAll(/ (error|bind-refused) (\S+)/g)].map((m) => m[1] + ' ' + m[2]))],
+    errors: [...new Set([...text.matchAll(/ (error|bind-refused) (\S+)/g)].map((m) => m[1] + ' ' + m[2]))]
+      .concat(failedCards ? [failedCards + ' widget(s) show Glance\'s "Can\'t show content"' + (glance.length ? ' (' + glance.map((l) => l.replace(/^.*?: /, '')).join(' | ').slice(0, 200) + ')' : '')] : []),
   };
 }
 
