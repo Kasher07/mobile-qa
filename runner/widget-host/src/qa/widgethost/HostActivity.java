@@ -30,7 +30,7 @@ import java.util.List;
 /**
  * Binds every home-screen widget of one app (extra "pkg"; "only" = comma-separated widget names, a name being the
  * provider class without its package and "Provider") and lays them out like a 4-column launcher page: a widget of
- * targetCellWidth x targetCellHeight cells gets that many cells of the screen. Extra "page" scrolls to that screenful.
+ * targetCellWidth x targetCellHeight cells gets the Android docs' portrait size for that many cells (73n-16 x 118n-16 dp). Extra "page" scrolls to that screenful.
  * Logs (tag QaWidgetHost) "pages N", "bound NAME ...", "update NAME" when the app sent its views and "error NAME" when
  * they failed to inflate. Binding needs `adb shell appwidget grantbind --package qa.widgethost --user 0` first.
  */
@@ -99,11 +99,11 @@ public class HostActivity extends Activity {
     Log.i(TAG, "providers " + infos.size() + " night " + night);
 
     float density = getResources().getDisplayMetrics().density;
-    float screenW = getResources().getDisplayMetrics().widthPixels / density;
     final float screenH = getResources().getDisplayMetrics().heightPixels / density;
+    // Widget size for n x m cells: the portrait phone sizes of the Android docs ("Determine a size for your widget":
+    // 1-4 cells = 57/130/203/276 dp wide, 102/220/337/455 dp tall), i.e. what a launcher grants at least. The bigger
+    // cells of a large phone only add room.
     float margin = 12, gap = 8;
-    float cellW = (screenW - 2 * margin) / COLUMNS;
-    float cellH = cellW * 1.25f;
 
     FrameLayout root = new FrameLayout(this);
     // A flat mid-tone "wallpaper", so the widget's own edges and corners show.
@@ -125,7 +125,7 @@ public class HostActivity extends Activity {
       if (cw <= 0) cw = Math.max(1, (int) Math.ceil((info.minWidth / density + 16) / 73f));
       if (ch <= 0) ch = Math.max(1, (int) Math.ceil((info.minHeight / density + 16) / 73f));
       cw = Math.min(cw, COLUMNS);
-      float wDp = cw * cellW - gap, hDp = ch * cellH - gap;
+      float wDp = 73 * cw - 16, hDp = 118 * ch - 16;
 
       int id = h.allocateAppWidgetId();
       Bundle opts = new Bundle();

@@ -221,9 +221,11 @@ with `--flows` / `--changed` it runs after the flows. Steps (`runner/app-widgets
 2. **Android**: the emulator keeps its launchers off (they froze over the app, see `runner/app-android.sh`). A small
    widget host (`runner/widget-host`, plain Java built with the SDK's own tools in a few seconds) gets the bind
    permission (`adb shell appwidget grantbind`) and binds every widget of the app at its `targetCellWidth` x
-   `targetCellHeight` on a 4-column grid, like a launcher page: what you see is the app's real RemoteViews in a real
-   `AppWidgetHostView`, light and dark (`cmd uimode night`), and a step fails when a widget sends no views or fails to
-   inflate. Not a launcher: cell size, corner clipping and margins are approximations of a Pixel launcher.
+   `targetCellHeight`, sized as the Android docs' portrait phone cells (73n-16 x 118n-16 dp: 4x2 = 276 x 220 dp, the
+   least a launcher grants), on a 4-column page: what you see is the app's real RemoteViews in a real
+   `AppWidgetHostView`, light and dark (`cmd uimode night`), and a step fails when a widget sends no views, fails to
+   inflate or shows Glance's own "Can't show content" card. Not a launcher: corner clipping and margins differ, and a
+   big phone's launcher gives more room than these sizes.
 3. **iOS** (Simulator, English): **unproven, not yet seen working** (2026-11-26). The step drives SpringBoard with
    Maestro: hold the first dock icon > Edit Home Screen > Edit > Add Widget > the app > the N-th page > Add Widget for
    each kind and size, then home-screen pages in light, dark and Tinted; lock-screen widgets and Tinted are best effort
