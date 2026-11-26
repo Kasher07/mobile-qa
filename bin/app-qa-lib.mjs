@@ -181,18 +181,22 @@ export function codemagic(cm, log) {
       let fetched = false;
       let seen = false;
       let lastError = '';
-      let errorRuns = 0;
+      let lastErrorLogAt = 0;
       const t0 = Date.now();
       for (;;) {
         if (Date.now() - t0 > deadlineMs) throw new Error('Codemagic build timed out after ' + Math.round(deadlineMs / 60000) + ' min (last status: ' + (last || 'never read') + ')');
         let build;
-        try { build = (await api('GET', '/builds/' + id)).build; seen = true; lastError = ''; errorRuns = 0; } catch (e) {
+        try { build = (await api('GET', '/builds/' + id)).build; seen = true; lastError = ''; } catch (e) {
           // Right after POST /builds the id is not readable for a few seconds: 404 NOT_FOUND (2026-11-23: the same id
           // answered "queued" 21 s later, same token). Not an error until it stays 404 past the window.
           if (e.status === 404 && !seen && Date.now() - t0 < notFoundWindowMs) { await sleep(notFoundRetryMs); continue; }
           if (e.status === 401 || e.status === 403 || e.status === 404) throw e;
           const msg = String(e.message).slice(0, 160);
-          if (msg !== lastError || ++errorRuns % 10 === 0) log(msg);
+          const now = Date.now();
+          if (msg !== lastError || now - lastErrorLogAt >= 60000) {
+            log(msg);
+            lastErrorLogAt = now;
+          }
           lastError = msg;
           await sleep(errorRetryMs);
           continue;

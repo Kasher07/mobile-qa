@@ -181,6 +181,7 @@ const exec = (script, args = []) => wd('POST', '/session/' + sid + '/execute/syn
 // timeout abandons a session safaridriver is still pairing, and the retry then fails with "already paired": so wait up
 // to 7 minutes, and between rounds kill safaridriver and Safari so nothing half-paired is left.
 const SESSION_TIMEOUT_MS = 7 * 60000;
+let iosInfraStage = null;
 async function startDriver() {
   try {
     run('sudo', ['safaridriver', '--enable']);
@@ -197,6 +198,8 @@ async function startDriver() {
       await sleep(round === 1 ? 10000 : 20000);
     } catch (e) {
       note('Safari pre-launch failed: ' + String(e.stderr || e.message).slice(0, 120));
+      iosInfraStage = 'safari-launch';
+      return false;
     }
     try {
       run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
@@ -213,9 +216,11 @@ async function startDriver() {
       const v = await wd('POST', '/session', { capabilities: { alwaysMatch: caps } }, 2, SESSION_TIMEOUT_MS);
       sid = v.sessionId;
       await wd('POST', '/session/' + sid + '/timeouts', { pageLoad: 60000, script: 30000 }).catch(() => {});
+      iosInfraStage = null;
       console.log('webdriver session ok (round ' + round + ', ' + Math.round((Date.now() - t0) / 1000) + ' s)');
       return true;
     } catch (e) {
+      iosInfraStage = 'webdriver-session';
       note('session round ' + round + ' failed after ' + Math.round((Date.now() - t0) / 1000) + ' s: ' + e.message.slice(0, 200));
     }
     await sleep(10000);
@@ -230,24 +235,20 @@ async function startDriver() {
 // Taps happen only here, on a fixed neutral page, never on a page under test.
 async function warmUp() {
   if (!axe || !(urls.length || FLOWS)) return;
-  // The first simctl openurl on a hosted Mac sometimes times out (seen: "Operation timed out", code 60): one more try, and the tip
-  // bubble ("View Bookmarks, Share Menu, and Open Tabs") is then closed on every pass. When warm-up still fails the bubble can cover
-  // the bottom bar in the screenshots (README).
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      run('xcrun', ['simctl', 'openurl', dev.udid, 'https://example.com/'], { timeout: 120000 });
-      await sleep(8000);
-      for (let k = 0; k < 3; k++) {
-        await dismissTips();
-        await sleep(1000);
-      }
-      run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
-      await sleep(1500);
-      return;
-    } catch (e) {
-      note('warm-up try ' + attempt + ' failed on ' + dev.name + ': ' + String(e.stderr || e.message || e).slice(0, 160));
-      await sleep(5000);
+  // Opening a network URL through simctl before SafariDriver starts can time out and leave the newly booted simulator
+  // unable to launch Safari. Launch Safari without navigating, close its native first-run tip, then let WebDriver load
+  // the requested page after the session is established.
+  try {
+    run('xcrun', ['simctl', 'launch', dev.udid, 'com.apple.mobilesafari'], { timeout: 120000 });
+    await sleep(8000);
+    for (let k = 0; k < 3; k++) {
+      await dismissTips();
+      await sleep(1000);
     }
+    run('xcrun', ['simctl', 'terminate', dev.udid, 'com.apple.mobilesafari']);
+    await sleep(1500);
+  } catch (e) {
+    note('Safari warm-up failed on ' + dev.name + ': ' + String(e.stderr || e.message || e).slice(0, 160));
   }
 }
 // Some runner images carry a simulator whose Safari never accepts automation (and even openurl fails): try the next
@@ -262,9 +263,11 @@ for (const [n, cand] of candidates.slice(0, 2).entries()) {
   try {
     boot(dev);
   } catch (e) {
+    iosInfraStage = 'boot';
     note('boot failed on ' + dev.name + ' ' + dev.udid + ': ' + String(e.stderr || e.message).slice(0, 160));
     continue;
   }
+  iosInfraStage = null;
   await warmUp();
   if (process.env.IOS_MODE === 'openurl') {
     note('openurl mode requested: screenshots only, no page checks');
@@ -282,6 +285,7 @@ for (const [n, cand] of candidates.slice(0, 2).entries()) {
   }
 }
 results.mode = hasWd ? 'webdriver' : 'openurl';
+if (!hasWd && process.env.IOS_MODE !== 'openurl') results.iosInfraStage = iosInfraStage || 'webdriver-session';
 // Cookies go in through WebDriver "Add Cookie", which needs an open document on the site: a plain text file there, then
 // every page is a fresh load. HttpOnly/Secure/__Host- cookies are added with no domain (host-only).
 let cookieError = null;

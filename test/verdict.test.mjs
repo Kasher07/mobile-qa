@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { verdict } from '../bin/mobile-qa.mjs';
+import { iosInfraSummaryLine, verdict } from '../bin/mobile-qa.mjs';
 
 const probe = (o = {}) => Object.assign({ title: 'x', innerWidth: 412, innerWidthRaw: 412, screenWidth: 412, scale: 1, scrollWidth: 412, scrollHeight: 900,
   overflowX: false, wide: [], smallTapTargets: [], viewportMeta: true, navStatus: 200, href: 'https://a.com/p', textLen: 500, media: 2 }, o);
@@ -9,6 +9,13 @@ const isOk = (p) => assert.deepEqual(verdict(p).bad, []);
 const isBad = (p, re) => assert.ok(verdict(p).bad.some((b) => re.test(b)), JSON.stringify(verdict(p)));
 
 test('clean page is ok', () => isOk(pg()));
+test('iOS infrastructure summary markers expose only supported stages', () => {
+  assert.equal(iosInfraSummaryLine({ platform: 'ios', iosInfraStage: 'boot' }), 'mobile-qa: ios-infra stage=boot');
+  assert.equal(iosInfraSummaryLine({ platform: 'ios', iosInfraStage: 'safari-launch' }), 'mobile-qa: ios-infra stage=safari-launch');
+  assert.equal(iosInfraSummaryLine({ platform: 'ios', iosInfraStage: 'webdriver-session' }), 'mobile-qa: ios-infra stage=webdriver-session');
+  assert.equal(iosInfraSummaryLine({ platform: 'android', iosInfraStage: 'boot' }), null);
+  assert.equal(iosInfraSummaryLine({ platform: 'ios', iosInfraStage: 'other' }), null);
+});
 test('no probe without error is never ok (iOS openurl fallback)', () => isBad(pg({ probe: null, status: null, mode: 'openurl' }), /not checked/));
 test('HTTP errors', () => isBad(pg({ status: 503 }), /HTTP 503/));
 test('status 0 / null does not hide other checks', () => isOk(pg({ status: 0 })));

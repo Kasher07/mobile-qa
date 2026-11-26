@@ -64,7 +64,10 @@ export function readPendingIosAll(appId, now = Date.now()) {
 export function readPendingIos(appId) { return readPendingIosAll(appId)[0]?.files ?? null; }
 export function writePendingIos(appId, files, rid = null) {
   fs.mkdirSync(cacheDir(appId), { recursive: true });
-  fs.writeFileSync(pendingFile(appId, rid), JSON.stringify({ at: new Date().toISOString(), rid, files }));
+  const newest = readPendingIosAll(appId)[0]?.at;
+  const latestAt = newest ? Date.parse(newest) : 0;
+  const at = new Date(Math.max(Date.now(), latestAt + 1)).toISOString();
+  fs.writeFileSync(pendingFile(appId, rid), JSON.stringify({ at, rid, files }));
 }
 export function clearPendingIos(appId, rid = null) { fs.rmSync(pendingFile(appId, rid), { force: true }); }
 

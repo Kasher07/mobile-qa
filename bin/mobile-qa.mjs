@@ -422,6 +422,12 @@ export function verdict(p) {
   return { bad, notes };
 }
 
+export function iosInfraSummaryLine(res) {
+  const stages = ['boot', 'safari-launch', 'webdriver-session'];
+  if (res.platform !== 'ios' || !stages.includes(res.iosInfraStage)) return null;
+  return 'mobile-qa: ios-infra stage=' + res.iosInfraStage;
+}
+
 function findResults(dir) {
   const found = [];
   if (!fs.existsSync(dir)) return found;
@@ -560,6 +566,8 @@ async function main() {
     }
     const dir = path.dirname(f);
     lines.push('## ' + res.platform + ': ' + res.device + ', ' + res.browser + ' (' + res.mode + ')', '');
+    const infraLine = iosInfraSummaryLine(res);
+    if (infraLine) lines.push(infraLine, '');
     if (res.platform === 'ios') lines.push('iOS: JS errors are not captured (WebDriver has no console); the Android section covers them.', '');
     if (res.platform === 'ios' && (res.flows || []).length) lines.push('iOS flows: element clicks and key input are WebDriver commands (synthesized, not a finger); the write guard is a page script injected after each document loads (see each flow summary).', '');
     for (const n of res.notes || []) lines.push('note: ' + n);
