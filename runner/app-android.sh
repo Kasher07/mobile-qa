@@ -31,14 +31,18 @@ for pkg in com.android.launcher3 com.google.android.apps.nexuslauncher; do
   adb shell pm disable-user --user 0 "$pkg" > /dev/null 2>&1 && echo "launcher off: $pkg" >> "$OUT/checks.txt"
 done
 adb shell settings put global hide_error_dialogs 1 > /dev/null 2>&1 || true
+# The verdict travels in junit.xml, which bin/app-qa-lib.mjs summarize reads: a failed flow is a test result, not a broken
+# run, so the step passes and GitHub sends no "workflow run failed" mail (about 50 such mails in November, 2026-11-27).
+# No junit.xml means Maestro or the widget step itself broke: that stays a failed step.
+verdict() { if [ -s "$OUT/junit.xml" ]; then [ "$1" = 0 ] || echo "flow failed: verdict in junit.xml"; exit 0; fi; exit "$1"; }
 status=0
 if [ "$PASS" = widgets ]; then
   OUT="$OUT" FLOWS="$RUNNER_TEMP/ready/.maestro" node runner/app-widgets.mjs android > "$OUT/maestro.log" 2>&1 || status=1
   grep -E "^\[widgets" "$OUT/maestro.log" | sed -E 's/ - .*//' || true
   adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID|widget" | tail -200 > "$OUT/logcat-errors.txt" || true
-  exit $status
+  verdict $status
 fi
 ( cd "$OUT" && maestro test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
 adb logcat -d -t 2000 '*:E' | grep -iE "ReactNative|AndroidRuntime|FATAL|$APP_ID" | tail -200 > "$OUT/logcat-errors.txt" || true
-exit $status
+verdict $status

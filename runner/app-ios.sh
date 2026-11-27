@@ -28,11 +28,15 @@ fi
 xcrun simctl install "$UDID" "$APP"
 # The workflow warmed the simulator's TLS trust in the background after boot; wait for it (at most 2 min).
 for _ in $(seq 1 60); do [ -f "$RUNNER_TEMP/warm" ] && break; sleep 2; done
+# The verdict travels in junit.xml, which bin/app-qa-lib.mjs summarize reads: a failed flow is a test result, not a broken
+# run, so the step passes and GitHub sends no "workflow run failed" mail (about 50 such mails in November, 2026-11-27).
+# No junit.xml means Maestro or the widget step itself broke: that stays a failed step.
+verdict() { if [ -s "$OUT/junit.xml" ]; then [ "$1" = 0 ] || echo "flow failed: verdict in junit.xml"; exit 0; fi; exit "$1"; }
 status=0
 if [ "$PASS" = widgets ]; then
   OUT="$OUT" UDID="$UDID" FLOWS="$RUNNER_TEMP/ready/.maestro" node runner/app-widgets.mjs ios > "$OUT/maestro.log" 2>&1 || status=1
   grep -E "^\[widgets" "$OUT/maestro.log" | sed -E 's/ - .*//' || true
-  exit $status
+  verdict $status
 fi
 ( cd "$OUT" && maestro --device "$UDID" test --format junit --output "$OUT/junit.xml" --test-output-dir "$OUT/maestro" "$FILE" ) > "$OUT/maestro.log" 2>&1 || status=1
 grep -E "^\[(Passed|Failed)\]" "$OUT/maestro.log" | sed -E 's/ \(.*//' || true # details stay in the sealed artifact
@@ -43,4 +47,4 @@ if [ -n "$DATA" ] && [ -d "$DATA/Documents/bible" ]; then
     for f in "$DATA"/Documents/bible/*.db; do echo "file_backup_excluded $(basename "$f")=$(xattr -p com.apple.metadata:com_apple_backup_excludeItem "$f" >/dev/null 2>&1 && echo yes || echo no)"; done
   } >> "$OUT/checks.txt"
 fi
-exit $status
+verdict $status
