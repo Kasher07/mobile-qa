@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { clearStaleResults, codemagic, codemagicConfigs, kitDir, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
+import { clearStaleResults, codemagic, codemagicConfigs, kitDir, lockHolder, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
 import { markIosResultSeen, readUnseenIosResults } from './app-qa-ios-results.mjs';
 import { chooseIosLane, parseIosOn } from './app-qa-pool.mjs';
 import { changedSince, describeDecision, fileMapHash, iosRisk, moveLastPass, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writePendingIos } from './app-qa-select.mjs';
@@ -229,6 +229,28 @@ async function sweepAndLock() {
   }
 }
 
+// sweepAndLock only looks: two calls that waited for the same previous call both saw the repo free at one poll and both
+// went on (2026-11-27, aq-20261127091937-6f7c and aq-20261127091946-f164, 9 s apart); the later APP_QA_KEY overwrote the
+// earlier one and that run could not decrypt its app. The release is the lock: create it, then only the oldest app-qa
+// release holds the repo (lockHolder); any other call deletes its own release and waits again. The key is set after this.
+async function acquireLock(createRelease) {
+  for (let attempt = 0; ; attempt++) {
+    await sweepAndLock();
+    createRelease();
+    let holder = null;
+    for (let t = 0; t < 5; t++) {
+      const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,name']));
+      if (rels.some((x) => x.tagName === tag)) { holder = lockHolder(rels); break; }
+      await sleep(2000); // the list can lag the create by a moment
+    }
+    if (holder === null || holder === tag) return; // ours, or the list never showed it: the old behaviour
+    log('another app-qa call took the repo at the same moment (' + holder + '), waiting');
+    try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); } catch { /* gone */ }
+    if (attempt >= 5) throw new Error('could not take the app-qa lock (' + holder + ' holds it)');
+    await sleep(5000 + Math.floor(Math.random() * 10000));
+  }
+}
+
 const rid = 'aq-' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14) + '-' + randomBytes(2).toString('hex');
 const tag = 'app-qa-' + rid;
 const outDir = path.resolve(opts.out || path.join(os.tmpdir(), rid));
@@ -340,7 +362,7 @@ async function waitGithub() {
 
 let code = 0;
 try {
-  await sweepAndLock();
+  await acquireLock(() => gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']));
   // This call holds the lock now: nothing an earlier call left in outDir may be read as this run's result.
   const stale = clearStaleResults(outDir);
   if (stale.length) log('removed ' + stale.length + ' result entries of an earlier run from ' + outDir);
@@ -351,7 +373,6 @@ try {
     if (lane.conf) cm = codemagic(lane.conf, log);
   }
   setKey(key.toString('hex'));
-  gh(['release', 'create', tag, path.join(work, 'app.tgz.enc'), ...reuse.map((p) => path.join(work, 'shell-' + p + '.tgz.enc')), '-R', REPO, '--title', tag, '--notes', 'Temporary encrypted input of an app-qa run; deleted when the run ends.', '--prerelease']);
   if (cm) {
     cmBuildId = await cm.start({ ASSET_TAG: tag, APP_ID: appId, APP_QA_KEY: key.toString('hex'), REUSE: reuse.includes('ios') ? 'ios' : '', SHARDS: JSON.stringify(plan.ios), WIDGETS: wplan ? JSON.stringify(wplan) : '' });
     log('ios on Codemagic M2' + (iosBackground ? ' (background)' : '') + ': https://codemagic.io/app/' + cmConf.appId + '/build/' + cmBuildId);
