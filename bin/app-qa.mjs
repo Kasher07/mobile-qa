@@ -214,8 +214,7 @@ const ageMin = (t) => (Date.now() - Date.parse(t)) / 60000;
 // (2026-11-27 08:07 and 09:02 in PTH). 25 minutes: the PTH deep step stops the whole call at 75, and a full run behind
 // the wait needs up to 50. APP_QA_LOCK_WAIT_MIN overrides (0 = do not wait).
 const LOCK_WAIT_MS = Math.max(0, Number(process.env.APP_QA_LOCK_WAIT_MIN ?? 25)) * 60000;
-async function sweepAndLock() {
-  const waitUntil = Date.now() + LOCK_WAIT_MS;
+async function sweepAndLock(waitUntil = Date.now() + LOCK_WAIT_MS) {
   for (let attempt = 0; ; attempt++) {
     const runs = JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '50', '--json', 'databaseId,displayTitle,status,createdAt,updatedAt']));
     for (const r of runs) {
@@ -241,19 +240,25 @@ async function sweepAndLock() {
 // earlier one and that run could not decrypt its app. The release is the lock: create it, then only the oldest app-qa
 // release holds the repo (lockHolder); any other call deletes its own release and waits again. The key is set after this.
 async function acquireLock(createRelease) {
-  for (let attempt = 0; ; attempt++) {
-    await sweepAndLock();
-    createRelease();
-    let holder = null;
+  const waitUntil = Date.now() + LOCK_WAIT_MS; // one deadline for every retry
+  const holderNow = async () => {
     for (let t = 0; t < 5; t++) {
       const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,publishedAt,name']));
-      if (rels.some((x) => x.tagName === tag)) { holder = lockHolder(rels); break; }
+      if (rels.some((x) => x.tagName === tag)) return lockHolder(rels);
       await sleep(2000); // the list can lag the create by a moment
     }
+    return null;
+  };
+  for (;;) {
+    await sweepAndLock(waitUntil);
+    createRelease();
+    // Asked twice, 3 s apart: a release published a moment before ours may not be in the first list yet.
+    let holder = await holderNow();
+    if (holder === null || holder === tag) { await sleep(3000); holder = await holderNow(); }
     if (holder === null || holder === tag) return; // ours, or the list never showed it: the old behaviour
     log('another app-qa call took the repo at the same moment (' + holder + '), waiting');
-    try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); } catch { /* gone */ }
-    if (attempt >= 5) throw new Error('could not take the app-qa lock (' + holder + ' holds it)');
+    try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); } catch (e) { throw new Error('could not give the app-qa lock back: ' + String(e.stderr || e.message).slice(0, 150)); }
+    if (Date.now() >= waitUntil) throw new Error('could not take the app-qa lock (' + holder + ' holds it)');
     await sleep(5000 + Math.floor(Math.random() * 10000));
   }
 }
@@ -294,6 +299,14 @@ let dispatched = false;
 let cmBuildId = null;
 let handedOff = false;
 let ghDoneFile = null;
+// keySet: this call put its key in APP_QA_KEY. lockGiven: it gave the lock away (release renamed '... ios-background'),
+// so another call may own APP_QA_KEY now. cleanup replaces the key only when both say it is still ours.
+let keySet = false;
+let lockGiven = false;
+let renamePending = false;
+const giveLock = () => {
+  try { gh(['release', 'edit', tag, '-R', REPO, '--title', tag + ' ios-background']); lockGiven = true; } catch { /* the lock then waits for it */ }
+};
 let cm = null;
 const findRun = () => JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '20', '--json', 'databaseId,displayTitle'])).find((x) => x.displayTitle === rid)?.databaseId ?? null;
 let cleaning = null;
@@ -315,7 +328,9 @@ function cleanup() {
     // The key is replaced BEFORE the release goes: the release is the lock (sweepAndLock), so a waiting call takes over
     // the moment it is deleted and sets its own key; replacing ours after that overwrote the next call's key and its app
     // could not be decrypted (2026-11-27, aq-20261127091946-f164: "unable to authenticate data").
-    try { setKey(randomBytes(32).toString('hex')); } catch (e) { log('WARNING: could not replace APP_QA_KEY: ' + String(e.stderr || e.message).slice(0, 150)); }
+    // Only our own key is replaced: a call that never set it (killed or timed out while waiting) or that already gave the
+    // lock away would overwrite the key of the call running now (review 2026-11-27).
+    if (keySet && !lockGiven) { try { setKey(randomBytes(32).toString('hex')); } catch (e) { log('WARNING: could not replace APP_QA_KEY: ' + String(e.stderr || e.message).slice(0, 150)); } }
     // The background iOS process deletes the release once Codemagic has fetched it.
     if (!handedOff) { try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); log('release deleted'); } catch { /* never created, or already gone */ } }
     fs.rmSync(work, { recursive: true, force: true });
@@ -380,6 +395,7 @@ try {
     if (lane.conf) cm = codemagic(lane.conf, log);
   }
   setKey(key.toString('hex'));
+  keySet = true;
   if (cm) {
     cmBuildId = await cm.start({ ASSET_TAG: tag, APP_ID: appId, APP_QA_KEY: key.toString('hex'), REUSE: reuse.includes('ios') ? 'ios' : '', SHARDS: JSON.stringify(plan.ios), WIDGETS: wplan ? JSON.stringify(wplan) : '' });
     log('ios on Codemagic M2' + (iosBackground ? ' (background)' : '') + ': https://codemagic.io/app/' + cmConf.appId + '/build/' + cmBuildId);
@@ -396,7 +412,9 @@ try {
       child.unref();
       handedOff = true;
       if (savesSnapshot) writePendingIos(appId, current, rid);
-      try { gh(['release', 'edit', tag, '-R', REPO, '--title', tag + ' ios-background']); } catch { /* the lock then waits for it */ }
+      // The lock goes to the next call only once this call's GitHub half (Android, which uses APP_QA_KEY) is done.
+      if (ghPlatforms.length) renamePending = true;
+      else giveLock();
       log('iOS continues in the background; its result: ' + path.join(kitDir(), 'ios-results', rid) + ' (printed by the next app-qa call)');
     }
   }
@@ -408,6 +426,7 @@ try {
     if (!runId) throw new Error('run not found');
     log('run ' + rid + ': https://github.com/' + REPO + '/actions/runs/' + runId);
     await waitGithub();
+    if (renamePending) giveLock();
   }
   if (cm && !iosBackground) {
     const build = await cm.wait(cmBuildId);

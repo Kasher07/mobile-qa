@@ -49,3 +49,27 @@ test('the lock wait is a deadline of APP_QA_LOCK_WAIT_MIN (default 25), not 40 p
   assert.match(src, /process\.env\.APP_QA_LOCK_WAIT_MIN \?\? 25/);
   assert.ok(!/attempt >= 40/.test(src));
 });
+
+test('cleanup replaces APP_QA_KEY only when this call set it and still holds the lock', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'bin', 'app-qa.mjs'), 'utf8');
+  const body = src.slice(src.indexOf('function cleanup()'));
+  assert.match(body, /if \(keySet && !lockGiven\) \{ try \{ setKey\(randomBytes\(32\)/);
+  const main = src.slice(src.indexOf('let code = 0;'));
+  assert.ok(main.indexOf('keySet = true') > main.indexOf("setKey(key.toString('hex'))"));
+});
+
+test('the lock goes to the next call (rename to ios-background) only after the GitHub half is done', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'bin', 'app-qa.mjs'), 'utf8');
+  const main = src.slice(src.indexOf('let code = 0;'));
+  assert.match(main, /if \(ghPlatforms\.length\) renamePending = true;\s+else giveLock\(\);/);
+  assert.match(main, /await waitGithub\(\);\s+if \(renamePending\) giveLock\(\);/);
+  assert.equal((src.match(/'--title', tag \+ ' ios-background'/g) || []).length, 1);
+});
+
+test('acquireLock: one deadline for every retry, and the holder is asked twice', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'bin', 'app-qa.mjs'), 'utf8');
+  const fn = src.slice(src.indexOf('async function acquireLock'), src.indexOf("const rid = 'aq-'"));
+  assert.match(fn, /await sweepAndLock\(waitUntil\)/);
+  assert.equal((fn.match(/await holderNow\(\)/g) || []).length, 2);
+  assert.ok(!/attempt >= 5/.test(fn));
+});
