@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { clearStaleResults, codemagic, codemagicConfigs, kitDir, lockHolder, makeLog, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
+import { clearStaleResults, codemagic, codemagicConfigs, kitDir, lockHolder, makeLog, releaseTime, openArtifacts, seal, sleep, summarize, tarBin } from './app-qa-lib.mjs';
 import { markIosResultSeen, readUnseenIosResults } from './app-qa-ios-results.mjs';
 import { chooseIosLane, parseIosOn } from './app-qa-pool.mjs';
 import { changedSince, describeDecision, fileMapHash, iosRisk, moveLastPass, readLastPass, readPendingIos, selectFlows, snapshot, splitByCoverage, writePendingIos } from './app-qa-select.mjs';
@@ -219,9 +219,10 @@ async function sweepAndLock() {
     const active = runs.filter((r) => r.status !== 'completed' && ageMin(r.createdAt) <= 180).map((r) => r.displayTitle);
     // A release handed to a background iOS process (title ends in 'ios-background') needs no lock: iOS has its own key
     // copy on Codemagic and the process deletes it; only GitHub runs share APP_QA_KEY.
-    const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,name'])).filter((x) => x.tagName.startsWith('app-qa-') && !(/ios-background$/.test(x.name || '') && ageMin(x.createdAt) <= 180));
-    for (const r of rels.filter((x) => ageMin(x.createdAt) > 180)) { try { gh(['release', 'delete', r.tagName, '-R', REPO, '--cleanup-tag', '-y']); log('deleted leftover release ' + r.tagName); } catch { /* gone */ } }
-    const held = [...active, ...rels.filter((x) => ageMin(x.createdAt) <= 180).map((x) => x.tagName)];
+    const relAge = (x) => (Date.now() - releaseTime(x)) / 60000; // publishedAt: createdAt is the commit's date
+    const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,publishedAt,name'])).filter((x) => x.tagName.startsWith('app-qa-') && !(/ios-background$/.test(x.name || '') && relAge(x) <= 180));
+    for (const r of rels.filter((x) => relAge(x) > 180)) { try { gh(['release', 'delete', r.tagName, '-R', REPO, '--cleanup-tag', '-y']); log('deleted leftover release ' + r.tagName); } catch { /* gone */ } }
+    const held = [...active, ...rels.filter((x) => relAge(x) <= 180).map((x) => x.tagName)];
     if (!held.length) return;
     if (attempt >= 40) throw new Error('another app-qa call is still running (' + held.join(', ') + ')');
     if (attempt === 0) log('waiting for the previous app-qa call to free the repo (' + held.join(', ') + ')');
@@ -239,7 +240,7 @@ async function acquireLock(createRelease) {
     createRelease();
     let holder = null;
     for (let t = 0; t < 5; t++) {
-      const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,name']));
+      const rels = JSON.parse(gh(['release', 'list', '-R', REPO, '-L', '100', '--json', 'tagName,createdAt,publishedAt,name']));
       if (rels.some((x) => x.tagName === tag)) { holder = lockHolder(rels); break; }
       await sleep(2000); // the list can lag the create by a moment
     }

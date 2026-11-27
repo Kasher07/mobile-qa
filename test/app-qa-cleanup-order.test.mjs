@@ -33,3 +33,13 @@ test('app-qa main takes the lock (release first) before it sets APP_QA_KEY', () 
   assert.ok(lock > 0 && key > lock);
   assert.equal((src.match(/gh\(\['release', 'create'/g) || []).length, 1);
 });
+
+test('lockHolder ages a release by publishedAt: createdAt is the date of the commit it points at', () => {
+  const now = Date.parse('2026-11-27T13:00:00Z');
+  const rel = { tagName: 'app-qa-x', name: 'app-qa-x', createdAt: '2026-11-27T08:33:19Z', publishedAt: '2026-11-27T12:59:00Z' };
+  assert.equal(lockHolder([rel], now), 'app-qa-x'); // published a minute ago on a 4.5-hour-old commit: live
+  const early = { tagName: 'app-qa-z', name: 'app-qa-z', createdAt: '2026-11-27T12:00:00Z', publishedAt: '2026-11-27T12:58:00Z' };
+  assert.equal(lockHolder([rel, early], now), 'app-qa-z'); // the earlier publish holds, whatever the commit dates say
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'bin', 'app-qa.mjs'), 'utf8');
+  assert.ok(!/ageMin\(x\.createdAt\)/.test(src), 'the leftover sweep never ages releases by createdAt');
+});

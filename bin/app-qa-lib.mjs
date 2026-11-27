@@ -244,12 +244,18 @@ export function codemagic(cm, log) {
 }
 
 /**
- * The app-qa call that holds the repo: the oldest app-qa-* release (createdAt, then tag name) younger than 3 hours, not
+ * When a release was made: publishedAt. A release's createdAt is the date of the commit it points at (a release made now
+ * on a 5-hour-old main reads 5 hours old), so the lock and the leftover sweep never use it (2026-11-27).
+ */
+export const releaseTime = (x) => Date.parse(x?.publishedAt || x?.createdAt);
+
+/**
+ * The app-qa call that holds the repo: the oldest app-qa-* release (publishedAt, then tag name) younger than 3 hours, not
  * counting releases handed to a background iOS process (title ends in 'ios-background': iOS has its own key copy).
  * Pure; null when there is none.
  */
 export function lockHolder(releases, nowMs = Date.now()) {
-  const live = (releases || []).filter((x) => String(x?.tagName || '').startsWith('app-qa-') && !/ios-background$/.test(x?.name || '') && nowMs - Date.parse(x.createdAt) <= 180 * 60000);
-  live.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || String(a.tagName).localeCompare(String(b.tagName)));
+  const live = (releases || []).filter((x) => String(x?.tagName || '').startsWith('app-qa-') && !/ios-background$/.test(x?.name || '') && nowMs - releaseTime(x) <= 180 * 60000);
+  live.sort((a, b) => releaseTime(a) - releaseTime(b) || String(a.tagName).localeCompare(String(b.tagName)));
   return live[0]?.tagName ?? null;
 }
