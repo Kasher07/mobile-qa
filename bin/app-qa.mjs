@@ -209,7 +209,12 @@ const setKey = (hex) => execFileSync('gh', ['secret', 'set', 'APP_QA_KEY', '-R',
 // ---- one call at a time (they share APP_QA_KEY); leftovers of a killed caller are removed first. A background iOS
 // build holds its release only until Codemagic has fetched it (about a minute; longer while Codemagic queues).
 const ageMin = (t) => (Date.now() - Date.parse(t)) / 60000;
+// A full run (native build + 8 flows per platform) takes 40-55 minutes, and app-qa is mostly a background (deep lane)
+// step: the old 10-minute wait turned every call behind a full run into "another app-qa call is still running"
+// (2026-11-27 08:07 and 09:02 in PTH). APP_QA_LOCK_WAIT_MIN overrides (0 = do not wait).
+const LOCK_WAIT_MS = Math.max(0, Number(process.env.APP_QA_LOCK_WAIT_MIN ?? 60)) * 60000;
 async function sweepAndLock() {
+  const waitUntil = Date.now() + LOCK_WAIT_MS;
   for (let attempt = 0; ; attempt++) {
     const runs = JSON.parse(gh(['run', 'list', '-R', REPO, '-w', WORKFLOW, '-L', '50', '--json', 'databaseId,displayTitle,status,createdAt,updatedAt']));
     for (const r of runs) {
@@ -224,7 +229,7 @@ async function sweepAndLock() {
     for (const r of rels.filter((x) => relAge(x) > 180)) { try { gh(['release', 'delete', r.tagName, '-R', REPO, '--cleanup-tag', '-y']); log('deleted leftover release ' + r.tagName); } catch { /* gone */ } }
     const held = [...active, ...rels.filter((x) => relAge(x) <= 180).map((x) => x.tagName)];
     if (!held.length) return;
-    if (attempt >= 40) throw new Error('another app-qa call is still running (' + held.join(', ') + ')');
+    if (Date.now() >= waitUntil) throw new Error('another app-qa call is still running (' + held.join(', ') + ')');
     if (attempt === 0) log('waiting for the previous app-qa call to free the repo (' + held.join(', ') + ')');
     await sleep(15000);
   }

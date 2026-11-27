@@ -43,3 +43,9 @@ test('lockHolder ages a release by publishedAt: createdAt is the date of the com
   const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'bin', 'app-qa.mjs'), 'utf8');
   assert.ok(!/ageMin\(x\.createdAt\)/.test(src), 'the leftover sweep never ages releases by createdAt');
 });
+
+test('the lock wait is a deadline of APP_QA_LOCK_WAIT_MIN (default 60), not 40 polls', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'bin', 'app-qa.mjs'), 'utf8');
+  assert.match(src, /process\.env\.APP_QA_LOCK_WAIT_MIN \?\? 60/);
+  assert.ok(!/attempt >= 40/.test(src));
+});
