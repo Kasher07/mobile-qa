@@ -283,9 +283,12 @@ function cleanup() {
         log('run deleted');
       } catch { log('could not delete the run; the next app-qa call removes it: https://github.com/' + REPO + '/actions/runs/' + runId); }
     } else if (dispatched && !runId) log('run of ' + rid + ' not found; the next app-qa call removes it');
+    // The key is replaced BEFORE the release goes: the release is the lock (sweepAndLock), so a waiting call takes over
+    // the moment it is deleted and sets its own key; replacing ours after that overwrote the next call's key and its app
+    // could not be decrypted (2026-11-27, aq-20261127091946-f164: "unable to authenticate data").
+    try { setKey(randomBytes(32).toString('hex')); } catch (e) { log('WARNING: could not replace APP_QA_KEY: ' + String(e.stderr || e.message).slice(0, 150)); }
     // The background iOS process deletes the release once Codemagic has fetched it.
     if (!handedOff) { try { gh(['release', 'delete', tag, '-R', REPO, '--cleanup-tag', '-y']); log('release deleted'); } catch { /* never created, or already gone */ } }
-    try { setKey(randomBytes(32).toString('hex')); } catch (e) { log('WARNING: could not replace APP_QA_KEY: ' + String(e.stderr || e.message).slice(0, 150)); }
     fs.rmSync(work, { recursive: true, force: true });
     // The background iOS process may delete the release now.
     if (ghDoneFile) { try { fs.writeFileSync(ghDoneFile, ''); } catch { /* it waits, then gives up */ } }
